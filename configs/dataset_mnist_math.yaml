@@ -1,0 +1,23 @@
+dataset:
+  name: mnist_math
+  root_dir: data
+  output_dir: data/mnist_math
+
+  train_size: 50000
+  val_size: 10000
+  test_size: 10000
+
+  image_height: 28
+  symbol_width: 28
+  num_symbols: 5
+
+  valid_ratio: 0.5
+
+  operators:
+    - "+"
+
+  allow_carry: false
+
+  seed: 42
+
+  save_format: pt
