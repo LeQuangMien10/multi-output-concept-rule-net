@@ -1,5 +1,6 @@
 dataset:
   name: mnist_math
+
   root_dir: data
   output_dir: data/mnist_math
 
@@ -19,5 +20,4 @@ dataset:
   allow_carry: false
 
   seed: 42
-
   save_format: pt
