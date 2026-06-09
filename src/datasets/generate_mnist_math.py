@@ -15,32 +15,137 @@ from src.utils.symbols import SYMBOL_TO_ID, CONCEPT_ORDER, CONCEPT_SPECS
 
 def make_symbol_image(symbol: str, size: int = 28) -> Image.Image:
     """
-    Create a grayscale image for math symbols.
-    Currently supports + and =.
+    Create a grayscale image for math symbols with slight randomness
+    so that symbols are not perfectly straight / identical.
+
+    Supported: +, =, -, *, /
     """
     img = Image.new("L", (size, size), color=0)
     draw = ImageDraw.Draw(img)
 
+    def clamp(x, low=0, high=None):
+        if high is None:
+            high = size - 1
+        return max(low, min(int(x), high))
+
+    # random center shift
+    cx = size // 2 + random.randint(-2, 2)
+    cy = size // 2 + random.randint(-2, 2)
+
+    # random thickness
+    thickness = random.randint(2, 4)
+
+    # useful margins / lengths
+    margin = random.randint(6, 8)
+    half_len_h = random.randint(8, 10)
+    half_len_v = random.randint(8, 10)
+
     if symbol == "+":
-        draw.line((size // 2, 7, size // 2, size - 7), fill=255, width=3)
-        draw.line((7, size // 2, size - 7, size // 2), fill=255, width=3)
+        # horizontal stroke with slight slope
+        x1 = clamp(cx - half_len_h)
+        y1 = clamp(cy + random.randint(-1, 1))
+        x2 = clamp(cx + half_len_h)
+        y2 = clamp(cy + random.randint(-1, 1))
+        draw.line((x1, y1, x2, y2), fill=255, width=thickness)
+
+        # vertical stroke with slight slope
+        x3 = clamp(cx + random.randint(-1, 1))
+        y3 = clamp(cy - half_len_v)
+        x4 = clamp(cx + random.randint(-1, 1))
+        y4 = clamp(cy + half_len_v)
+        draw.line((x3, y3, x4, y4), fill=255, width=thickness)
 
     elif symbol == "=":
-        draw.line((7, size // 2 - 4, size - 7, size // 2 - 4), fill=255, width=3)
-        draw.line((7, size // 2 + 4, size - 7, size // 2 + 4), fill=255, width=3)
+        gap = random.randint(5, 8)
+
+        # upper line
+        x1 = clamp(margin)
+        y1 = clamp(cy - gap // 2 + random.randint(-1, 1))
+        x2 = clamp(size - margin)
+        y2 = clamp(cy - gap // 2 + random.randint(-1, 1))
+        draw.line((x1, y1, x2, y2), fill=255, width=thickness)
+
+        # lower line
+        x3 = clamp(margin + random.randint(-1, 1))
+        y3 = clamp(cy + gap // 2 + random.randint(-1, 1))
+        x4 = clamp(size - margin + random.randint(-1, 1))
+        y4 = clamp(cy + gap // 2 + random.randint(-1, 1))
+        draw.line((x3, y3, x4, y4), fill=255, width=thickness)
 
     elif symbol == "-":
-        draw.line((7, size // 2, size - 7, size // 2), fill=255, width=3)
+        x1 = clamp(margin)
+        y1 = clamp(cy + random.randint(-1, 1))
+        x2 = clamp(size - margin)
+        y2 = clamp(cy + random.randint(-1, 1))
+        draw.line((x1, y1, x2, y2), fill=255, width=thickness)
 
     elif symbol == "*":
-        draw.line((8, 8, size - 8, size - 8), fill=255, width=3)
-        draw.line((size - 8, 8, 8, size - 8), fill=255, width=3)
+        # diagonal 1
+        draw.line(
+            (
+                clamp(margin + random.randint(-1, 1)),
+                clamp(margin + random.randint(-1, 1)),
+                clamp(size - margin + random.randint(-1, 1)),
+                clamp(size - margin + random.randint(-1, 1)),
+            ),
+            fill=255,
+            width=thickness,
+        )
+
+        # diagonal 2
+        draw.line(
+            (
+                clamp(size - margin + random.randint(-1, 1)),
+                clamp(margin + random.randint(-1, 1)),
+                clamp(margin + random.randint(-1, 1)),
+                clamp(size - margin + random.randint(-1, 1)),
+            ),
+            fill=255,
+            width=thickness,
+        )
+
+        # optional center stroke to make it more star-like
+        if random.random() < 0.7:
+            draw.line(
+                (
+                    clamp(cx + random.randint(-1, 1)),
+                    clamp(margin + random.randint(-1, 1)),
+                    clamp(cx + random.randint(-1, 1)),
+                    clamp(size - margin + random.randint(-1, 1)),
+                ),
+                fill=255,
+                width=max(1, thickness - 1),
+            )
 
     elif symbol == "/":
-        draw.line((size - 8, 6, 8, size - 6), fill=255, width=3)
+        draw.line(
+            (
+                clamp(size - margin + random.randint(-1, 1)),
+                clamp(margin + random.randint(-1, 1)),
+                clamp(margin + random.randint(-1, 1)),
+                clamp(size - margin + random.randint(-1, 1)),
+            ),
+            fill=255,
+            width=thickness,
+        )
 
     else:
         raise ValueError(f"Unsupported symbol: {symbol}")
+
+    # random tiny speckle noise
+    if random.random() < 0.8:
+        for _ in range(random.randint(2, 8)):
+            px = random.randint(0, size - 1)
+            py = random.randint(0, size - 1)
+            img.putpixel((px, py), random.choice([0, 255]))
+
+    # slight rotation so symbols are less perfect
+    angle = random.uniform(-8, 8)
+    img = img.rotate(angle, resample=Image.Resampling.BILINEAR, fillcolor=0)
+
+    # very light blur sometimes
+    if random.random() < 0.35:
+        img = img.filter(ImageFilter.GaussianBlur(radius=random.uniform(0.2, 0.6)))
 
     return img
 
