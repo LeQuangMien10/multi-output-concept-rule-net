@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFilter
 from torchvision.datasets import MNIST
 from torchvision import transforms
 from tqdm import tqdm
