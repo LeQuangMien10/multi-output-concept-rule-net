@@ -33,7 +33,7 @@ def make_symbol_image(symbol: str, size: int = 28) -> Image.Image:
     cy = size // 2 + random.randint(-1, 1)
 
     # nét mảnh hơn
-    thickness = random.randint(2, 4)
+    thickness = random.randint(2, 3)
 
     margin = random.randint(6, 8)
     half_len_h = random.randint(8, 9)
@@ -124,7 +124,7 @@ def make_symbol_image(symbol: str, size: int = 28) -> Image.Image:
 
     # blur rất nhẹ, xác suất thấp
     if random.random() < 0.85:
-        img = img.filter(ImageFilter.GaussianBlur(radius=random.uniform(0.15, 0.35)))
+        img = img.filter(ImageFilter.GaussianBlur(radius=random.uniform(0.35, 0.5)))
 
     return img
 
