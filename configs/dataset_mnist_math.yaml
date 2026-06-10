@@ -19,5 +19,5 @@ dataset:
 
   allow_carry: false
 
-  seed: 42
+  seed: 123
   save_format: pt
