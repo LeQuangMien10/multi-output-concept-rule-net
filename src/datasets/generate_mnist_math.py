@@ -33,7 +33,7 @@ def make_symbol_image(symbol: str, size: int = 28) -> Image.Image:
     cy = size // 2 + random.randint(-1, 1)
 
     # nét mảnh hơn
-    thickness = random.randint(1, 3)
+    thickness = random.randint(2, 4)
 
     margin = random.randint(6, 8)
     half_len_h = random.randint(8, 9)
@@ -123,7 +123,7 @@ def make_symbol_image(symbol: str, size: int = 28) -> Image.Image:
     img = img.rotate(angle, resample=Image.Resampling.BILINEAR, fillcolor=0)
 
     # blur rất nhẹ, xác suất thấp
-    if random.random() < 0.15:
+    if random.random() < 0.85:
         img = img.filter(ImageFilter.GaussianBlur(radius=random.uniform(0.15, 0.35)))
 
     return img
