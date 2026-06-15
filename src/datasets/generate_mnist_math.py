@@ -13,118 +13,194 @@ from src.utils.seed import set_seed
 from src.utils.symbols import SYMBOL_TO_ID, CONCEPT_ORDER, CONCEPT_SPECS
 
 
+import random
+import math
+from PIL import Image, ImageDraw, ImageFilter
+
+
 def make_symbol_image(symbol: str, size: int = 28) -> Image.Image:
     """
-    Create a grayscale math symbol image with slight randomness,
-    but cleaner and thinner than the previous version.
+    Tạo ảnh ký hiệu toán học giả lập nét tay với nhiều biến thể:
+    - Độ dài nét (stroke length)
+    - Độ lệch tâm (center offset)
+    - Độ dày nét (stroke width)
+    - Độ nghiêng nét (tilt/skew)
+    - Độ cong nét (curvature via multi-segment)
+    - Áp lực bút (pressure: fade ở đầu/cuối nét)
+    - Chấn động tay (jitter)
+    - Blur + noise
 
     Supported: +, =, -, *, /
     """
     img = Image.new("L", (size, size), color=0)
     draw = ImageDraw.Draw(img)
 
-    def clamp(x, low=0, high=None):
-        if high is None:
-            high = size - 1
-        return max(low, min(int(x), high))
+    # ─── helpers ───────────────────────────────────────────────────────────────
 
-    # nhẹ nhàng hơn bản trước
-    cx = size // 2 + random.randint(-1, 1)
-    cy = size // 2 + random.randint(-1, 1)
+    def clamp(x, lo=0, hi=None):
+        if hi is None:
+            hi = size - 1
+        return max(lo, min(int(round(x)), hi))
 
-    # nét mảnh hơn
-    thickness = random.randint(2, 3)
+    def jitter(scale=1.0):
+        """Rung tay nhỏ."""
+        return random.gauss(0, scale)
 
-    margin = random.randint(6, 8)
-    half_len_h = random.randint(8, 9)
-    half_len_v = random.randint(8, 9)
+    def draw_wobbly_line(draw, x1, y1, x2, y2, fill, width, segments=4, wobble=0.8):
+        """
+        Vẽ đoạn thẳng qua nhiều đoạn nhỏ với nhiễu nhỏ ở điểm giữa
+        → nét bút trông tự nhiên hơn nét thẳng hoàn hảo.
+        """
+        pts = [(x1, y1)]
+        for i in range(1, segments):
+            t = i / segments
+            mx = x1 + (x2 - x1) * t + jitter(wobble)
+            my = y1 + (y2 - y1) * t + jitter(wobble)
+            pts.append((mx, my))
+        pts.append((x2, y2))
+
+        for i in range(len(pts) - 1):
+            ax, ay = pts[i]
+            bx, by = pts[i + 1]
+            # Giả lập áp lực bút: hai đầu mảnh hơn giữa
+            t = (i + 0.5) / (len(pts) - 1)
+            pressure = math.sin(t * math.pi)          # 0→1→0
+            w = max(1, int(round(width * (0.65 + 0.35 * pressure))))
+            draw.line(
+                (clamp(ax), clamp(ay), clamp(bx), clamp(by)),
+                fill=fill, width=w
+            )
+
+    def rotate_point(x, y, cx, cy, angle_deg):
+        a = math.radians(angle_deg)
+        dx, dy = x - cx, y - cy
+        rx = dx * math.cos(a) - dy * math.sin(a) + cx
+        ry = dx * math.sin(a) + dy * math.cos(a) + cy
+        return rx, ry
+
+    # ─── tham số biến thể toàn cục ─────────────────────────────────────────────
+
+    # Lệch tâm: phân phối Gauss rộng hơn, thỉnh thoảng lệch hẳn
+    cx = size / 2 + random.gauss(0, 1.8)
+    cy = size / 2 + random.gauss(0, 1.8)
+
+    # Độ dày nét: dải rộng hơn, phân phối log-normal giả lập bút bi/bút chì/marker
+    base_thick = random.choice([
+        random.uniform(1.2, 2.0),   # mảnh (bút chì)
+        random.uniform(2.0, 3.2),   # trung bình (bút bi)
+        random.uniform(3.2, 4.5),   # dày (marker)
+    ])
+    thickness = int(round(base_thick))
+
+    # Độ nghiêng của toàn ký hiệu (áp dụng cuối)
+    global_tilt = random.gauss(0, 8)        # ±8° phân phối chuẩn, thỉnh thoảng lệch nhiều
+
+    # Độ dài nét: margin & half_len thay đổi theo chiều bút
+    margin      = random.uniform(4.5, 9.0)
+    half_len_h  = random.uniform(6.5, 10.5)
+    half_len_v  = random.uniform(6.5, 10.5)
+
+    # Số đoạn nhỏ & biên độ rung
+    segs   = random.choice([3, 4, 5, 6])
+    wobble = random.uniform(0.3, 1.2)
+
+    # ─── vẽ theo ký hiệu ───────────────────────────────────────────────────────
 
     if symbol == "+":
-        # horizontal stroke
-        x1 = clamp(cx - half_len_h)
-        y1 = clamp(cy + random.randint(-1, 1))
-        x2 = clamp(cx + half_len_h)
-        y2 = clamp(cy + random.randint(-1, 1))
-        draw.line((x1, y1, x2, y2), fill=255, width=thickness)
+        # Hai nét không nhất thiết đồng đều về chiều dài
+        hl = half_len_h * random.uniform(0.85, 1.15)
+        vl = half_len_v * random.uniform(0.85, 1.15)
 
-        # vertical stroke
-        x3 = clamp(cx + random.randint(-1, 1))
-        y3 = clamp(cy - half_len_v)
-        x4 = clamp(cx + random.randint(-1, 1))
-        y4 = clamp(cy + half_len_v)
-        draw.line((x3, y3, x4, y4), fill=255, width=thickness)
+        # Nét ngang (có thể hơi nghiêng độc lập)
+        h_tilt = random.gauss(0, 3)
+        hx1, hy1 = rotate_point(cx - hl, cy, cx, cy, h_tilt)
+        hx2, hy2 = rotate_point(cx + hl, cy, cx, cy, h_tilt)
+        draw_wobbly_line(draw, hx1, hy1, hx2, hy2, 255, thickness, segs, wobble)
+
+        # Nét dọc (có thể hơi nghiêng độc lập)
+        v_tilt = random.gauss(0, 3)
+        vx1, vy1 = rotate_point(cx, cy - vl, cx, cy, v_tilt)
+        vx2, vy2 = rotate_point(cx, cy + vl, cx, cy, v_tilt)
+        draw_wobbly_line(draw, vx1, vy1, vx2, vy2, 255, thickness, segs, wobble)
 
     elif symbol == "=":
-        gap = random.randint(5, 7)
+        gap = random.uniform(4.0, 8.0)
 
-        # upper line
-        x1 = clamp(margin)
-        y1 = clamp(cy - gap // 2 + random.randint(-1, 0))
-        x2 = clamp(size - margin)
-        y2 = clamp(cy - gap // 2 + random.randint(-1, 0))
-        draw.line((x1, y1, x2, y2), fill=255, width=thickness)
+        # Hai nét không song song hoàn toàn
+        left_x  = margin + random.gauss(0, 1.0)
+        right_x = size - margin + random.gauss(0, 1.0)
 
-        # lower line
-        x3 = clamp(margin)
-        y3 = clamp(cy + gap // 2 + random.randint(0, 1))
-        x4 = clamp(size - margin)
-        y4 = clamp(cy + gap // 2 + random.randint(0, 1))
-        draw.line((x3, y3, x4, y4), fill=255, width=thickness)
+        tilt1 = random.gauss(0, 3)
+        tilt2 = random.gauss(0, 3)
+
+        # Nét trên
+        ux1, uy1 = rotate_point(left_x,  cy - gap / 2, cx, cy, tilt1)
+        ux2, uy2 = rotate_point(right_x, cy - gap / 2, cx, cy, tilt1)
+        draw_wobbly_line(draw, ux1, uy1, ux2, uy2, 255, thickness, segs, wobble)
+
+        # Nét dưới (bắt đầu & kết thúc không đều với nét trên)
+        shift_l = random.gauss(0, 1.5)
+        shift_r = random.gauss(0, 1.5)
+        lx1, ly1 = rotate_point(left_x  + shift_l, cy + gap / 2, cx, cy, tilt2)
+        lx2, ly2 = rotate_point(right_x + shift_r, cy + gap / 2, cx, cy, tilt2)
+        draw_wobbly_line(draw, lx1, ly1, lx2, ly2, 255, thickness, segs, wobble)
 
     elif symbol == "-":
-        x1 = clamp(margin)
-        y1 = clamp(cy + random.randint(-1, 1))
-        x2 = clamp(size - margin)
-        y2 = clamp(cy + random.randint(-1, 1))
-        draw.line((x1, y1, x2, y2), fill=255, width=thickness)
+        left_x  = margin + random.gauss(0, 1.2)
+        right_x = size - margin + random.gauss(0, 1.2)
+        tilt = random.gauss(0, 4)
+        x1, y1 = rotate_point(left_x,  cy, cx, cy, tilt)
+        x2, y2 = rotate_point(right_x, cy, cx, cy, tilt)
+        draw_wobbly_line(draw, x1, y1, x2, y2, 255, thickness, segs, wobble)
 
     elif symbol == "*":
-        # diagonal 1
-        draw.line(
-            (
-                clamp(margin + random.randint(-1, 1)),
-                clamp(margin + random.randint(-1, 1)),
-                clamp(size - margin + random.randint(-1, 1)),
-                clamp(size - margin + random.randint(-1, 1)),
-            ),
-            fill=255,
-            width=thickness,
-        )
+        # × kiểu: hai đường chéo với góc không nhất thiết là 45°
+        angle_bias = random.gauss(0, 6)   # lệch góc so với chuẩn
+        reach = random.uniform(7.0, 11.0)
 
-        # diagonal 2
-        draw.line(
-            (
-                clamp(size - margin + random.randint(-1, 1)),
-                clamp(margin + random.randint(-1, 1)),
-                clamp(margin + random.randint(-1, 1)),
-                clamp(size - margin + random.randint(-1, 1)),
-            ),
-            fill=255,
-            width=thickness,
-        )
+        for base_angle in [45 + angle_bias, 135 + angle_bias]:
+            a = math.radians(base_angle)
+            ax = cx + reach * math.cos(a) + jitter(0.5)
+            ay = cy + reach * math.sin(a) + jitter(0.5)
+            bx = cx - reach * math.cos(a) + jitter(0.5)
+            by = cy - reach * math.sin(a) + jitter(0.5)
+            draw_wobbly_line(draw, ax, ay, bx, by, 255, thickness, segs, wobble)
 
     elif symbol == "/":
-        draw.line(
-            (
-                clamp(size - margin + random.randint(-1, 1)),
-                clamp(margin + random.randint(-1, 1)),
-                clamp(margin + random.randint(-1, 1)),
-                clamp(size - margin + random.randint(-1, 1)),
-            ),
-            fill=255,
-            width=thickness,
-        )
+        # Độ dài hai đầu không đều
+        top_shift    = random.gauss(0, 1.5)
+        bottom_shift = random.gauss(0, 1.5)
+        x1 = size - margin + bottom_shift
+        y1 = size - margin
+        x2 = margin + top_shift
+        y2 = margin
+        draw_wobbly_line(draw, x1, y1, x2, y2, 255, thickness, segs, wobble)
 
     else:
         raise ValueError(f"Unsupported symbol: {symbol}")
 
-    # rotation nhẹ thôi
-    angle = random.uniform(-5, 5)
-    img = img.rotate(angle, resample=Image.Resampling.BILINEAR, fillcolor=0)
+    # ─── xoay toàn ký hiệu ─────────────────────────────────────────────────────
+    img = img.rotate(
+        global_tilt,
+        resample=Image.Resampling.BILINEAR,
+        fillcolor=0,
+        expand=False
+    )
 
-    # blur rất nhẹ, xác suất thấp
-    if random.random() < 0.85:
-        img = img.filter(ImageFilter.GaussianBlur(radius=random.uniform(0.35, 0.5)))
+    # ─── blur (mô phỏng mực loang / bút mềm) ───────────────────────────────────
+    # Xác suất cao hơn, bán kính rộng hơn cho nét dày
+    blur_prob   = 0.80
+    blur_radius = random.uniform(0.3, 0.6) + (base_thick - 2.0) * 0.06
+    if random.random() < blur_prob:
+        img = img.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+
+    # ─── noise nhẹ (hạt bút chì / bụi scanner) ────────────────────────────────
+    # if random.random() < 0.4:
+    #     import numpy as np
+    #     arr  = np.array(img, dtype=np.float32)
+    #     arr += np.random.normal(0, random.uniform(3, 8), arr.shape)
+    #     arr  = np.clip(arr, 0, 255).astype(np.uint8)
+    #     img  = Image.fromarray(arr)
 
     return img
 
