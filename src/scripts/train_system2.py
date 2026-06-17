@@ -31,7 +31,7 @@ from tqdm import tqdm
 
 from src.datasets.mnist_math_dataset import MNISTMathPTDataset
 from src.models.multi_head_system1 import MultiHeadSystem1
-from src.models.system2_model import (
+from src.models.system2_rules import (
     System2Rules,
     compute_system2_accuracy,
     system1_outputs_to_concept,
@@ -351,6 +351,13 @@ def print_learned_rules(system2: System2Rules, output_dir: Path, n: int = 20, th
             "hard_mask": mask.tolist() if hasattr(mask, "tolist") else list(mask)
         })
 
+    # Ghi toàn bộ rules ra file JSON
+    json_path = output_dir / "rule_generated.json"
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(rules_json_data, f, indent=2, ensure_ascii=False)
+    print(f"[INFO] All {system2.num_rules} rules exported to {json_path}")
+
+
 # ─────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────
@@ -449,8 +456,8 @@ def main():
     print(f"  concept_acc={test_m['concept_acc']:.4f}  "
           f"expression_acc={test_m['expression_acc']:.4f}")
 
-    # In rules đã học
-    print_learned_rules(system2, n=20, threshold=0.5)
+    # In rules đã học và export ra JSON
+    print_learned_rules(system2, output_dir=output_dir, n=20, threshold=0.5)
 
     # Save results
     results = {
