@@ -1,421 +1,454 @@
 """
-train_system2.py
-----------------
-Training System 2 với GROUND TRUTH concept vectors (teacher forcing).
+train_system2.py  (v2 — concept-balanced)
+==========================================
+Train System 2 với multi-objective loss đảm bảo mọi concept
+slot (digit1, op1, digit2, op2, digit3, valid) đều ngang nhau.
 
-Pipeline:
-  1. Load dataset → lấy (image, concept_vector, label)
-  2. Nếu System 1 đã train → dùng System 1 extract concept_vec
-     Nếu chưa → dùng ground truth concept one-hot làm concept_vec
-  3. Khởi tạo RuleMemory từ concept vectors (kmeans hoặc random)
-  4. Train System2Rules bằng soft forward + cls_loss + diversity_loss
-  5. Save checkpoint
+Usage:
+    python -m src.training.train_system2 \
+        --data_dir data/mnist_math \
+        --system1_ckpt outputs/system1_baseline/best_model.pt \
+        --output_dir outputs/system2 \
+        --num_rules 64 \
+        --epochs 30
 
-Giả định:
-  - Dataset trả về (image, concept_labels_dict, class_label)
-  - concept_labels_dict: {"d1": int, "o1": int, "d2": int, ...}
-  - Có sẵn hàm build_concept_vector() để chuyển dict → one-hot vector
+Loss weights:
+    --concept_weight   (default 1.0)  CE trên 6 slot
+    --recon_weight     (default 0.5)  MSE reconstruction
+    --sparsity_weight  (default 0.05) entropy regularization
+    --coverage_weight  (default 0.05) penalize unused rules
+    --diversity_weight (default 0.01) penalize identical rules
 """
+from __future__ import annotations
 
-import os
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader
-import yaml
 import argparse
+import json
+from pathlib import Path
+
+import torch
+from torch.utils.data import DataLoader
 from tqdm import tqdm
-from typing import Dict, Tuple, List, Optional, Callable
-import numpy as np
 
-from src.models.system2_model import System2Rules
-from src.models.rule_memory import RuleMemory
+from src.datasets.mnist_math_dataset import MNISTMathPTDataset
+from src.models.multi_head_system1 import MultiHeadSystem1
+from src.models.system2_model import (
+    System2Rules,
+    compute_system2_accuracy,
+    system1_outputs_to_concept,
+)
+from src.models.rule_memory import (
+    labels_to_concept_vector,
+    CONCEPT_KEYS_ORDERED,
+)
+from src.training.metrics import AverageMeter
+from src.utils.seed import set_seed
 
 
-# ======================================================================
-# Helper: build concept vector từ ground truth labels
-# ======================================================================
+# ─────────────────────────────────────────────────────────────
+# Args
+# ─────────────────────────────────────────────────────────────
 
-def build_concept_vector(
-    labels_dict: Dict[str, torch.Tensor],
-    concept_groups: Dict[str, Tuple[int, int]],
-    device: torch.device,
+def parse_args():
+    p = argparse.ArgumentParser(description="Train System 2 (concept-balanced).")
+
+    # Paths
+    p.add_argument("--data_dir",      type=str, required=True)
+    p.add_argument("--system1_ckpt",  type=str, required=True)
+    p.add_argument("--output_dir",    type=str, default="outputs/system2")
+
+    # Architecture
+    p.add_argument("--num_rules",    type=int,   default=64)
+    p.add_argument("--score_mode",   type=str,   default="weighted",
+                   choices=["dot", "weighted", "cosine"])
+    p.add_argument("--temperature",  type=float, default=1.0)
+
+    # Loss weights
+    p.add_argument("--concept_weight",   type=float, default=1.0,
+                   help="Weight cho CE loss trên 6 concept slot.")
+    p.add_argument("--recon_weight",     type=float, default=0.5,
+                   help="Weight cho MSE reconstruction loss.")
+    p.add_argument("--sparsity_weight",  type=float, default=0.05)
+    p.add_argument("--coverage_weight",  type=float, default=0.05)
+    p.add_argument("--diversity_weight", type=float, default=0.01)
+
+    # Per-slot weight override (JSON string)
+    # e.g. '{"digit1":1.0,"op1":1.0,"digit2":1.0,"op2":1.0,"digit3":1.0,"valid":1.0}'
+    p.add_argument("--slot_weights", type=str, default=None,
+                   help="JSON dict override per-slot weight.")
+
+    # Training
+    p.add_argument("--epochs",       type=int,   default=30)
+    p.add_argument("--batch_size",   type=int,   default=128)
+    p.add_argument("--lr",           type=float, default=1e-3)
+    p.add_argument("--weight_decay", type=float, default=1e-4)
+    p.add_argument("--num_workers",  type=int,   default=2)
+    p.add_argument("--seed",         type=int,   default=42)
+
+    # Concept source
+    p.add_argument("--use_gt_concepts", action="store_true",
+                   help="Dùng GT labels làm concept thay vì System1.")
+
+    # Checkpoint monitor
+    p.add_argument("--monitor", type=str, default="expression_acc",
+                   choices=["expression_acc", "concept_acc", "valid_acc",
+                            "digit1_acc", "digit2_acc", "digit3_acc"],
+                   help="Metric để chọn best checkpoint.")
+
+    return p.parse_args()
+
+
+# ─────────────────────────────────────────────────────────────
+# Utils
+# ─────────────────────────────────────────────────────────────
+
+def make_loaders(data_dir: Path, batch_size: int, num_workers: int):
+    kw = dict(batch_size=batch_size, num_workers=num_workers, pin_memory=True)
+    return (
+        DataLoader(MNISTMathPTDataset(data_dir / "train.pt"), shuffle=True,  **kw),
+        DataLoader(MNISTMathPTDataset(data_dir / "val.pt"),   shuffle=False, **kw),
+        DataLoader(MNISTMathPTDataset(data_dir / "test.pt"),  shuffle=False, **kw),
+    )
+
+
+def load_system1(ckpt_path: Path, device: torch.device) -> MultiHeadSystem1:
+    ckpt = torch.load(ckpt_path, map_location=device)
+    feature_dim = ckpt.get("args", {}).get("feature_dim", 256)
+    model = MultiHeadSystem1(feature_dim=feature_dim)
+    model.load_state_dict(ckpt["model_state_dict"])
+    model.to(device).eval()
+    for p in model.parameters():
+        p.requires_grad_(False)
+    print(f"[INFO] System1 loaded (frozen): {ckpt_path}")
+    return model
+
+
+def get_concept_vec(
+    system1   : MultiHeadSystem1,
+    images    : torch.Tensor,
+    labels    : dict[str, torch.Tensor],
+    use_gt    : bool,
+    soft      : bool = True,
 ) -> torch.Tensor:
-    """
-    Chuyển dict nhãn ground truth thành one-hot concept vector.
-
-    Args:
-        labels_dict   : {"d1": [B] int, "o1": [B] int, ...}
-        concept_groups: {"d1": (start, size), ...}
-        device        : torch device
-
-    Returns:
-        [B, concept_dim] float tensor (one-hot concatenated)
-    """
-    B = next(iter(labels_dict.values())).shape[0]
-    concept_dim = sum(size for _, size in concept_groups.values())
-    vec = torch.zeros(B, concept_dim, device=device)
-
-    for group_name, (start, size) in concept_groups.items():
-        if group_name in labels_dict:
-            idx = labels_dict[group_name].long().to(device)  # [B]
-            # One-hot scatter
-            vec[:, start : start + size].scatter_(1, idx.unsqueeze(1), 1.0)
-
-    return vec
+    if use_gt:
+        return labels_to_concept_vector(labels).float()
+    with torch.no_grad():
+        s1_out = system1(images)
+    return system1_outputs_to_concept(s1_out, soft=soft)
 
 
-# ======================================================================
-# Collect all concept vectors từ dataset (để init memory)
-# ======================================================================
+# ─────────────────────────────────────────────────────────────
+# Metrics accumulator
+# ─────────────────────────────────────────────────────────────
 
-@torch.no_grad()
-def collect_concept_vectors(
-    dataloader: DataLoader,
-    concept_groups: Dict[str, Tuple[int, int]],
-    device: torch.device,
-    system1: Optional[nn.Module] = None,
-    max_samples: int = 10000,
-) -> torch.Tensor:
-    """
-    Thu thập concept vectors từ toàn bộ dataset.
-    Nếu system1 không None → dùng System 1 predictions.
-    Ngược lại → dùng ground truth one-hot.
+class SlotAccumulator:
+    """Tích lũy per-slot accuracy + expression accuracy qua batches."""
 
-    Returns: [N, concept_dim]
-    """
-    all_vecs = []
-    collected = 0
+    def __init__(self):
+        self.counts: dict[str, list] = {
+            k: [0, 0] for k in CONCEPT_KEYS_ORDERED   # [correct, total]
+        }
+        self.expr_correct = 0
+        self.expr_total   = 0
 
-    for batch in tqdm(dataloader, desc="Collecting concept vectors"):
-        images = batch["image"].to(device)
-        B = images.shape[0]
+    def update(
+        self,
+        outputs: dict[str, torch.Tensor],
+        labels : dict[str, torch.Tensor],
+        B      : int,
+    ):
+        acc_dict = compute_system2_accuracy(outputs, labels)
 
-        if system1 is not None:
-            # Dùng System 1 predictions
-            system1.eval()
-            preds = system1(images)  # dict {group_name: [B, size] logits}
-            vec_parts = []
-            for group_name, (start, size) in concept_groups.items():
-                if group_name in preds:
-                    logits = preds[group_name]            # [B, size]
-                    vec_parts.append(logits.cpu())
-            vec = torch.cat(vec_parts, dim=-1)           # [B, concept_dim]
-        else:
-            # Ground truth one-hot
-            labels_dict = {k: batch[k] for k in concept_groups if k in batch}
-            vec = build_concept_vector(labels_dict, concept_groups, device).cpu()
+        for key in CONCEPT_KEYS_ORDERED:
+            n_correct = int(round(acc_dict[f"{key}_acc"] * B))
+            self.counts[key][0] += n_correct
+            self.counts[key][1] += B
 
-        all_vecs.append(vec)
-        collected += B
-        if collected >= max_samples:
-            break
+        n_expr = int(round(acc_dict["expression_acc"] * B))
+        self.expr_correct += n_expr
+        self.expr_total   += B
 
-    return torch.cat(all_vecs, dim=0)[:max_samples]
+    def result(self) -> dict[str, float]:
+        out = {}
+        for key in CONCEPT_KEYS_ORDERED:
+            c, t = self.counts[key]
+            out[f"{key}_acc"] = c / t if t > 0 else 0.0
+        out["expression_acc"] = (
+            self.expr_correct / self.expr_total
+            if self.expr_total > 0 else 0.0
+        )
+        out["concept_acc"] = sum(
+            out[f"{k}_acc"] for k in CONCEPT_KEYS_ORDERED
+        ) / len(CONCEPT_KEYS_ORDERED)
+        return out
 
 
-# ======================================================================
-# Training loop
-# ======================================================================
+# ─────────────────────────────────────────────────────────────
+# Train / Eval loops
+# ─────────────────────────────────────────────────────────────
 
-def train_system2(
-    system2: System2Rules,
-    dataloader: DataLoader,
-    val_dataloader: Optional[DataLoader],
-    concept_groups: Dict[str, Tuple[int, int]],
-    output_group: str,
-    device: torch.device,
-    num_epochs: int = 50,
-    lr: float = 1e-3,
-    diversity_weight: float = 0.01,
-    system1: Optional[nn.Module] = None,
-    save_dir: str = "checkpoints/system2",
-    log_interval: int = 10,
-) -> Dict[str, List[float]]:
-    """
-    Main training loop cho System 2.
+def train_one_epoch(
+    system1  : MultiHeadSystem1,
+    system2  : System2Rules,
+    loader   : DataLoader,
+    optimizer: torch.optim.Optimizer,
+    device   : torch.device,
+    args,
+    slot_weights: dict[str, float] | None,
+) -> dict[str, float]:
+    system2.train()
 
-    Args:
-        system2         : System2Rules model
-        dataloader      : training dataloader
-        val_dataloader  : validation dataloader (optional)
-        concept_groups  : {name: (start, size)}
-        output_group    : tên group label
-        device          : torch device
-        num_epochs      : số epochs
-        lr              : learning rate
-        diversity_weight: weight cho diversity loss
-        system1         : nếu có → dùng system1 predictions thay GT concepts
-        save_dir        : nơi lưu checkpoint
-        log_interval    : log mỗi bao nhiêu batch
+    loss_meters = {
+        k: AverageMeter()
+        for k in ["total", "concept", "recon", "sparsity", "coverage", "diversity"]
+    }
+    acc_accum = SlotAccumulator()
 
-    Returns:
-        history: {"train_loss": [...], "train_acc": [...], "val_acc": [...]}
-    """
-    system2 = system2.to(device)
-    optimizer = optim.Adam(system2.parameters(), lr=lr)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
+    for images, labels in tqdm(loader, desc="Train S2", leave=False):
+        images = images.to(device)
+        labels = {k: v.to(device) for k, v in labels.items()}
 
-    os.makedirs(save_dir, exist_ok=True)
-    history = {"train_loss": [], "train_acc": [], "val_acc": []}
-    best_val_acc = 0.0
-
-    for epoch in range(num_epochs):
-        system2.train()
-        epoch_loss = 0.0
-        epoch_acc = 0.0
-        n_batches = 0
-
-        pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{num_epochs}")
-        for batch_idx, batch in enumerate(pbar):
-            images = batch["image"].to(device)
-            labels = batch[output_group].long().to(device)   # [B]
-
-            # --- Tạo concept vector ---
-            if system1 is not None:
-                # System 1 predictions
-                system1.eval()
-                with torch.no_grad():
-                    preds = system1(images)
-                concept_vec = torch.cat(
-                    [preds[g] for g in concept_groups], dim=-1
-                ).to(device)
-            else:
-                # Ground truth teacher forcing
-                labels_dict = {k: batch[k] for k in concept_groups if k in batch}
-                concept_vec = build_concept_vector(labels_dict, concept_groups, device)
-
-            # --- Forward + loss ---
-            optimizer.zero_grad()
-            loss_dict = system2.compute_loss(
-                concept_vec=concept_vec,
-                labels=labels,
-                use_soft=True,
-                diversity_weight=diversity_weight,
-            )
-            loss = loss_dict["loss"]
-            loss.backward()
-
-            # Gradient clipping
-            nn.utils.clip_grad_norm_(system2.parameters(), max_norm=1.0)
-            optimizer.step()
-
-            epoch_loss += loss.item()
-            epoch_acc += loss_dict["acc"].item()
-            n_batches += 1
-
-            if (batch_idx + 1) % log_interval == 0:
-                avg_loss = epoch_loss / n_batches
-                avg_acc = epoch_acc / n_batches
-                pbar.set_postfix({
-                    "loss": f"{avg_loss:.4f}",
-                    "acc": f"{avg_acc:.3f}",
-                    "cls": f"{loss_dict['cls_loss'].item():.4f}",
-                    "div": f"{loss_dict['div_loss'].item():.4f}",
-                })
-
-        scheduler.step()
-
-        avg_train_loss = epoch_loss / max(n_batches, 1)
-        avg_train_acc = epoch_acc / max(n_batches, 1)
-        history["train_loss"].append(avg_train_loss)
-        history["train_acc"].append(avg_train_acc)
-
-        # --- Validation ---
-        val_acc = 0.0
-        if val_dataloader is not None:
-            val_acc = evaluate_system2_accuracy(
-                system2, val_dataloader, concept_groups, output_group,
-                device, system1=system1
-            )
-            history["val_acc"].append(val_acc)
-
-            if val_acc > best_val_acc:
-                best_val_acc = val_acc
-                system2.save(os.path.join(save_dir, "best"))
-                print(f"  ✓ New best val_acc = {val_acc:.4f} → saved")
-
-        print(
-            f"Epoch {epoch+1}/{num_epochs} | "
-            f"loss={avg_train_loss:.4f} | train_acc={avg_train_acc:.4f} | "
-            f"val_acc={val_acc:.4f}"
+        concept_vec = get_concept_vec(
+            system1, images, labels, use_gt=args.use_gt_concepts, soft=True
         )
 
-    # Save final checkpoint
-    system2.save(os.path.join(save_dir, "final"))
-    print(f"\n[train_system2] Training done. Best val_acc = {best_val_acc:.4f}")
+        outputs = system2(concept_vec)
 
-    return history
+        total_loss, loss_dict = System2Rules.compute_loss(
+            outputs=outputs,
+            concept_vec=concept_vec,
+            labels=labels,
+            concept_weight   = args.concept_weight,
+            recon_weight     = args.recon_weight,
+            sparsity_weight  = args.sparsity_weight,
+            coverage_weight  = args.coverage_weight,
+            diversity_weight = args.diversity_weight,
+            slot_weights     = slot_weights,
+        )
 
+        optimizer.zero_grad()
+        total_loss.backward()
+        optimizer.step()
 
-# ======================================================================
-# Evaluate accuracy (helper dùng chung cho train và evaluate scripts)
-# ======================================================================
+        B = images.size(0)
+        loss_meters["total"    ].update(loss_dict["loss_total"    ].item(), B)
+        loss_meters["concept"  ].update(loss_dict["loss_concept"  ].item(), B)
+        loss_meters["recon"    ].update(loss_dict["loss_recon"    ].item(), B)
+        loss_meters["sparsity" ].update(loss_dict["loss_sparsity" ].item(), B)
+        loss_meters["coverage" ].update(loss_dict["loss_coverage" ].item(), B)
+        loss_meters["diversity"].update(loss_dict["loss_diversity"].item(), B)
+
+        acc_accum.update(outputs, labels, B)
+
+    result = {f"loss_{k}": v.avg for k, v in loss_meters.items()}
+    result.update(acc_accum.result())
+    return result
+
 
 @torch.no_grad()
-def evaluate_system2_accuracy(
-    system2: System2Rules,
-    dataloader: DataLoader,
-    concept_groups: Dict[str, Tuple[int, int]],
-    output_group: str,
-    device: torch.device,
-    system1: Optional[nn.Module] = None,
-    use_gt_concepts: bool = False,
-) -> float:
-    """
-    Tính accuracy của System 2.
-
-    Args:
-        use_gt_concepts: True → dùng GT concepts (upper bound);
-                         False → dùng System 1 predictions (thực tế)
-    """
+def evaluate(
+    system1 : MultiHeadSystem1,
+    system2 : System2Rules,
+    loader  : DataLoader,
+    device  : torch.device,
+    args,
+    split   : str = "Val",
+    slot_weights: dict[str, float] | None = None,
+) -> dict[str, float]:
     system2.eval()
-    correct = 0
-    total = 0
 
-    for batch in dataloader:
-        images = batch["image"].to(device)
-        labels = batch[output_group].long().to(device)
-        B = images.shape[0]
+    loss_meter = AverageMeter()
+    acc_accum  = SlotAccumulator()
 
-        if use_gt_concepts or system1 is None:
-            labels_dict = {k: batch[k] for k in concept_groups if k in batch}
-            concept_vec = build_concept_vector(labels_dict, concept_groups, device)
-        else:
-            system1.eval()
-            preds = system1(images)
-            concept_vec = torch.cat(
-                [preds[g] for g in concept_groups], dim=-1
-            ).to(device)
+    for images, labels in tqdm(loader, desc=f"Eval [{split}]", leave=False):
+        images = images.to(device)
+        labels = {k: v.to(device) for k, v in labels.items()}
 
-        out = system2.forward(concept_vec)
-        pred_labels = out["logits"].argmax(dim=-1)
-        correct += (pred_labels == labels).sum().item()
-        total += B
+        concept_vec = get_concept_vec(
+            system1, images, labels, use_gt=args.use_gt_concepts, soft=True
+        )
 
-    return correct / max(total, 1)
+        outputs = system2(concept_vec)
+
+        total_loss, _ = System2Rules.compute_loss(
+            outputs=outputs,
+            concept_vec=concept_vec,
+            labels=labels,
+            concept_weight   = args.concept_weight,
+            recon_weight     = args.recon_weight,
+            sparsity_weight  = args.sparsity_weight,
+            coverage_weight  = args.coverage_weight,
+            diversity_weight = args.diversity_weight,
+            slot_weights     = slot_weights,
+        )
+
+        B = images.size(0)
+        loss_meter.update(total_loss.item(), B)
+        acc_accum.update(outputs, labels, B)
+
+    result = {"loss_total": loss_meter.avg}
+    result.update(acc_accum.result())
+    return result
 
 
-# ======================================================================
-# Main entry point
-# ======================================================================
+# ─────────────────────────────────────────────────────────────
+# Pretty print helpers
+# ─────────────────────────────────────────────────────────────
+
+def print_epoch(epoch: int, total: int, train_m: dict, val_m: dict):
+    print(
+        f"Epoch {epoch:3d}/{total} | "
+        f"loss={train_m['loss_total']:.4f} "
+        f"(concept={train_m['loss_concept']:.4f}, "
+        f"recon={train_m['loss_recon']:.4f}) | "
+        f"val_loss={val_m['loss_total']:.4f}"
+    )
+    # Per-slot accuracy
+    slot_str = "  ".join(
+        f"{k}={val_m[f'{k}_acc']:.4f}" for k in CONCEPT_KEYS_ORDERED
+    )
+    print(f"  Val slot acc: {slot_str}")
+    print(
+        f"  Val concept_acc={val_m['concept_acc']:.4f}  "
+        f"expression_acc={val_m['expression_acc']:.4f}"
+    )
+
+
+def print_learned_rules(system2: System2Rules, n: int = 20, threshold: float = 0.5):
+    print(f"\n[INFO] Top {n} learned rules (mask threshold={threshold}):")
+    slot_probs = system2.get_rule_slot_probs()
+
+    for i in range(min(n, system2.num_rules)):
+        # Decode prototype prediction per slot
+        parts = []
+        for key in CONCEPT_KEYS_ORDERED:
+            pred_idx = slot_probs[key][i].argmax().item()
+            if key in ("op1", "op2"):
+                from src.utils.symbols import ID_TO_SYMBOL
+                label = ID_TO_SYMBOL.get(pred_idx, str(pred_idx))
+            else:
+                label = str(pred_idx)
+            parts.append(f"{key}={label}")
+
+        rule_str = " AND ".join(parts)
+        # Mask info
+        mask = system2.memory.get_hard_masks(threshold)[i]
+        n_active = int(mask.sum().item())
+        print(f"  Rule {i:3d} [{n_active:2d} active slots]: {rule_str}")
+
+
+# ─────────────────────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="Train System 2 (Rule-based)")
-    parser.add_argument("--config", type=str, required=True,
-                        help="Path to config YAML file")
-    parser.add_argument("--system1_ckpt", type=str, default=None,
-                        help="Path to System 1 checkpoint (optional)")
-    parser.add_argument("--save_dir", type=str, default="checkpoints/system2")
-    parser.add_argument("--num_rules", type=int, default=None,
-                        help="Override num_rules from config")
-    parser.add_argument("--epochs", type=int, default=None)
-    parser.add_argument("--lr", type=float, default=None)
-    parser.add_argument("--init_strategy", type=str, default="kmeans",
-                        choices=["kmeans", "random_sample"])
-    parser.add_argument("--use_gt_concepts", action="store_true",
-                        help="Use GT concepts instead of System 1 predictions")
-    args = parser.parse_args()
+    args = parse_args()
+    set_seed(args.seed)
 
-    # Load config
-    with open(args.config) as f:
-        cfg = yaml.safe_load(f)
+    data_dir   = Path(args.data_dir)
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[train_system2] Device: {device}")
+    print(f"[INFO] Device: {device}")
 
-    # Lấy concept_groups từ config
-    # Expected format trong config:
-    # concept_groups:
-    #   d1: [0, 10]
-    #   o1: [10, 4]
-    #   d2: [14, 10]
-    #   o2: [24, 4]
-    #   d3: [28, 10]
-    #   output: [38, 2]
-    concept_groups_raw = cfg["concept_groups"]
-    concept_groups = {
-        k: tuple(v) for k, v in concept_groups_raw.items()
-    }
+    # Slot weights
+    slot_weights: dict[str, float] | None = None
+    if args.slot_weights:
+        slot_weights = json.loads(args.slot_weights)
+        print(f"[INFO] Slot weights: {slot_weights}")
 
-    output_group = cfg.get("output_group", "output")
-    num_rules = args.num_rules or cfg.get("system2", {}).get("num_rules", 100)
-    num_epochs = args.epochs or cfg.get("system2", {}).get("num_epochs", 50)
-    lr = args.lr or cfg.get("system2", {}).get("lr", 1e-3)
-    diversity_weight = cfg.get("system2", {}).get("diversity_weight", 0.01)
+    train_loader, val_loader, test_loader = make_loaders(
+        data_dir, args.batch_size, args.num_workers
+    )
 
-    # ---- Load dataset ----
-    # Người dùng cần implement hàm get_dataloaders() phù hợp với project
-    # Đây là placeholder interface
-    try:
-        from src.data.dataset import get_dataloaders
-        train_loader, val_loader = get_dataloaders(cfg, split="train"), \
-                                   get_dataloaders(cfg, split="val")
-    except ImportError:
-        raise RuntimeError(
-            "Cần implement src/data/dataset.py với hàm get_dataloaders(cfg, split)"
+    system1 = load_system1(Path(args.system1_ckpt), device)
+
+    system2 = System2Rules(
+        num_rules   = args.num_rules,
+        score_mode  = args.score_mode,
+        temperature = args.temperature,
+    ).to(device)
+
+    optimizer = torch.optim.AdamW(
+        system2.parameters(),
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+    )
+
+    print(f"[INFO] System2: {args.num_rules} rules, score_mode={args.score_mode}")
+    print(f"[INFO] Loss weights: concept={args.concept_weight}, "
+          f"recon={args.recon_weight}, sparsity={args.sparsity_weight}, "
+          f"coverage={args.coverage_weight}, diversity={args.diversity_weight}")
+    print(f"[INFO] Monitor: {args.monitor}")
+    print(f"[INFO] Concept source: "
+          f"{'GT labels' if args.use_gt_concepts else 'System1 predictions'}")
+
+    best_val_metric = -1.0
+    history = []
+
+    for epoch in range(1, args.epochs + 1):
+        train_m = train_one_epoch(
+            system1, system2, train_loader, optimizer, device, args, slot_weights
+        )
+        val_m = evaluate(
+            system1, system2, val_loader, device, args, "Val", slot_weights
         )
 
-    # ---- Load System 1 (optional) ----
-    system1 = None
-    if args.system1_ckpt and not args.use_gt_concepts:
-        try:
-            from src.models.multi_output_net import MultiOutputNet
-            system1 = MultiOutputNet.load(args.system1_ckpt)
-            system1 = system1.to(device)
-            system1.eval()
-            print(f"[train_system2] Loaded System 1 from {args.system1_ckpt}")
-        except Exception as e:
-            print(f"[train_system2] Warning: Could not load System 1: {e}")
-            print("[train_system2] Falling back to GT concepts")
+        print_epoch(epoch, args.epochs, train_m, val_m)
 
-    # ---- Collect concept vectors để init memory ----
-    print(f"[train_system2] Collecting concept vectors for memory init...")
-    concept_vectors = collect_concept_vectors(
-        train_loader, concept_groups, device,
-        system1=system1 if not args.use_gt_concepts else None,
-        max_samples=5000,
-    )
-    print(f"[train_system2] Collected {concept_vectors.shape[0]} concept vectors")
+        row = {
+            "epoch": epoch,
+            **{f"train_{k}": v for k, v in train_m.items()},
+            **{f"val_{k}":   v for k, v in val_m.items()},
+        }
+        history.append(row)
 
-    # ---- Khởi tạo System 2 ----
-    system2 = System2Rules(
-        num_rules=num_rules,
-        concept_groups=concept_groups,
-        output_group=output_group,
-        match_mode=cfg.get("system2", {}).get("match_mode", "cosine"),
-        temperature=cfg.get("system2", {}).get("temperature", 1.0),
-        diversity_weight=diversity_weight if False else None,  # handled in compute_loss
-    )
+        monitored = val_m[args.monitor]
+        if monitored > best_val_metric:
+            best_val_metric = monitored
+            torch.save(
+                {
+                    "model_state_dict"  : system2.state_dict(),
+                    "args"              : vars(args),
+                    "best_val_metric"   : best_val_metric,
+                    "monitor"           : args.monitor,
+                    "epoch"             : epoch,
+                },
+                output_dir / "best_system2.pt",
+            )
+            print(f"  → Saved best ({args.monitor}={best_val_metric:.4f})")
 
-    # Init memory từ data
-    print(f"[train_system2] Initializing {num_rules} rule prototypes via {args.init_strategy}...")
-    system2.init_memory_from_data(concept_vectors, strategy=args.init_strategy)
+    # ── Final evaluation ─────────────────────────────────────
+    ckpt = torch.load(output_dir / "best_system2.pt", map_location=device)
+    system2.load_state_dict(ckpt["model_state_dict"])
 
-    # Set concept labels nếu có trong config
-    if "concept_labels" in cfg:
-        system2.set_concept_labels(cfg["concept_labels"])
-
-    print(f"[train_system2] System 2 initialized: {num_rules} rules, "
-          f"concept_dim={system2.concept_dim}")
-
-    # ---- Training ----
-    history = train_system2(
-        system2=system2,
-        dataloader=train_loader,
-        val_dataloader=val_loader,
-        concept_groups=concept_groups,
-        output_group=output_group,
-        device=device,
-        num_epochs=num_epochs,
-        lr=lr,
-        diversity_weight=diversity_weight,
-        system1=system1 if not args.use_gt_concepts else None,
-        save_dir=args.save_dir,
+    test_m = evaluate(
+        system1, system2, test_loader, device, args, "Test", slot_weights
     )
 
-    print("\n[train_system2] Done!")
-    print(f"  Best val_acc: {max(history['val_acc']) if history['val_acc'] else 'N/A':.4f}")
+    print("\n[DONE] Test results:")
+    slot_str = "  ".join(
+        f"{k}={test_m[f'{k}_acc']:.4f}" for k in CONCEPT_KEYS_ORDERED
+    )
+    print(f"  Slot acc: {slot_str}")
+    print(f"  concept_acc={test_m['concept_acc']:.4f}  "
+          f"expression_acc={test_m['expression_acc']:.4f}")
+
+    # In rules đã học
+    print_learned_rules(system2, n=20, threshold=0.5)
+
+    # Save results
+    results = {
+        "best_val_metric" : best_val_metric,
+        "monitor"         : args.monitor,
+        "test_metrics"    : test_m,
+        "history"         : history,
+        "args"            : vars(args),
+    }
+    with open(output_dir / "metrics.json", "w") as f:
+        json.dump(results, f, indent=2)
+
+    print(f"\n[INFO] Results saved to {output_dir}/metrics.json")
 
 
 if __name__ == "__main__":
