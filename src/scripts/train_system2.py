@@ -28,7 +28,7 @@ from tqdm import tqdm
 from typing import Dict, Tuple, List, Optional, Callable
 import numpy as np
 
-from src.models.system2_rules import System2Rules
+from src.models.system2_model import System2Rules
 from src.models.rule_memory import RuleMemory
 
 
