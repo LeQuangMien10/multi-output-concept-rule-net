@@ -123,6 +123,7 @@ def main():
     print("====================")
     print(f"Accuracy: {acc:.4f}")
     print(f"Total samples: {total}")
+    print(f"10 best rules: {best_rule[:10]}")
 
 
 if __name__ == "__main__":
