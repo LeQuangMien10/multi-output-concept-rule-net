@@ -313,13 +313,16 @@ def print_epoch(epoch: int, total: int, train_m: dict, val_m: dict):
     )
 
 
-def print_learned_rules(system2: System2Rules, n: int = 20, threshold: float = 0.5):
+def print_learned_rules(system2: System2Rules, output_dir: Path, n: int = 20, threshold: float = 0.5):
     print(f"\n[INFO] Top {n} learned rules (mask threshold={threshold}):")
     slot_probs = system2.get_rule_slot_probs()
 
-    for i in range(min(n, system2.num_rules)):
+    rules_json_data = []
+
+    for i in range(system2.num_rules):
         # Decode prototype prediction per slot
         parts = []
+        slots_dict = {}
         for key in CONCEPT_KEYS_ORDERED:
             pred_idx = slot_probs[key][i].argmax().item()
             if key in ("op1", "op2"):
@@ -328,13 +331,25 @@ def print_learned_rules(system2: System2Rules, n: int = 20, threshold: float = 0
             else:
                 label = str(pred_idx)
             parts.append(f"{key}={label}")
+            slots_dict[key] = label
 
         rule_str = " AND ".join(parts)
         # Mask info
         mask = system2.memory.get_hard_masks(threshold)[i]
         n_active = int(mask.sum().item())
-        print(f"  Rule {i:3d} [{n_active:2d} active slots]: {rule_str}")
+        
+        # Chỉ print ra terminal n rules đầu tiên theo yêu cầu ban đầu
+        if i < n:
+            print(f"  Rule {i:3d} [{n_active:2d} active slots]: {rule_str}")
 
+        # Lưu lại thông tin cấu trúc của rule để export JSON
+        rules_json_data.append({
+            "rule_id": i,
+            "active_slots_count": n_active,
+            "rule_string": rule_str,
+            "slots": slots_dict,
+            "hard_mask": mask.tolist() if hasattr(mask, "tolist") else list(mask)
+        })
 
 # ─────────────────────────────────────────────────────────────
 # Main
