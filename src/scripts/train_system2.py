@@ -31,7 +31,7 @@ from tqdm import tqdm
 
 from src.datasets.mnist_math_dataset import MNISTMathPTDataset
 from src.models.multi_head_system1 import MultiHeadSystem1
-from src.models.system2_rules import (
+from src.models.system2_model import (
     System2Rules,
     compute_system2_accuracy,
     system1_outputs_to_concept,
