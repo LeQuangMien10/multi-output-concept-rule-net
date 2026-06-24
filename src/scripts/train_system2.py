@@ -25,6 +25,7 @@ import argparse
 import json
 from pathlib import Path
 
+import math
 import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -62,8 +63,12 @@ def parse_args():
     p.add_argument("--score_mode",   type=str,   default="slot_cosine",
                    choices=["slot_cosine", "flat_cosine"],
                    help="slot_cosine: mỗi slot đóng góp đều nhau (recommended).")
-    p.add_argument("--temperature",  type=float, default=0.5,
-                   help="Softmax temperature. Thấp hơn → peaked assignment.")
+    p.add_argument("--T_max",        type=float, default=2.0,
+                   help="Temperature ban đầu (cosine annealing). Cao → exploration.")
+    p.add_argument("--T_min",        type=float, default=0.07,
+                   help="Temperature cuối (cosine annealing). Thấp → peaked assignment.")
+    p.add_argument("--init_sharp",   type=float, default=8.0,
+                   help="Logit sharpness khi khởi tạo prototype từ expressions.")
     p.add_argument("--hard_threshold", type=float, default=0.7,
                    help="Cosine threshold để coi slot khớp khi inference.")
 
@@ -307,11 +312,13 @@ def evaluate(
 # ─────────────────────────────────────────────────────────────
 
 def print_epoch(epoch: int, total: int, train_m: dict, val_m: dict):
+    temp_str = f" T={train_m.get('temperature', 0):.3f}" if 'temperature' in train_m else ""
     print(
-        f"Epoch {epoch:3d}/{total} | "
+        f"Epoch {epoch:3d}/{total}{temp_str} | "
         f"loss={train_m['loss_total']:.4f} "
         f"(concept={train_m['loss_concept']:.4f}, "
-        f"recon={train_m['loss_recon']:.4f}) | "
+        f"recon={train_m['loss_recon']:.4f}, "
+        f"spar={train_m['loss_sparsity']:.3f}) | "
         f"val_loss={val_m['loss_total']:.4f}"
     )
     # Per-slot accuracy
@@ -377,6 +384,11 @@ def print_learned_rules(system2: System2Rules, output_dir: Path, n: int = 20):
 # Main
 # ─────────────────────────────────────────────────────────────
 
+def get_temperature(epoch: int, total_epochs: int, T_max: float, T_min: float) -> float:
+    """Cosine annealing schedule: T_max → T_min qua total_epochs."""
+    return T_min + 0.5 * (T_max - T_min) * (1 + math.cos(math.pi * epoch / total_epochs))
+
+
 def main():
     args = parse_args()
     set_seed(args.seed)
@@ -403,9 +415,13 @@ def main():
     system2 = System2Rules(
         num_rules      = args.num_rules,
         score_mode     = args.score_mode,
-        temperature    = args.temperature,
+        temperature    = args.T_max,   # sẽ được override mỗi epoch bởi annealing
         hard_threshold = args.hard_threshold,
+        init_sharp     = args.init_sharp,
     ).to(device)
+    # lưu T_max/T_min vào system2 để checkpoint có thể restore
+    system2._T_max = args.T_max
+    system2._T_min = args.T_min
 
     optimizer = torch.optim.AdamW(
         system2.parameters(),
@@ -414,7 +430,9 @@ def main():
     )
 
     print(f"[INFO] System2: {args.num_rules} rules, score_mode={args.score_mode}, "
-          f"temperature={args.temperature}, hard_threshold={args.hard_threshold}")
+          f"T_max={args.T_max} → T_min={args.T_min} (cosine annealing), "
+          f"hard_threshold={args.hard_threshold}")
+    print(f"[INFO] Prototype init: sharp={args.init_sharp}")
     print(f"[INFO] Warm-up GT epochs: {args.warmup_gt_epochs}")
     print(f"[INFO] Loss weights: concept={args.concept_weight}, "
           f"recon={args.recon_weight}, sparsity={args.sparsity_weight}, "
@@ -427,6 +445,10 @@ def main():
     history = []
 
     for epoch in range(1, args.epochs + 1):
+        # Temperature annealing: T_max → T_min theo cosine schedule
+        current_temp = get_temperature(epoch, args.epochs, args.T_max, args.T_min)
+        system2.temperature = current_temp
+
         train_m = train_one_epoch(
             system1, system2, train_loader, optimizer, device, args, slot_weights,
             epoch=epoch,
@@ -435,6 +457,7 @@ def main():
             system1, system2, val_loader, device, args, "Val", slot_weights
         )
 
+        train_m["temperature"] = current_temp
         print_epoch(epoch, args.epochs, train_m, val_m)
 
         row = {

@@ -58,6 +58,75 @@ from src.models.rule_memory import (
 from src.models.rule_matching import RuleMatcher
 
 
+# ─────────────────────────────────────────────────────────────
+# Prototype initialization helper
+# ─────────────────────────────────────────────────────────────
+
+def _enumerate_mnist_math_expressions(op1_id: int = 0, op2_id: int = 4) -> list[tuple]:
+    """
+    Liệt kê tất cả biểu thức a op1 b op2 c với:
+        op1=+  (id=0), op2==  (id=4)
+        allow_carry=False  → a+b ≤ 9
+    Trả về list (digit1, op1, digit2, op2, digit3, valid).
+    """
+    valid, invalid = [], []
+    for a in range(10):
+        for b in range(10):
+            c_true = a + b
+            if c_true > 9:
+                continue
+            valid.append((a, op1_id, b, op2_id, c_true, 1))
+            # 1 invalid peer: same a,b, digit3 sai
+            c_wrong = (c_true + 1) % 10
+            invalid.append((a, op1_id, b, op2_id, c_wrong, 0))
+    return valid, invalid
+
+
+def _build_prototype_logits(
+    num_rules:    int,
+    concept_dims: dict,
+    concept_keys: list,
+    sharp:        float = 8.0,
+    seed:         int   = 42,
+) -> dict:
+    """
+    Xây dựng logit tensors để khởi tạo rule_slot_logits.
+
+    Thay vì random N(0, 0.1) dẫn đến softmax đều và score spread ≈ 0,
+    mỗi rule được gán một biểu thức toán học cụ thể:
+        rule r ← expression (digit1=a, op1=+, digit2=b, op2==, digit3=c, valid=v)
+    với logit[r, target_class] = sharp, còn lại = 0.
+
+    Kết quả: softmax(logit) ≈ peaked → cosine giữa 2 rules khác nhau ≈ 0
+    → score spread cao ngay từ epoch 1 → softmax/T không bị uniform.
+
+    Returns
+    -------
+    dict[key → FloatTensor[num_rules, dim_k]]
+    """
+    import random as _random
+    _random.seed(seed)
+
+    valid_exprs, invalid_exprs = _enumerate_mnist_math_expressions()
+    all_exprs = valid_exprs + invalid_exprs
+    _random.shuffle(all_exprs)
+
+    # Pad nếu num_rules > len(all_exprs)
+    while len(all_exprs) < num_rules:
+        all_exprs.append(_random.choice(all_exprs))
+    exprs = all_exprs[:num_rules]
+
+    logits = {key: torch.zeros(num_rules, concept_dims[key]) for key in concept_keys}
+    key_to_pos = {k: i for i, k in enumerate(concept_keys)}
+
+    for r, expr in enumerate(exprs):
+        vals = dict(zip(concept_keys, expr))
+        for key in concept_keys:
+            logits[key][r, vals[key]] = sharp
+
+    return logits
+
+
 class System2Rules(nn.Module):
     """
     System 2 v3: prototype-based scoring.
@@ -77,25 +146,31 @@ class System2Rules(nn.Module):
         num_rules:      int   = 128,
         concept_dim:    int   = CONCEPT_TOTAL_DIM,
         score_mode:     str   = "slot_cosine",
-        temperature:    float = 0.5,
+        temperature:    float = 2.0,   # overridden per-epoch by annealing
         hard_threshold: float = 0.7,
+        init_sharp:     float = 8.0,   # logit sharpness for prototype init
     ):
         super().__init__()
 
         self.num_rules   = num_rules
         self.concept_dim = concept_dim
         self.temperature = temperature
+        self.init_sharp  = init_sharp
 
         # ── Rule prototype: một tham số, hai nhiệm vụ ────────
         # rule_slot_logits[k]: [R, dim_k]
-        # Trước softmax: logit của prototype value cho mỗi slot mỗi rule.
-        # Khởi tạo N(0, 0.1): softmax gần đều → rule chưa committed,
-        # để gradient từ cả score và CE tự kéo về giá trị đúng.
+        # Khởi tạo từ danh sách expression cụ thể (không phải random):
+        #   → các rules bắt đầu từ các điểm khác nhau trong concept space
+        #   → score spread cao ngay từ epoch 1 → softmax không bị uniform
+        init_logits = _build_prototype_logits(
+            num_rules=num_rules,
+            concept_dims=CONCEPT_DIMS,
+            concept_keys=CONCEPT_KEYS_ORDERED,
+            sharp=init_sharp,
+        )
         self.rule_slot_logits = nn.ParameterDict({
-            key: nn.Parameter(
-                torch.randn(num_rules, dim) * 0.1
-            )
-            for key, dim in CONCEPT_DIMS.items()
+            key: nn.Parameter(init_logits[key])
+            for key in CONCEPT_DIMS
         })
 
         # ── Matcher ──────────────────────────────────────────
