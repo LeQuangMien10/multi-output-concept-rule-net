@@ -38,11 +38,21 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42)
 
     parser.add_argument("--feature_dim", type=int, default=256)
+    parser.add_argument("--num_slots", type=int, default=5,
+                        help="Số ký tự trong biểu thức (5 cho MNIST Math).")
     parser.add_argument(
         "--valid_loss_weight",
         type=float,
         default=1.0,
         help="Weight for valid/invalid classification loss.",
+    )
+    parser.add_argument(
+        "--monitor",
+        type=str,
+        default="expression_acc",
+        choices=["expression_acc", "valid_acc", "digit1_acc",
+                 "digit2_acc", "digit3_acc"],
+        help="Metric dùng để lưu best checkpoint.",
     )
 
     return parser.parse_args()
@@ -208,7 +218,10 @@ def main():
         num_workers=args.num_workers,
     )
 
-    model = MultiHeadSystem1(feature_dim=args.feature_dim).to(device)
+    model = MultiHeadSystem1(
+        feature_dim=args.feature_dim,
+        num_slots=args.num_slots,
+    ).to(device)
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -216,7 +229,7 @@ def main():
         weight_decay=args.weight_decay,
     )
 
-    best_val_valid_acc = -1.0
+    best_val_metric = -1.0
     history = []
 
     for epoch in range(1, args.epochs + 1):
@@ -264,21 +277,24 @@ def main():
             f"d3={row['val_digit3_acc']:.4f}"
         )
 
-        if val_metrics["valid_acc"] > best_val_valid_acc:
-            best_val_valid_acc = val_metrics["valid_acc"]
+        # Lưu checkpoint theo metric được chọn (mặc định expression_acc)
+        monitored = val_metrics[args.monitor]
+        if monitored > best_val_metric:
+            best_val_metric = monitored
             ckpt_path = output_dir / "best_model.pt"
 
             torch.save(
                 {
                     "model_state_dict": model.state_dict(),
                     "args": vars(args),
-                    "best_val_valid_acc": best_val_valid_acc,
+                    "best_val_metric": best_val_metric,
+                    "monitor": args.monitor,
                     "epoch": epoch,
                 },
                 ckpt_path,
             )
 
-            print(f"[INFO] Saved best checkpoint to {ckpt_path}")
+            print(f"[INFO] Saved best checkpoint ({args.monitor}={best_val_metric:.4f})")
 
     best_ckpt = torch.load(output_dir / "best_model.pt", map_location=device)
     model.load_state_dict(best_ckpt["model_state_dict"])
@@ -292,7 +308,8 @@ def main():
     )
 
     results = {
-        "best_val_valid_acc": best_val_valid_acc,
+        "best_val_metric": best_val_metric,
+        "monitor": args.monitor,
         "test_metrics": test_metrics,
         "history": history,
         "args": vars(args),
@@ -301,8 +318,18 @@ def main():
     with open(output_dir / "metrics.json", "w", encoding="utf-8") as f:
         json.dump(results, f, indent=2)
 
-    print("\n[DONE] System 1 baseline results:")
-    print(json.dumps(results, indent=2))
+    print("\n[DONE] System 1 results:")
+    print(f"  best_val_{args.monitor} = {best_val_metric:.4f}")
+    print(f"  test_expression_acc    = {test_metrics['expression_acc']:.4f}")
+    print(
+        f"  test slot acc: "
+        f"d1={test_metrics['digit1_acc']:.4f}  "
+        f"op1={test_metrics['op1_acc']:.4f}  "
+        f"d2={test_metrics['digit2_acc']:.4f}  "
+        f"op2={test_metrics['op2_acc']:.4f}  "
+        f"d3={test_metrics['digit3_acc']:.4f}  "
+        f"valid={test_metrics['valid_acc']:.4f}"
+    )
 
 
 if __name__ == "__main__":

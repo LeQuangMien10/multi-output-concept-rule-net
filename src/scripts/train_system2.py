@@ -112,13 +112,16 @@ def make_loaders(data_dir: Path, batch_size: int, num_workers: int):
 
 def load_system1(ckpt_path: Path, device: torch.device) -> MultiHeadSystem1:
     ckpt = torch.load(ckpt_path, map_location=device)
-    feature_dim = ckpt.get("args", {}).get("feature_dim", 256)
-    model = MultiHeadSystem1(feature_dim=feature_dim)
+    saved_args = ckpt.get("args", {})
+    feature_dim = saved_args.get("feature_dim", 256)
+    num_slots   = saved_args.get("num_slots", 5)
+    model = MultiHeadSystem1(feature_dim=feature_dim, num_slots=num_slots)
     model.load_state_dict(ckpt["model_state_dict"])
     model.to(device).eval()
     for p in model.parameters():
         p.requires_grad_(False)
     print(f"[INFO] System1 loaded (frozen): {ckpt_path}")
+    print(f"       feature_dim={feature_dim}, num_slots={num_slots}, slot_dim={model.slot_dim}")
     return model
 
 
