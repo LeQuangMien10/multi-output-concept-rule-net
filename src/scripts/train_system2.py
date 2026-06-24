@@ -57,27 +57,31 @@ def parse_args():
     p.add_argument("--output_dir",    type=str, default="outputs/system2")
 
     # Architecture
-    p.add_argument("--num_rules",    type=int,   default=64)
-    p.add_argument("--score_mode",   type=str,   default="weighted",
-                   choices=["dot", "weighted", "cosine"])
-    p.add_argument("--temperature",  type=float, default=1.0)
+    p.add_argument("--num_rules",    type=int,   default=128,
+                   help="Số rule prototype. 128 cho MNIST Math (100+ valid expressions).")
+    p.add_argument("--score_mode",   type=str,   default="slot_cosine",
+                   choices=["slot_cosine", "flat_cosine"],
+                   help="slot_cosine: mỗi slot đóng góp đều nhau (recommended).")
+    p.add_argument("--temperature",  type=float, default=0.5,
+                   help="Softmax temperature. Thấp hơn → peaked assignment.")
+    p.add_argument("--hard_threshold", type=float, default=0.7,
+                   help="Cosine threshold để coi slot khớp khi inference.")
 
     # Loss weights
     p.add_argument("--concept_weight",   type=float, default=1.0,
                    help="Weight cho CE loss trên 6 concept slot.")
-    p.add_argument("--recon_weight",     type=float, default=0.5,
+    p.add_argument("--recon_weight",     type=float, default=0.3,
                    help="Weight cho MSE reconstruction loss.")
     p.add_argument("--sparsity_weight",  type=float, default=0.05)
     p.add_argument("--coverage_weight",  type=float, default=0.05)
-    p.add_argument("--diversity_weight", type=float, default=0.01)
+    p.add_argument("--diversity_weight", type=float, default=0.02)
 
     # Per-slot weight override (JSON string)
-    # e.g. '{"digit1":1.0,"op1":1.0,"digit2":1.0,"op2":1.0,"digit3":1.0,"valid":1.0}'
     p.add_argument("--slot_weights", type=str, default=None,
-                   help="JSON dict override per-slot weight.")
+                   help="JSON dict, e.g. '{\"digit3\":2.0}'")
 
     # Training
-    p.add_argument("--epochs",       type=int,   default=30)
+    p.add_argument("--epochs",       type=int,   default=50)
     p.add_argument("--batch_size",   type=int,   default=128)
     p.add_argument("--lr",           type=float, default=1e-3)
     p.add_argument("--weight_decay", type=float, default=1e-4)
@@ -87,6 +91,8 @@ def parse_args():
     # Concept source
     p.add_argument("--use_gt_concepts", action="store_true",
                    help="Dùng GT labels làm concept thay vì System1.")
+    p.add_argument("--warmup_gt_epochs", type=int, default=5,
+                   help="Số epoch đầu dùng GT concept (warm-up). Đặt 0 để tắt.")
 
     # Checkpoint monitor
     p.add_argument("--monitor", type=str, default="expression_acc",
@@ -197,6 +203,7 @@ def train_one_epoch(
     device   : torch.device,
     args,
     slot_weights: dict[str, float] | None,
+    epoch    : int = 0,
 ) -> dict[str, float]:
     system2.train()
 
@@ -210,8 +217,10 @@ def train_one_epoch(
         images = images.to(device)
         labels = {k: v.to(device) for k, v in labels.items()}
 
+        # Warm-up: dùng GT concept trong warmup_gt_epochs đầu
+        use_gt_now = args.use_gt_concepts or (epoch <= args.warmup_gt_epochs)
         concept_vec = get_concept_vec(
-            system1, images, labels, use_gt=args.use_gt_concepts, soft=True
+            system1, images, labels, use_gt=use_gt_now, soft=True
         )
 
         outputs = system2(concept_vec)
@@ -316,45 +325,48 @@ def print_epoch(epoch: int, total: int, train_m: dict, val_m: dict):
     )
 
 
-def print_learned_rules(system2: System2Rules, output_dir: Path, n: int = 20, threshold: float = 0.5):
-    print(f"\n[INFO] Top {n} learned rules (mask threshold={threshold}):")
-    slot_probs = system2.get_rule_slot_probs()
+def print_learned_rules(system2: System2Rules, output_dir: Path, n: int = 20):
+    """
+    Decode tất cả rules từ prototype probs (không dùng mask nữa).
+    Export ra JSON và in n rules đầu ra terminal.
+    """
+    from src.utils.symbols import ID_TO_SYMBOL
+    print(f"\n[INFO] Top {n} learned rules (decoded from prototype argmax):")
 
+    slot_probs = system2.get_rule_slot_probs()  # key → [R, dim_k]
     rules_json_data = []
 
     for i in range(system2.num_rules):
-        # Decode prototype prediction per slot
         parts = []
         slots_dict = {}
+        slot_confidence = {}
+
         for key in CONCEPT_KEYS_ORDERED:
-            pred_idx = slot_probs[key][i].argmax().item()
-            if key in ("op1", "op2"):
-                from src.utils.symbols import ID_TO_SYMBOL
-                label = ID_TO_SYMBOL.get(pred_idx, str(pred_idx))
-            else:
-                label = str(pred_idx)
+            probs    = slot_probs[key][i]              # [dim_k]
+            pred_idx = int(probs.argmax().item())
+            conf     = float(probs.max().item())       # confidence = max prob
+
+            label = ID_TO_SYMBOL.get(pred_idx, str(pred_idx)) if key in ("op1","op2") else str(pred_idx)
             parts.append(f"{key}={label}")
             slots_dict[key] = label
+            slot_confidence[key] = round(conf, 4)
 
         rule_str = " AND ".join(parts)
-        # Mask info
-        mask = system2.memory.get_hard_masks(threshold)[i]
-        n_active = int(mask.sum().item())
-        
-        # Chỉ print ra terminal n rules đầu tiên theo yêu cầu ban đầu
-        if i < n:
-            print(f"  Rule {i:3d} [{n_active:2d} active slots]: {rule_str}")
+        min_conf = min(slot_confidence.values())
 
-        # Lưu lại thông tin cấu trúc của rule để export JSON
+        if i < n:
+            conf_str = " | ".join(f"{k}:{v:.2f}" for k, v in slot_confidence.items())
+            print(f"  Rule {i:3d} [min_conf={min_conf:.2f}]: {rule_str}")
+            print(f"          conf: {conf_str}")
+
         rules_json_data.append({
-            "rule_id": i,
-            "active_slots_count": n_active,
-            "rule_string": rule_str,
-            "slots": slots_dict,
-            "hard_mask": mask.tolist() if hasattr(mask, "tolist") else list(mask)
+            "rule_id"        : i,
+            "rule_string"    : rule_str,
+            "slots"          : slots_dict,
+            "slot_confidence": slot_confidence,
+            "min_confidence" : round(min_conf, 4),
         })
 
-    # Ghi toàn bộ rules ra file JSON
     json_path = output_dir / "rule_generated.json"
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(rules_json_data, f, indent=2, ensure_ascii=False)
@@ -389,9 +401,10 @@ def main():
     system1 = load_system1(Path(args.system1_ckpt), device)
 
     system2 = System2Rules(
-        num_rules   = args.num_rules,
-        score_mode  = args.score_mode,
-        temperature = args.temperature,
+        num_rules      = args.num_rules,
+        score_mode     = args.score_mode,
+        temperature    = args.temperature,
+        hard_threshold = args.hard_threshold,
     ).to(device)
 
     optimizer = torch.optim.AdamW(
@@ -400,7 +413,9 @@ def main():
         weight_decay=args.weight_decay,
     )
 
-    print(f"[INFO] System2: {args.num_rules} rules, score_mode={args.score_mode}")
+    print(f"[INFO] System2: {args.num_rules} rules, score_mode={args.score_mode}, "
+          f"temperature={args.temperature}, hard_threshold={args.hard_threshold}")
+    print(f"[INFO] Warm-up GT epochs: {args.warmup_gt_epochs}")
     print(f"[INFO] Loss weights: concept={args.concept_weight}, "
           f"recon={args.recon_weight}, sparsity={args.sparsity_weight}, "
           f"coverage={args.coverage_weight}, diversity={args.diversity_weight}")
@@ -413,7 +428,8 @@ def main():
 
     for epoch in range(1, args.epochs + 1):
         train_m = train_one_epoch(
-            system1, system2, train_loader, optimizer, device, args, slot_weights
+            system1, system2, train_loader, optimizer, device, args, slot_weights,
+            epoch=epoch,
         )
         val_m = evaluate(
             system1, system2, val_loader, device, args, "Val", slot_weights
@@ -460,7 +476,7 @@ def main():
           f"expression_acc={test_m['expression_acc']:.4f}")
 
     # In rules đã học và export ra JSON
-    print_learned_rules(system2, output_dir=output_dir, n=20, threshold=0.5)
+    print_learned_rules(system2, output_dir=output_dir, n=20)
 
     # Save results
     results = {
