@@ -10,13 +10,13 @@ class SimpleCNNBackbone(nn.Module):
     để giữ thông tin vị trí không gian của từng symbol.
 
     Ảnh đầu vào gồm num_slots ký tự xếp ngang:
-        [digit1][op1][digit2][op2][digit3]  (mặc định 5 slot × 28px = 140px)
+[digit1][op1][digit2][op2]  (mặc định 4 slot × 28px = 112px)
 
     AdaptiveAvgPool2d((1, num_slots)) pool height xuống 1 nhưng giữ
     width dưới dạng num_slots bins, mỗi bin tương ứng đúng một ký tự.
 
     Input:
-        x: [B, in_channels, H, W]   (ví dụ: [B, 1, 28, 140])
+        x: [B, in_channels, H, W]   (ví dụ: [B, 1, 28, 112])
 
     Output:
         slots: [B, num_slots, slot_dim]
@@ -33,7 +33,7 @@ class SimpleCNNBackbone(nn.Module):
         self,
         in_channels: int = 1,
         slot_dim: int = 128,
-        num_slots: int = 5,
+        num_slots: int = 4,
         dropout: float = 0.2,
     ):
         super().__init__()
@@ -42,13 +42,13 @@ class SimpleCNNBackbone(nn.Module):
         self.num_slots = num_slots
 
         # ── Shared convolutional feature extractor ───────────
-        # Shape flow (input 28×140, num_slots=5):
-        #   [B,  1, 28, 140]
-        #   [B, 32, 14,  70]  after MaxPool2d(2)
-        #   [B, 64,  7,  35]  after MaxPool2d(2)
-        #   [B,128,  7,  35]  after conv3 + conv4
+        # Shape flow (input 28×112, num_slots=4):
+        #   [B,  1, 28, 112]
+        #   [B, 32, 14,  56]  after MaxPool2d(2)
+        #   [B, 64,  7,  28]  after MaxPool2d(2)
+        #   [B,128,  7,  28]  after conv3 + conv4
         #   [B,128,  1,   5]  after AdaptiveAvgPool2d((1, num_slots))
-        #   Width 35 / num_slots 5 = 7px per slot → exact alignment
+        #   Width 28 / num_slots 4 = 7px per slot → exact alignment
         self.conv = nn.Sequential(
             nn.Conv2d(in_channels, 32, kernel_size=3, padding=1),
             nn.BatchNorm2d(32),
@@ -95,12 +95,12 @@ class SimpleCNNBackbone(nn.Module):
 
 
 if __name__ == "__main__":
-    model = SimpleCNNBackbone(slot_dim=128, num_slots=5)
-    dummy = torch.randn(4, 1, 28, 140)
+    model = SimpleCNNBackbone(slot_dim=128, num_slots=4)
+    dummy = torch.randn(4, 1, 28, 112)  # 4 slots × 28px
     out = model(dummy)
     print(f"Output shape: {out.shape}")  # Expected: [4, 5, 128]
     print(f"  slots[b, 0, :] = digit1 features")
     print(f"  slots[b, 1, :] = op1 features")
     print(f"  slots[b, 2, :] = digit2 features")
     print(f"  slots[b, 3, :] = op2 features")
-    print(f"  slots[b, 4, :] = digit3 features")
+    print(f"  slots[b, 3, :] = op2 features (digit3 is the label, not in image)")

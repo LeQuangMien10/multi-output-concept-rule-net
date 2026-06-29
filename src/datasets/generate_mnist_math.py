@@ -176,6 +176,36 @@ def make_symbol_image(symbol: str, size: int = 28) -> Image.Image:
         y2 = margin
         draw_wobbly_line(draw, x1, y1, x2, y2, 255, thickness, segs, wobble)
 
+    elif symbol == "?":
+        # Ký hiệu hỏi chấm — placeholder cho digit cần dự đoán
+        r_arc = size * 0.28
+        top_cy = cy - size * 0.1
+
+        # Phần cong (arc 200° → 340°)
+        pts = []
+        for deg in range(200, 361, 10):
+            rad = math.radians(deg)
+            x = cx + r_arc * math.cos(rad) + jitter(0.4)
+            y = top_cy + r_arc * math.sin(rad) + jitter(0.4)
+            pts.append((cx if len(pts) == 0 else x, y))
+        pts = [(cx + r_arc * math.cos(math.radians(d)) + jitter(0.4),
+                top_cy + r_arc * math.sin(math.radians(d)) + jitter(0.4))
+               for d in range(200, 361, 12)]
+        for i in range(len(pts) - 1):
+            x1, y1 = pts[i]; x2, y2 = pts[i + 1]
+            draw.line([x1, y1, x2, y2], fill=255, width=thickness)
+
+        # Đuôi thẳng
+        stem_x   = cx + jitter(0.5)
+        stem_top = top_cy + r_arc * math.sin(math.radians(340)) + jitter(0.3)
+        stem_bot = cy + size * 0.08 + jitter(0.5)
+        draw.line([stem_x, stem_top, stem_x, stem_bot], fill=255, width=thickness)
+
+        # Chấm bên dưới
+        dot_y = cy + size * 0.24
+        dr = thickness + random.randint(0, 1)
+        draw.ellipse([cx - dr, dot_y - dr, cx + dr, dot_y + dr], fill=255)
+
     else:
         raise ValueError(f"Unsupported symbol: {symbol}")
 
@@ -275,6 +305,28 @@ def sample_expression(
     }
 
 
+def sample_expression_v2(
+    valid_expressions: list[tuple[int, int, int]],
+) -> dict:
+    """
+    Format mới: "a + b = ?" — chỉ sinh valid expressions.
+
+    Mỗi call chọn ngẫu nhiên một expression từ danh sách cố định
+    → đảm bảo uniform coverage trên 55 expressions.
+
+    Returns dict: digit1, op1_symbol, digit2, op2_symbol, digit3
+    Không có 'valid' key — tất cả đều valid by construction.
+    """
+    a, b, c = random.choice(valid_expressions)
+    return {
+        "digit1":     a,
+        "op1_symbol": "+",
+        "digit2":     b,
+        "op2_symbol": "=",
+        "digit3":     c,
+    }
+
+
 def render_expression_image(
     expr: dict[str, int | str],
     mnist_dataset: MNIST,
@@ -297,15 +349,16 @@ def render_expression_image(
     op1_symbol = str(expr["op1_symbol"])
     op2_symbol = str(expr["op2_symbol"])
 
+    # Format: [digit1][op1][digit2][op2]  — 4 slots
+    # digit3 là label cần predict, không render vào ảnh
     parts = [
         sample_digit_image(digit1, mnist_dataset, digit_to_indices),
         make_symbol_image(op1_symbol, size=symbol_width),
         sample_digit_image(digit2, mnist_dataset, digit_to_indices),
         make_symbol_image(op2_symbol, size=symbol_width),
-        sample_digit_image(digit3, mnist_dataset, digit_to_indices),
     ]
 
-    canvas = Image.new("L", (symbol_width * 5, image_height), color=0)
+    canvas = Image.new("L", (symbol_width * 4, image_height), color=0)
 
     for i, part in enumerate(parts):
         part = part.resize((symbol_width, image_height))
@@ -319,29 +372,35 @@ def generate_split(
     split_size: int,
     mnist_dataset: MNIST,
     digit_to_indices: dict[int, list[int]],
-    valid_ratio: float,
-    allow_carry: bool,
     symbol_width: int,
     image_height: int,
+    # legacy args kept for backward compat (ignored in v2)
+    valid_ratio: float = 1.0,
+    allow_carry: bool = False,
 ) -> dict[str, torch.Tensor]:
     """
-    Generate one split and return tensors.
+    Generate one split (format v2: "a + b = ?").
+    Tất cả expressions đều valid, slot thứ 5 trong ảnh là "?".
     """
+    # Build danh sách 55 valid expressions để sample uniform
+    valid_expressions: list[tuple[int, int, int]] = [
+        (a, b, a + b)
+        for a in range(10)
+        for b in range(10)
+        if a + b <= 9
+    ]
+
     to_tensor = transforms.ToTensor()
 
-    images = []
+    images      = []
     digit1_list = []
-    op1_list = []
+    op1_list    = []
     digit2_list = []
-    op2_list = []
+    op2_list    = []
     digit3_list = []
-    valid_list = []
 
     for _ in tqdm(range(split_size), desc=f"Generating {split_name}"):
-        expr = sample_expression(
-            valid_ratio=valid_ratio,
-            allow_carry=allow_carry,
-        )
+        expr = sample_expression_v2(valid_expressions)
 
         img = render_expression_image(
             expr=expr,
@@ -358,16 +417,15 @@ def generate_split(
         digit2_list.append(int(expr["digit2"]))
         op2_list.append(SYMBOL_TO_ID[str(expr["op2_symbol"])])
         digit3_list.append(int(expr["digit3"]))
-        valid_list.append(int(expr["valid"]))
 
     split_data = {
         "images": torch.stack(images, dim=0),
         "digit1": torch.tensor(digit1_list, dtype=torch.long),
-        "op1": torch.tensor(op1_list, dtype=torch.long),
+        "op1":    torch.tensor(op1_list,    dtype=torch.long),
         "digit2": torch.tensor(digit2_list, dtype=torch.long),
-        "op2": torch.tensor(op2_list, dtype=torch.long),
+        "op2":    torch.tensor(op2_list,    dtype=torch.long),
         "digit3": torch.tensor(digit3_list, dtype=torch.long),
-        "valid": torch.tensor(valid_list, dtype=torch.long),
+        # Không có "valid" key — tất cả valid by construction
     }
 
     return split_data
@@ -390,7 +448,7 @@ def generate_mnist_math_dataset(config: dict[str, Any]) -> None:
     val_size = int(dataset_cfg["val_size"])
     test_size = int(dataset_cfg["test_size"])
 
-    valid_ratio = float(dataset_cfg.get("valid_ratio", 0.5))
+    # valid_ratio không còn dùng trong format v2 (tất cả valid)
     allow_carry = bool(dataset_cfg.get("allow_carry", False))
 
     symbol_width = int(dataset_cfg.get("symbol_width", 28))
@@ -408,8 +466,6 @@ def generate_mnist_math_dataset(config: dict[str, Any]) -> None:
         split_size=train_size,
         mnist_dataset=mnist_train,
         digit_to_indices=train_digit_to_indices,
-        valid_ratio=valid_ratio,
-        allow_carry=allow_carry,
         symbol_width=symbol_width,
         image_height=image_height,
     )
@@ -419,8 +475,6 @@ def generate_mnist_math_dataset(config: dict[str, Any]) -> None:
         split_size=val_size,
         mnist_dataset=mnist_test,
         digit_to_indices=test_digit_to_indices,
-        valid_ratio=valid_ratio,
-        allow_carry=allow_carry,
         symbol_width=symbol_width,
         image_height=image_height,
     )
@@ -430,8 +484,6 @@ def generate_mnist_math_dataset(config: dict[str, Any]) -> None:
         split_size=test_size,
         mnist_dataset=mnist_test,
         digit_to_indices=test_digit_to_indices,
-        valid_ratio=valid_ratio,
-        allow_carry=allow_carry,
         symbol_width=symbol_width,
         image_height=image_height,
     )
@@ -441,15 +493,19 @@ def generate_mnist_math_dataset(config: dict[str, Any]) -> None:
     torch.save(test_data, output_dir / "test.pt")
 
     meta = {
-        "name": dataset_cfg.get("name", "mnist_math"),
-        "task": "a + b = c",
-        "image_shape": [1, image_height, symbol_width * 5],
+        "name": dataset_cfg.get("name", "mnist_math_v2"),
+        "task": "a + b = ?",
+        "format": "predict_digit3",
+        "image_shape": [1, image_height, symbol_width * 4],
         "symbol_width": symbol_width,
         "image_height": image_height,
-        "num_symbols": 5,
+        "num_symbols": 4,
         "concept_order": CONCEPT_ORDER,
         "concept_specs": CONCEPT_SPECS,
-        "valid_ratio": valid_ratio,
+        "label_keys": ["digit1", "op1", "digit2", "op2", "digit3"],
+        "input_concept_keys": ["digit1", "op1", "digit2", "op2"],
+        "target_key": "digit3",
+        "num_valid_expressions": 55,
         "allow_carry": allow_carry,
         "seed": seed,
         "splits": {

@@ -7,7 +7,7 @@ from src.models.cnn_backbone import SimpleCNNBackbone
 # Ánh xạ cố định: slot index → concept key
 # Khớp chính xác với thứ tự paste trong generate_mnist_math.py:
 #   canvas.paste(digit1, i=0), op1 (i=1), digit2 (i=2), op2 (i=3), digit3 (i=4)
-_SLOT_TO_KEY = {0: "digit1", 1: "op1", 2: "digit2", 3: "op2", 4: "digit3"}
+_SLOT_TO_KEY = {0: "digit1", 1: "op1", 2: "digit2", 3: "op2"}  # digit3 không có slot trong ảnh (target label)
 
 
 class MultiHeadSystem1(nn.Module):
@@ -20,12 +20,12 @@ class MultiHeadSystem1(nn.Module):
         Digit2/digit3 khó học vì không có gì phân biệt chúng với digit1.
 
     v2: backbone → [B, 5, slot_dim] → mỗi head nhận đúng slot của mình.
-        digit1_head  ← slots[:, 0, :]   (vùng ảnh chứa digit1)
-        op1_head     ← slots[:, 1, :]   (vùng ảnh chứa op1)
-        digit2_head  ← slots[:, 2, :]   (vùng ảnh chứa digit2)
-        op2_head     ← slots[:, 3, :]   (vùng ảnh chứa op2)
-        digit3_head  ← slots[:, 4, :]   (vùng ảnh chứa digit3)
-        valid_head   ← slots.mean(dim=1) (nhìn toàn bộ biểu thức)
+        digit1_head  ← slots[:, 0, :]    (vùng ảnh chứa digit1)
+        op1_head     ← slots[:, 1, :]    (vùng ảnh chứa op1)
+        digit2_head  ← slots[:, 2, :]    (vùng ảnh chứa digit2)
+        op2_head     ← slots[:, 3, :]    (vùng ảnh chứa op2)
+        digit3_head  ← slots.mean(dim=1) (predict answer từ context toàn biểu thức)
+        [valid_head đã bỏ — không còn valid/invalid concept]
 
     Tương thích dài hạn (ảnh y tế, da liễu):
     ─────────────────────────────────────────
@@ -41,7 +41,7 @@ class MultiHeadSystem1(nn.Module):
         slot_dim = feature_dim // 2 (mặc định 256 → slot_dim=128).
         Giữ tên feature_dim để tương thích với checkpoint cũ.
     num_slots : int
-        Số ký tự trong biểu thức (mặc định 5).
+        Số ký tự trong ảnh (mặc định 4 cho v2: digit1,op1,digit2,op2).
     dropout : float
         Dropout trong slot projection.
 
@@ -59,7 +59,7 @@ class MultiHeadSystem1(nn.Module):
     def __init__(
         self,
         feature_dim: int = 256,
-        num_slots: int = 5,
+        num_slots: int = 4,   # ảnh v2: [digit1][op1][digit2][op2]
         dropout: float = 0.2,
     ):
         super().__init__()
@@ -84,10 +84,8 @@ class MultiHeadSystem1(nn.Module):
         self.op2_head    = nn.Linear(self.slot_dim, 5)
         self.digit3_head = nn.Linear(self.slot_dim, 10)
 
-        # valid head: nhận global mean của tất cả slots → [B, slot_dim]
-        # Lý do: valid phụ thuộc vào toàn bộ biểu thức (3+5=8 valid, 3+5=9 invalid)
-        # không phải chỉ một ký tự đơn lẻ.
-        self.valid_head = nn.Linear(self.slot_dim, 2)
+        # digit3_head: predict answer từ global mean (không có slot riêng)
+        # Lý do: digit3 = f(digit1, op1, digit2) cần nhìn toàn bộ biểu thức
 
     def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
         """
@@ -103,14 +101,13 @@ class MultiHeadSystem1(nn.Module):
         slots = self.backbone(x)
 
         outputs = {
-            # Mỗi head nhận đúng slot không gian tương ứng
+            # Concept slots trong ảnh (4 slots: digit1, op1, digit2, op2)
             "digit1": self.digit1_head(slots[:, 0, :]),
             "op1":    self.op1_head(slots[:, 1, :]),
             "digit2": self.digit2_head(slots[:, 2, :]),
             "op2":    self.op2_head(slots[:, 3, :]),
-            "digit3": self.digit3_head(slots[:, 4, :]),
-            # valid nhìn toàn bộ biểu thức qua global mean
-            "valid":  self.valid_head(slots.mean(dim=1)),
+            # digit3 = target — predict từ global context (không có slot riêng trong ảnh)
+            "digit3": self.digit3_head(slots.mean(dim=1)),
         }
 
         return outputs
@@ -124,8 +121,8 @@ class MultiHeadSystem1(nn.Module):
 
 
 if __name__ == "__main__":
-    model = MultiHeadSystem1(feature_dim=256, num_slots=5)
-    dummy = torch.randn(4, 1, 28, 140)
+    model = MultiHeadSystem1(feature_dim=256, num_slots=4)
+    dummy = torch.randn(4, 1, 28, 112)  # 4 slots × 28px
     outputs = model(dummy)
 
     print(f"slot_dim = {model.slot_dim}")
