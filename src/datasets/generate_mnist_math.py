@@ -489,7 +489,7 @@ def generate_mnist_math_dataset(config: dict[str, Any]) -> None:
     )
 
     torch.save(train_data, output_dir / "train.pt")
-    torch.save(val_data, output_dir / "val.pt")
+    torch.save(val_data, output_dir / "valid.pt")
     torch.save(test_data, output_dir / "test.pt")
 
     meta = {
@@ -520,5 +520,5 @@ def generate_mnist_math_dataset(config: dict[str, Any]) -> None:
 
     print(f"[DONE] Dataset saved to: {output_dir}")
     print(f"[DONE] train.pt: {train_data['images'].shape}")
-    print(f"[DONE] val.pt:   {val_data['images'].shape}")
+    print(f"[DONE] valid.pt:   {val_data['images'].shape}")
     print(f"[DONE] test.pt:  {test_data['images'].shape}")
