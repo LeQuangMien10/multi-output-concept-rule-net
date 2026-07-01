@@ -284,7 +284,14 @@ def visualize(
     # Expression string in title
     has_valid_label = "valid" in gt_labels
     _validity = f"  ({'valid' if gt_labels['valid'] == 1 else 'invalid'})" if has_valid_label else ""
-    gt_expr = f"{gt_labels['digit1']} + {gt_labels['digit2']} = {gt_labels['digit3']}{_validity}"
+    gt_expr = (
+        f"{label_to_str('digit1', gt_labels['digit1'])} "
+        f"{label_to_str('op1', gt_labels['op1'])} "
+        f"{label_to_str('digit2', gt_labels['digit2'])} "
+        f"{label_to_str('op2', gt_labels['op2'])} "
+        f"{label_to_str('digit3', gt_labels['digit3'])}"
+        f"{_validity}"
+    )
     ax_img.set_title(
         f"Sample #{sample_idx}   GT: {gt_expr}",
         fontsize=12, pad=8, fontweight="bold", color="#2c2c2a",
@@ -532,9 +539,14 @@ def main():
     gt_labels = {k: data[k][idx].item() for k in CONCEPT_KEYS_ORDERED}
     if "valid" in data:
         gt_labels["valid"] = data["valid"][idx].item()
-    print(f"[INFO] GT: digit1={gt_labels['digit1']} op1=+ "
-          f"digit2={gt_labels['digit2']} op2== "
-          f"digit3={gt_labels['digit3']}")
+    print(
+        f"[INFO] GT: "
+        f"digit1={gt_labels['digit1']} "
+        f"op1={label_to_str('op1', gt_labels['op1'])} "
+        f"digit2={gt_labels['digit2']} "
+        f"op2={label_to_str('op2', gt_labels['op2'])} "
+        f"digit3={gt_labels['digit3']}"
+    )
 
     # Load models
     s1_ckpt = Path(args.system1_ckpt) if args.system1_ckpt else None
