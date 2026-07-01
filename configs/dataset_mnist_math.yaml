@@ -1,8 +1,8 @@
 dataset:
-  name: mnist_math_v2
+  name: mnist_math_v3
 
   root_dir: data
-  output_dir: data/mnist_math_v2
+  output_dir: data/mnist_math_v3
 
   train_size: 50000
   val_size:   10000
@@ -10,10 +10,9 @@ dataset:
 
   image_height: 28
   symbol_width: 28
-  num_symbols:  5
+  num_symbols:  4      # [digit1][op1][digit2][=]
 
-  # v2: tất cả expressions là valid, slot 5 trong ảnh là "?"
-  # valid_ratio không còn dùng
+  # v3: + và − (110 valid expressions, digit3 perfectly balanced)
   allow_carry: false
 
   seed: 2026

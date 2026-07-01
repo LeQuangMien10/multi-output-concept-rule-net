@@ -306,24 +306,24 @@ def sample_expression(
 
 
 def sample_expression_v2(
-    valid_expressions: list[tuple[int, int, int]],
+    valid_expressions: list[tuple[int, int, str, int]],
 ) -> dict:
     """
-    Format mới: "a + b = ?" — chỉ sinh valid expressions.
+    Format v2: "a op b = ?" — chỉ sinh valid expressions.
 
     Mỗi call chọn ngẫu nhiên một expression từ danh sách cố định
-    → đảm bảo uniform coverage trên 55 expressions.
+    → đảm bảo uniform coverage trên tất cả valid expressions.
 
+    Tuple format: (digit1, digit2, op_symbol, digit3)
     Returns dict: digit1, op1_symbol, digit2, op2_symbol, digit3
-    Không có 'valid' key — tất cả đều valid by construction.
     """
-    a, b, c = random.choice(valid_expressions)
+    digit1, digit2, op_symbol, digit3 = random.choice(valid_expressions)
     return {
-        "digit1":     a,
-        "op1_symbol": "+",
-        "digit2":     b,
+        "digit1":     digit1,
+        "op1_symbol": op_symbol,
+        "digit2":     digit2,
         "op2_symbol": "=",
-        "digit3":     c,
+        "digit3":     digit3,
     }
 
 
@@ -382,12 +382,21 @@ def generate_split(
     Generate one split (format v2: "a + b = ?").
     Tất cả expressions đều valid, slot thứ 5 trong ảnh là "?".
     """
-    # Build danh sách 55 valid expressions để sample uniform
-    valid_expressions: list[tuple[int, int, int]] = [
-        (a, b, a + b)
-        for a in range(10)
-        for b in range(10)
-        if a + b <= 9
+    # Build danh sách 110 valid expressions (55 phép + và 55 phép −)
+    # Tuple: (digit1, digit2, op_symbol, digit3)
+    valid_expressions: list[tuple[int, int, str, int]] = [
+        *(
+            (a, b, "+", a + b)
+            for a in range(10)
+            for b in range(10)
+            if a + b <= 9
+        ),
+        *(
+            (a, b, "-", a - b)
+            for a in range(10)
+            for b in range(10)
+            if a - b >= 0
+        ),
     ]
 
     to_tensor = transforms.ToTensor()
@@ -494,8 +503,9 @@ def generate_mnist_math_dataset(config: dict[str, Any]) -> None:
 
     meta = {
         "name": dataset_cfg.get("name", "mnist_math_v2"),
-        "task": "a + b = ?",
+        "task": "a op b = ?  (op ∈ {+, −})",
         "format": "predict_digit3",
+        "operators": ["+", "-"],
         "image_shape": [1, image_height, symbol_width * 4],
         "symbol_width": symbol_width,
         "image_height": image_height,
@@ -505,7 +515,7 @@ def generate_mnist_math_dataset(config: dict[str, Any]) -> None:
         "label_keys": ["digit1", "op1", "digit2", "op2", "digit3"],
         "input_concept_keys": ["digit1", "op1", "digit2", "op2"],
         "target_key": "digit3",
-        "num_valid_expressions": 55,
+        "num_valid_expressions": 110,
         "allow_carry": allow_carry,
         "seed": seed,
         "splits": {
