@@ -59,7 +59,6 @@ SLOT_COLORS = {
     "digit2": "#7F77DD",
     "op2":    "#D85A30",
     "digit3": "#BA7517",
-    "valid":  "#888780",
 }
 
 SLOT_DISPLAY = {
@@ -68,7 +67,6 @@ SLOT_DISPLAY = {
     "digit2": "digit 2",
     "op2":    "op 2",
     "digit3": "digit 3",
-    "valid":  "valid",
 }
 
 
@@ -80,8 +78,6 @@ def label_to_str(key: str, idx: int) -> str:
     """Convert concept index to readable label."""
     if key in ("op1", "op2"):
         return ID_TO_SYMBOL.get(idx, str(idx))
-    elif key == "valid":
-        return "yes" if idx == 1 else "no"
     return str(idx)
 
 
@@ -486,17 +482,44 @@ def main():
     random.seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Load data
+    # Load data — tự động tìm file .pt khớp với split name
+    # Dataset v1: val.pt / train.pt / test.pt
+    # Dataset v2: valid.pt / train.pt / test.pt  (val → valid)
     data_dir = Path(args.data_dir)
-    data = torch.load(data_dir / f"{args.split}.pt", map_location="cpu")
-    N = data["images"].shape[0]
+    from src.datasets.mnist_math_dataset import MNISTMathPTDataset
+
+    _SPLIT_ALIASES = {
+        "val":   ["val.pt", "valid.pt"],
+        "valid": ["valid.pt", "val.pt"],
+        "train": ["train.pt"],
+        "test":  ["test.pt"],
+    }
+    _candidates = _SPLIT_ALIASES.get(args.split, [f"{args.split}.pt"])
+    _pt_path = None
+    for _fname in _candidates:
+        _candidate = data_dir / _fname
+        if _candidate.exists():
+            _pt_path = _candidate
+            break
+    if _pt_path is None:
+        raise FileNotFoundError(
+            f"No dataset file found for split '{args.split}' in {data_dir}. "
+            f"Tried: {_candidates}"
+        )
+    print(f"[INFO] Loading: {_pt_path}")
+    _ds   = MNISTMathPTDataset(_pt_path)
+    data  = _ds.data   # raw dict
+    N     = _ds.length
 
     # Select sample index
     if args.sample_idx is not None:
         idx = args.sample_idx
     elif args.pick is not None:
-        target_valid = 1 if args.pick == "valid" else 0
-        pool = [i for i in range(N) if data["valid"][i].item() == target_valid]
+        if "valid" in data and args.pick in ("valid", "invalid"):
+            target_valid = 1 if args.pick == "valid" else 0
+            pool = [i for i in range(N) if data["valid"][i].item() == target_valid]
+        else:
+            pool = list(range(N))   # v2: tất cả đều valid
         idx = random.choice(pool)
     elif args.random:
         idx = random.randint(0, N - 1)
@@ -505,11 +528,12 @@ def main():
 
     print(f"[INFO] Sample #{idx} from {args.split} set")
 
-    gt_labels = {k: data[k][idx].item() for k in CONCEPT_KEYS_ORDERED + ["valid"]}
-    gt_labels["valid"] = data["valid"][idx].item()
+    gt_labels = {k: data[k][idx].item() for k in CONCEPT_KEYS_ORDERED}
+    if "valid" in data:
+        gt_labels["valid"] = data["valid"][idx].item()
     print(f"[INFO] GT: digit1={gt_labels['digit1']} op1=+ "
           f"digit2={gt_labels['digit2']} op2== "
-          f"digit3={gt_labels['digit3']} valid={gt_labels['valid']}")
+          f"digit3={gt_labels['digit3']}")
 
     # Load models
     s1_ckpt = Path(args.system1_ckpt) if args.system1_ckpt else None
