@@ -1,24 +1,9 @@
 """
-rule_matching.py  (v3 — prototype-based scoring)
-=================================================
-Bottleneck 2 fix: thay thế mask-based scoring bằng prototype cosine scoring.
-
-Vấn đề cũ:
-    score = concept_vec @ rule_masks.T
-    rule_masks = sigmoid(rule_logits)   ← chỉ là binary gate, không encode giá trị
-    → gradient từ score KHÔNG chảy vào rule_slot_logits (prototype)
-    → rule_slot_logits và rule_masks diverge, không đồng bộ
-
-Giải pháp mới:
-    score = slot_wise_cosine(concept_vec, rule_proto_cv)
-    rule_proto_cv = concat(softmax(rule_slot_logits[k]) for k in slots)
-    → gradient từ score chảy trực tiếp vào rule_slot_logits
-    → một tham số (rule_slot_logits) vừa làm scoring vừa làm prediction
-
-Slot-wise cosine (không phải flat cosine):
-    Mỗi slot k đóng góp đều nhau 1/6 vào tổng score,
-    bất kể dim_k (digit dim=10 không lấn át op dim=5).
-    Phù hợp với thiết lý "mọi concept slot ngang nhau".
+rule_matching.py  (v3 — prototype cosine, dataset v2 compatible)
+=================================================================
+Slot-wise cosine scoring giữa concept vector [B, 40] và rule prototypes [R, 40].
+Mỗi trong 5 slots đóng góp đều nhau 1/5.
+(Dataset v2: 5 slots thay vì 6 — không có "valid")
 """
 from __future__ import annotations
 
@@ -33,29 +18,18 @@ from src.models.rule_memory import (
 )
 
 
-# ─────────────────────────────────────────────────────────────
-# Prototype-based scoring (THAY THẾ mask-based scoring)
-# ─────────────────────────────────────────────────────────────
-
 def slot_wise_cosine_scores(
     concept_vec:   torch.Tensor,
     rule_proto_cv: torch.Tensor,
 ) -> torch.Tensor:
     """
-    Tính slot-wise cosine similarity giữa concept vector và rule prototypes.
-    Mỗi slot đóng góp đều nhau vào tổng score (1/num_slots).
+    Slot-wise cosine similarity, equal weight per slot (1/num_slots).
 
-    Parameters
-    ----------
-    concept_vec   : FloatTensor[B, 42]  — softmax probs từ System1
-    rule_proto_cv : FloatTensor[R, 42]  — concat softmax probs từ rule_slot_logits
-
-    Returns
-    -------
-    scores : FloatTensor[B, R]
-        scores[b, r] = mean cosine similarity qua 6 slots
+    concept_vec   : FloatTensor[B, 40]
+    rule_proto_cv : FloatTensor[R, 40]
+    returns       : FloatTensor[B, R]
     """
-    num_slots = len(CONCEPT_KEYS_ORDERED)
+    num_slots = len(CONCEPT_KEYS_ORDERED)   # 5
     B = concept_vec.shape[0]
     R = rule_proto_cv.shape[0]
     total = torch.zeros(B, R, device=concept_vec.device)
@@ -63,28 +37,21 @@ def slot_wise_cosine_scores(
     for key in CONCEPT_KEYS_ORDERED:
         offset = CONCEPT_OFFSETS[key]
         dim    = CONCEPT_DIMS[key]
-        cv_s   = F.normalize(concept_vec[:, offset: offset + dim],   dim=1)  # [B, dim]
-        rv_s   = F.normalize(rule_proto_cv[:, offset: offset + dim], dim=1)  # [R, dim]
-        total += cv_s @ rv_s.T                                                # [B, R]
+        cv_s   = F.normalize(concept_vec[:, offset: offset + dim],   dim=1)
+        rv_s   = F.normalize(rule_proto_cv[:, offset: offset + dim], dim=1)
+        total += cv_s @ rv_s.T
 
-    return total / num_slots   # [B, R], range ≈ [-1, 1]
+    return total / num_slots
 
 
 def flat_cosine_scores(
     concept_vec:   torch.Tensor,
     rule_proto_cv: torch.Tensor,
 ) -> torch.Tensor:
-    """
-    Flat cosine trên toàn bộ 42-dim (alternative, ít preferred hơn slot_wise).
-    """
-    cv_n = F.normalize(concept_vec,   dim=1)  # [B, 42]
-    rv_n = F.normalize(rule_proto_cv, dim=1)  # [R, 42]
-    return cv_n @ rv_n.T                       # [B, R]
+    cv_n = F.normalize(concept_vec,   dim=1)
+    rv_n = F.normalize(rule_proto_cv, dim=1)
+    return cv_n @ rv_n.T
 
-
-# ─────────────────────────────────────────────────────────────
-# Hard activation (inference)
-# ─────────────────────────────────────────────────────────────
 
 def slot_wise_match_detail(
     concept_vec:   torch.Tensor,
@@ -93,18 +60,11 @@ def slot_wise_match_detail(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Per-slot cosine score và boolean match cho mỗi cặp (sample, rule).
-    Dùng khi inference để giải thích tại sao rule được chọn.
-
-    Parameters
-    ----------
-    concept_vec   : FloatTensor[B, 42]
-    rule_proto_cv : FloatTensor[R, 42]
-    threshold     : float — ngưỡng cosine để coi là slot "khớp"
 
     Returns
     -------
-    slot_scores : FloatTensor[B, R, num_slots]  — cosine per slot
-    slot_match  : BoolTensor[B, R, num_slots]   — score >= threshold
+    slot_scores : FloatTensor[B, R, num_slots]
+    slot_match  : BoolTensor[B, R, num_slots]
     """
     B = concept_vec.shape[0]
     R = rule_proto_cv.shape[0]
@@ -126,65 +86,18 @@ def slot_wise_match_detail(
 def predict_best_rule(
     concept_vec:   torch.Tensor,
     rule_proto_cv: torch.Tensor,
-    temperature:   float = 0.5,
 ) -> torch.Tensor:
-    """
-    Chọn rule có score cao nhất cho mỗi sample.
+    scores = slot_wise_cosine_scores(concept_vec, rule_proto_cv)
+    return scores.argmax(dim=1)
 
-    Returns
-    -------
-    best_rule_idx : LongTensor[B]
-    """
-    scores = slot_wise_cosine_scores(concept_vec, rule_proto_cv)  # [B, R]
-    return scores.argmax(dim=1)                                    # [B]
-
-
-# ─────────────────────────────────────────────────────────────
-# RuleMatcher module (dùng trong System2)
-# ─────────────────────────────────────────────────────────────
 
 class RuleMatcher(nn.Module):
-    """
-    Module tính score match giữa concept vector và rule prototypes.
-
-    Bottleneck 2 fix:
-        - Nhận rule_proto_cv (từ System2Rules.get_rule_concept_vec())
-          thay vì rule_masks từ RuleMemory.
-        - Score = slot_wise_cosine(concept_vec, rule_proto_cv)
-        - Gradient chảy thẳng vào rule_slot_logits.
-
-    Parameters
-    ----------
-    score_mode     : "slot_cosine" (default) | "flat_cosine"
-    hard_threshold : float — cosine threshold để coi slot là "khớp" khi inference
-    """
-
-    def __init__(
-        self,
-        score_mode:     str   = "slot_cosine",
-        hard_threshold: float = 0.7,
-    ):
+    def __init__(self, score_mode: str = "slot_cosine", hard_threshold: float = 0.7):
         super().__init__()
         self.score_mode     = score_mode
         self.hard_threshold = hard_threshold
 
-    def forward(
-        self,
-        concept_vec:   torch.Tensor,
-        rule_proto_cv: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Soft matching — dùng khi training.
-
-        Parameters
-        ----------
-        concept_vec   : FloatTensor[B, 42]
-        rule_proto_cv : FloatTensor[R, 42]  — từ System2Rules.get_rule_concept_vec()
-
-        Returns
-        -------
-        scores : FloatTensor[B, R]
-        """
+    def forward(self, concept_vec: torch.Tensor, rule_proto_cv: torch.Tensor) -> torch.Tensor:
         if self.score_mode == "slot_cosine":
             return slot_wise_cosine_scores(concept_vec, rule_proto_cv)
         elif self.score_mode == "flat_cosine":
@@ -198,15 +111,6 @@ class RuleMatcher(nn.Module):
         concept_vec:   torch.Tensor,
         rule_proto_cv: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Hard inference — chọn best rule và tính per-slot match detail.
-
-        Returns
-        -------
-        best_rule_idx : LongTensor[B]
-        slot_scores   : FloatTensor[B, R, num_slots]
-        slot_match    : BoolTensor[B, R, num_slots]
-        """
         best_rule_idx = predict_best_rule(concept_vec, rule_proto_cv)
         slot_scores, slot_match = slot_wise_match_detail(
             concept_vec, rule_proto_cv, self.hard_threshold

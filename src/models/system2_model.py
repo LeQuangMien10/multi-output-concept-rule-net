@@ -1,45 +1,18 @@
 """
-system2_model.py  (v3 — prototype scoring)
-==========================================
-Bottleneck 2 fix: scoring và prediction dùng chung một tham số.
+system2_model.py  (dataset v2 — "a + b = ?")
+=============================================
+Cập nhật cho dataset v2:
+    - 5 concept slots (bỏ "valid"): digit1, op1, digit2, op2, digit3
+    - concept_dim: 40 thay vì 42
+    - _enumerate_mnist_math_expressions: chỉ sinh valid expressions (55)
+      không còn invalid peers (không cần thiết vì dataset chỉ có valid)
+    - Rule được decode thành "a + b = c" thay vì có valid=0/1
 
-Vấn đề v2:
-    - rule_slot_logits encode "giá trị" của rule (digit1=3, op1=+, ...)
-    - rule_logits (mask) encode "độ quan trọng" của slot
-    - Scoring dùng rule_masks → gradient KHÔNG chảy vào rule_slot_logits
-    - rule_slot_logits chỉ nhận gradient từ CE loss, không từ scoring
-    - Kết quả: rule không học được cách match ảnh với rule đúng
-
-Giải pháp v3 — một tham số, hai nhiệm vụ:
-    rule_slot_logits[R, dim_k] per slot k
-        ↓ softmax per slot
-    rule_slot_probs[R, dim_k]
-        ↓ concat → rule_proto_cv [R, 42]
-
-    Scoring:    slot_wise_cosine(concept_vec, rule_proto_cv)  → gradient vào rule_slot_logits
-    Prediction: rule_assign @ rule_slot_probs[k]              → gradient vào rule_slot_logits
-
-    → rule_slot_logits nhận gradient từ CẢ HAI đường,
-      buộc prototype phải vừa "đúng" (CE loss) vừa "phân biệt được" (score loss)
-
-Architecture:
-─────────────
-concept_vec [B, 42]  (softmax probs từ System1)
-    ↓  slot_wise_cosine vs rule_proto_cv [R, 42]
-rule_scores  [B, R]
-    ↓  softmax / temperature
-rule_assign  [B, R]
-    ↓  weighted sum vs rule_slot_probs [R, dim_k]
-pred_slot    dict key→[B, dim_k]
-    ↓  NLL loss vs GT labels
-concept_loss (6 slots, equal weight)
-
-Loss:
-    1. concept_loss   — NLL per slot, balanced
-    2. recon_loss     — MSE(pred_concept, concept_vec)
-    3. sparsity_loss  — penalize uniform assignment (entropy)
-    4. coverage_loss  — penalize unused rules
-    5. diversity_loss — penalize identical prototypes
+Giữ nguyên toàn bộ logic:
+    - Prototype cosine scoring (Bottleneck 2 fix)
+    - Expression init với sharp=8.0 (Bottleneck 3 fix)
+    - Cosine annealing temperature
+    - Multi-objective loss (concept + recon + sparsity + coverage + diversity)
 """
 from __future__ import annotations
 
@@ -59,27 +32,22 @@ from src.models.rule_matching import RuleMatcher
 
 
 # ─────────────────────────────────────────────────────────────
-# Prototype initialization helper
+# Prototype initialization (dataset v2: chỉ valid expressions)
 # ─────────────────────────────────────────────────────────────
 
-def _enumerate_mnist_math_expressions(op1_id: int = 0, op2_id: int = 4) -> list[tuple]:
+def _enumerate_valid_expressions(op1_id: int = 0, op2_id: int = 4) -> list[tuple]:
     """
-    Liệt kê tất cả biểu thức a op1 b op2 c với:
-        op1=+  (id=0), op2==  (id=4)
-        allow_carry=False  → a+b ≤ 9
-    Trả về list (digit1, op1, digit2, op2, digit3, valid).
+    Liệt kê 55 valid expressions: a + b = c  với a+b ≤ 9.
+    Tuple: (digit1, op1, digit2, op2, digit3)
+    — không có "valid" slot vì dataset v2 chỉ có valid expressions.
     """
-    valid, invalid = [], []
+    exprs = []
     for a in range(10):
         for b in range(10):
-            c_true = a + b
-            if c_true > 9:
-                continue
-            valid.append((a, op1_id, b, op2_id, c_true, 1))
-            # 1 invalid peer: same a,b, digit3 sai
-            c_wrong = (c_true + 1) % 10
-            invalid.append((a, op1_id, b, op2_id, c_wrong, 0))
-    return valid, invalid
+            c = a + b
+            if c <= 9:
+                exprs.append((a, op1_id, b, op2_id, c))
+    return exprs  # 55 expressions
 
 
 def _build_prototype_logits(
@@ -90,35 +58,23 @@ def _build_prototype_logits(
     seed:         int   = 42,
 ) -> dict:
     """
-    Xây dựng logit tensors để khởi tạo rule_slot_logits.
+    Khởi tạo rule_slot_logits từ 55 valid expressions.
 
-    Thay vì random N(0, 0.1) dẫn đến softmax đều và score spread ≈ 0,
-    mỗi rule được gán một biểu thức toán học cụ thể:
-        rule r ← expression (digit1=a, op1=+, digit2=b, op2==, digit3=c, valid=v)
-    với logit[r, target_class] = sharp, còn lại = 0.
-
-    Kết quả: softmax(logit) ≈ peaked → cosine giữa 2 rules khác nhau ≈ 0
-    → score spread cao ngay từ epoch 1 → softmax/T không bị uniform.
-
-    Returns
-    -------
-    dict[key → FloatTensor[num_rules, dim_k]]
+    Với 128 rules và 55 expressions: pad bằng cách lặp lại.
+    Kết quả: mỗi rule bắt đầu từ một expression cụ thể,
+    score spread cao ngay từ epoch 1.
     """
-    import random as _random
-    _random.seed(seed)
+    import random as _rng
+    _rng.seed(seed)
 
-    valid_exprs, invalid_exprs = _enumerate_mnist_math_expressions()
-    all_exprs = valid_exprs + invalid_exprs
-    _random.shuffle(all_exprs)
+    exprs = _enumerate_valid_expressions()
+    # Pad đến num_rules nếu cần
+    while len(exprs) < num_rules:
+        exprs.append(_rng.choice(exprs))
+    _rng.shuffle(exprs)
+    exprs = exprs[:num_rules]
 
-    # Pad nếu num_rules > len(all_exprs)
-    while len(all_exprs) < num_rules:
-        all_exprs.append(_random.choice(all_exprs))
-    exprs = all_exprs[:num_rules]
-
-    logits = {key: torch.zeros(num_rules, concept_dims[key]) for key in concept_keys}
-    key_to_pos = {k: i for i, k in enumerate(concept_keys)}
-
+    logits = {k: torch.zeros(num_rules, concept_dims[k]) for k in concept_keys}
     for r, expr in enumerate(exprs):
         vals = dict(zip(concept_keys, expr))
         for key in concept_keys:
@@ -127,28 +83,32 @@ def _build_prototype_logits(
     return logits
 
 
+# ─────────────────────────────────────────────────────────────
+# System2Rules
+# ─────────────────────────────────────────────────────────────
+
 class System2Rules(nn.Module):
     """
-    System 2 v3: prototype-based scoring.
+    System 2: học rule prototype cho 5 concept slots (dataset v2).
 
-    Parameters
-    ----------
-    num_rules       : số rule prototype cần học
-    concept_dim     : chiều concept vector (42)
-    score_mode      : "slot_cosine" (default) | "flat_cosine"
-    temperature     : softmax temperature cho rule assignment
-                      (thấp → peaked, cao → uniform)
-    hard_threshold  : cosine threshold để coi slot "khớp" khi inference
+    concept_vec [B, 40]
+        ↓  slot_wise_cosine vs rule_proto_cv [R, 40]
+    rule_scores [B, R]
+        ↓  softmax / temperature (cosine annealing)
+    rule_assign [B, R]
+        ↓  weighted sum
+    pred_slot   dict key→[B, dim_k]
+        ↓  NLL loss vs GT labels[digit1..digit3]
     """
 
     def __init__(
         self,
-        num_rules:      int   = 128,
-        concept_dim:    int   = CONCEPT_TOTAL_DIM,
+        num_rules:      int   = 55,
+        concept_dim:    int   = CONCEPT_TOTAL_DIM,   # 40
         score_mode:     str   = "slot_cosine",
-        temperature:    float = 2.0,   # overridden per-epoch by annealing
+        temperature:    float = 2.0,
         hard_threshold: float = 0.7,
-        init_sharp:     float = 8.0,   # logit sharpness for prototype init
+        init_sharp:     float = 8.0,
     ):
         super().__init__()
 
@@ -157,11 +117,7 @@ class System2Rules(nn.Module):
         self.temperature = temperature
         self.init_sharp  = init_sharp
 
-        # ── Rule prototype: một tham số, hai nhiệm vụ ────────
-        # rule_slot_logits[k]: [R, dim_k]
-        # Khởi tạo từ danh sách expression cụ thể (không phải random):
-        #   → các rules bắt đầu từ các điểm khác nhau trong concept space
-        #   → score spread cao ngay từ epoch 1 → softmax không bị uniform
+        # ── Rule prototypes ──────────────────────────────────
         init_logits = _build_prototype_logits(
             num_rules=num_rules,
             concept_dims=CONCEPT_DIMS,
@@ -179,70 +135,52 @@ class System2Rules(nn.Module):
             hard_threshold=hard_threshold,
         )
 
-        # ── RuleMemory: chỉ dùng cho decode/interpretability ─
+        # ── RuleMemory (decode only) ─────────────────────────
         self.memory = RuleMemory(num_rules=num_rules, concept_dim=concept_dim)
 
     # ── Prototype helpers ────────────────────────────────────
 
     def get_rule_slot_probs(self) -> dict[str, torch.Tensor]:
-        """
-        Softmax per slot → prototype probs.
-        key → FloatTensor[R, dim_k]
-        """
+        """key → FloatTensor[R, dim_k]"""
         return {
             key: F.softmax(self.rule_slot_logits[key], dim=-1)
             for key in CONCEPT_KEYS_ORDERED
         }
 
     def get_rule_concept_vec(self) -> torch.Tensor:
-        """
-        Nối prototype probs thành concept vector [R, 42].
-        Đây là input cho matcher.forward() — gradient chảy vào rule_slot_logits.
-        """
+        """Concat prototype probs → [R, 40]"""
         return torch.cat(
             [F.softmax(self.rule_slot_logits[key], dim=-1)
              for key in CONCEPT_KEYS_ORDERED],
             dim=1,
-        )  # [R, 42]
+        )
 
-    # ── Forward (training) ───────────────────────────────────
+    # ── Forward ──────────────────────────────────────────────
 
     def forward(self, concept_vec: torch.Tensor) -> dict[str, torch.Tensor]:
         """
-        Parameters
-        ----------
-        concept_vec : FloatTensor[B, 42]  — softmax probs từ System1
+        concept_vec : FloatTensor[B, 40]
 
-        Returns
-        -------
-        dict:
-          rule_scores      : [B, R]           — slot-wise cosine similarity
-          rule_assignment  : [B, R]           — softmax weights
-          pred_slot_logits : dict key→[B,dim] — weighted sum probs (dùng cho NLL)
-          pred_concept     : [B, 42]          — concat pred_slot_logits
-          rule_concept_vec : [R, 42]          — rule prototypes
+        Returns dict:
+          rule_scores       [B, R]
+          rule_assignment   [B, R]
+          pred_slot_logits  dict key→[B, dim_k]
+          pred_concept      [B, 40]
+          rule_concept_vec  [R, 40]
         """
-        # 1. Prototype concept vector [R, 42]
-        rule_cv = self.get_rule_concept_vec()
-
-        # 2. Slot-wise cosine scores [B, R]
-        #    Gradient chảy vào rule_slot_logits qua rule_cv
+        rule_cv     = self.get_rule_concept_vec()
         rule_scores = self.matcher(concept_vec, rule_cv)
-
-        # 3. Assignment [B, R]
         rule_assign = F.softmax(rule_scores / self.temperature, dim=1)
 
-        # 4. Per-slot prediction: weighted sum của slot probs
-        slot_probs = self.get_rule_slot_probs()          # key → [R, dim_k]
-        pred_slot_logits: dict[str, torch.Tensor] = {}
-        for key in CONCEPT_KEYS_ORDERED:
-            # [B, R] @ [R, dim_k] → [B, dim_k]
-            pred_slot_logits[key] = rule_assign @ slot_probs[key]
+        slot_probs = self.get_rule_slot_probs()
+        pred_slot_logits = {
+            key: rule_assign @ slot_probs[key]
+            for key in CONCEPT_KEYS_ORDERED
+        }
 
-        # 5. Predicted concept vector (concat)
         pred_concept = torch.cat(
             [pred_slot_logits[k] for k in CONCEPT_KEYS_ORDERED], dim=1
-        )  # [B, 42]
+        )
 
         return {
             "rule_scores"     : rule_scores,
@@ -257,42 +195,28 @@ class System2Rules(nn.Module):
     @torch.no_grad()
     def infer(self, concept_vec: torch.Tensor) -> dict:
         """
-        Hard inference: chọn best rule per sample, decode ra string,
-        tính per-slot match detail.
-
-        Parameters
-        ----------
-        concept_vec : FloatTensor[B, 42]  — soft hoặc hard concept
-
-        Returns
-        -------
-        dict:
-          best_rule_idx  : LongTensor[B]
-          pred_slot      : dict key→LongTensor[B]   — argmax per slot từ best rule
-          rule_strings   : list[str]                 — decoded rule per sample
-          slot_scores    : FloatTensor[B, R, 6]     — cosine per slot per rule
-          slot_match     : BoolTensor[B, R, 6]      — score >= threshold
-          rule_scores    : FloatTensor[B, R]         — mean slot cosine
+        Returns dict:
+          best_rule_idx  LongTensor[B]
+          pred_slot      dict key→LongTensor[B]
+          rule_strings   list[str]  e.g. "3 + 5 = 8"
+          slot_scores    FloatTensor[B, R, 5]
+          slot_match     BoolTensor[B, R, 5]
+          rule_scores    FloatTensor[B, R]
         """
-        rule_cv = self.get_rule_concept_vec()  # [R, 42]
+        rule_cv = self.get_rule_concept_vec()
 
-        # Best rule per sample
         best_rule_idx, slot_scores, slot_match = self.matcher.predict(
             concept_vec, rule_cv
-        )  # [B], [B,R,6], [B,R,6]
-
-        # Overall scores [B, R]
+        )
         rule_scores = self.matcher(concept_vec, rule_cv)
 
-        # Decode slot values từ best rule prototype
-        slot_probs = self.get_rule_slot_probs()  # key → [R, dim_k]
-        pred_slot: dict[str, torch.Tensor] = {}
-        for key in CONCEPT_KEYS_ORDERED:
-            # probs của best rule → argmax → predicted class
-            pred_slot[key] = slot_probs[key][best_rule_idx].argmax(dim=1)  # [B]
+        slot_probs = self.get_rule_slot_probs()
+        pred_slot = {
+            key: slot_probs[key][best_rule_idx].argmax(dim=1)
+            for key in CONCEPT_KEYS_ORDERED
+        }
 
-        # Decode rule string per sample
-        rule_strings: list[str] = [
+        rule_strings = [
             self.memory.decode_rule_from_probs(slot_probs, idx.item())
             for idx in best_rule_idx
         ]
@@ -306,7 +230,7 @@ class System2Rules(nn.Module):
             "rule_scores"  : rule_scores,
         }
 
-    # ── Loss ────────────────────────────────────────────────
+    # ── Loss ─────────────────────────────────────────────────
 
     @staticmethod
     def compute_loss(
@@ -322,54 +246,45 @@ class System2Rules(nn.Module):
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """
         Loss = concept + recon + sparsity + coverage + diversity
-
-        1. concept_loss  : NLL per slot, 6 slots ngang nhau
-        2. recon_loss    : MSE(pred_concept, concept_vec) — buộc prototype encode đủ info
-        3. sparsity_loss : entropy(rule_assign) — mỗi ảnh map peaked vào ít rule
-        4. coverage_loss : penalize rule không được dùng
-        5. diversity_loss: cosine sim giữa các rule prototype → penalize duplicates
+        Tất cả 5 concept slots ngang nhau (không có "valid").
         """
-        pred_slot  = outputs["pred_slot_logits"]  # key → [B, dim_k]
-        rule_assign= outputs["rule_assignment"]    # [B, R]
-        pred_cv    = outputs["pred_concept"]       # [B, 42]
-        rule_cv    = outputs["rule_concept_vec"]   # [R, 42]
+        pred_slot   = outputs["pred_slot_logits"]
+        rule_assign = outputs["rule_assignment"]
+        pred_cv     = outputs["pred_concept"]
+        rule_cv     = outputs["rule_concept_vec"]
 
         if slot_weights is None:
             slot_weights = {k: 1.0 for k in CONCEPT_KEYS_ORDERED}
 
-        # ── 1. Concept CE loss ────────────────────────────────
-        slot_losses: dict[str, torch.Tensor] = {}
+        # 1. Concept NLL loss (per slot)
+        slot_losses = {}
         for key in CONCEPT_KEYS_ORDERED:
-            log_pred = (pred_slot[key] + 1e-8).log()   # [B, dim_k]
-            target   = labels[key].long()               # [B]
-            slot_losses[key] = F.nll_loss(log_pred, target)
+            log_pred       = (pred_slot[key] + 1e-8).log()
+            slot_losses[key] = F.nll_loss(log_pred, labels[key].long())
 
         concept_loss = sum(
             slot_weights[k] * slot_losses[k] for k in CONCEPT_KEYS_ORDERED
         ) / sum(slot_weights.values())
 
-        # ── 2. Reconstruction MSE ─────────────────────────────
+        # 2. Reconstruction MSE
         recon_loss = F.mse_loss(pred_cv, concept_vec.detach())
 
-        # ── 3. Sparsity: penalize high entropy (uniform) assignment
+        # 3. Sparsity: penalize uniform assignment
         entropy = -(rule_assign * (rule_assign + 1e-8).log()).sum(dim=1)
         sparsity_loss = entropy.mean()
 
-        # ── 4. Coverage: penalize unused rules ───────────────
-        avg_assign    = rule_assign.mean(dim=0)              # [R]
+        # 4. Coverage: penalize unused rules
+        avg_assign    = rule_assign.mean(dim=0)
         uniform_thr   = 0.5 / rule_assign.shape[1]
         coverage_loss = F.relu(uniform_thr - avg_assign).mean()
 
-        # ── 5. Diversity: penalize identical prototypes ───────
-        rv_norm       = F.normalize(rule_cv, dim=1)          # [R, 42]
-        sim_mat       = rv_norm @ rv_norm.T                  # [R, R]
-        R             = sim_mat.shape[0]
-        upper         = torch.triu(
-            torch.ones(R, R, device=sim_mat.device), diagonal=1
-        ).bool()
+        # 5. Diversity: penalize identical prototypes
+        rv_norm        = F.normalize(rule_cv, dim=1)
+        sim_mat        = rv_norm @ rv_norm.T
+        R              = sim_mat.shape[0]
+        upper          = torch.triu(torch.ones(R, R, device=sim_mat.device), diagonal=1).bool()
         diversity_loss = sim_mat[upper].mean()
 
-        # ── Total ─────────────────────────────────────────────
         total = (
               concept_weight   * concept_loss
             + recon_weight     * recon_loss
@@ -405,11 +320,7 @@ def compute_system2_accuracy(
     outputs: dict[str, torch.Tensor],
     labels : dict[str, torch.Tensor],
 ) -> dict[str, float]:
-    """
-    Per-slot accuracy + expression accuracy (tất cả slot đúng).
-
-    Dùng pred_slot_logits từ forward() — weighted sum probs, argmax để predict.
-    """
+    """Per-slot accuracy + expression accuracy (tất cả 5 slots đúng)."""
     pred_slot = outputs["pred_slot_logits"]
     B = labels["digit1"].shape[0]
     device = labels["digit1"].device
@@ -418,8 +329,8 @@ def compute_system2_accuracy(
     all_correct = torch.ones(B, dtype=torch.bool, device=device)
 
     for key in CONCEPT_KEYS_ORDERED:
-        preds   = pred_slot[key].argmax(dim=1)   # [B]
-        targets = labels[key].long()              # [B]
+        preds   = pred_slot[key].argmax(dim=1)
+        targets = labels[key].long()
         correct = (preds == targets)
         per_slot_correct[key] = correct
         all_correct = all_correct & correct
@@ -429,15 +340,11 @@ def compute_system2_accuracy(
         for key in CONCEPT_KEYS_ORDERED
     }
     result["expression_acc"] = all_correct.float().mean().item()
-    result["concept_acc"] = sum(
+    result["concept_acc"]    = sum(
         result[f"{k}_acc"] for k in CONCEPT_KEYS_ORDERED
     ) / len(CONCEPT_KEYS_ORDERED)
     return result
 
-
-# ─────────────────────────────────────────────────────────────
-# Convenience
-# ─────────────────────────────────────────────────────────────
 
 def system1_outputs_to_concept(
     s1_outputs: dict[str, torch.Tensor],

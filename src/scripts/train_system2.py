@@ -2,7 +2,8 @@
 train_system2.py  (v2 — concept-balanced)
 ==========================================
 Train System 2 với multi-objective loss đảm bảo mọi concept
-slot (digit1, op1, digit2, op2, digit3, valid) đều ngang nhau.
+slot (digit1, op1, digit2, op2, digit3) đều ngang nhau.
+(Dataset v2: không có "valid" slot)
 
 Usage:
     python -m src.training.train_system2 \
@@ -58,8 +59,8 @@ def parse_args():
     p.add_argument("--output_dir",    type=str, default="outputs/system2")
 
     # Architecture
-    p.add_argument("--num_rules",    type=int,   default=128,
-                   help="Số rule prototype. 128 cho MNIST Math (100+ valid expressions).")
+    p.add_argument("--num_rules",    type=int,   default=55,
+                   help="Số rule prototype. 55 cho dataset v2 (55 valid expressions).")
     p.add_argument("--score_mode",   type=str,   default="slot_cosine",
                    choices=["slot_cosine", "flat_cosine"],
                    help="slot_cosine: mỗi slot đóng góp đều nhau (recommended).")
@@ -101,7 +102,7 @@ def parse_args():
 
     # Checkpoint monitor
     p.add_argument("--monitor", type=str, default="expression_acc",
-                   choices=["expression_acc", "concept_acc", "valid_acc",
+                   choices=["expression_acc", "concept_acc",
                             "digit1_acc", "digit2_acc", "digit3_acc"],
                    help="Metric để chọn best checkpoint.")
 
@@ -116,7 +117,7 @@ def make_loaders(data_dir: Path, batch_size: int, num_workers: int):
     kw = dict(batch_size=batch_size, num_workers=num_workers, pin_memory=True)
     return (
         DataLoader(MNISTMathPTDataset(data_dir / "train.pt"), shuffle=True,  **kw),
-        DataLoader(MNISTMathPTDataset(data_dir / "val.pt"),   shuffle=False, **kw),
+        DataLoader(MNISTMathPTDataset(data_dir / "valid.pt"),   shuffle=False, **kw),
         DataLoader(MNISTMathPTDataset(data_dir / "test.pt"),  shuffle=False, **kw),
     )
 
@@ -344,21 +345,25 @@ def print_learned_rules(system2: System2Rules, output_dir: Path, n: int = 20):
     rules_json_data = []
 
     for i in range(system2.num_rules):
-        parts = []
+        from src.utils.symbols import ID_TO_SYMBOL, rule_to_string as _rts
         slots_dict = {}
         slot_confidence = {}
 
         for key in CONCEPT_KEYS_ORDERED:
-            probs    = slot_probs[key][i]              # [dim_k]
+            probs    = slot_probs[key][i]
             pred_idx = int(probs.argmax().item())
-            conf     = float(probs.max().item())       # confidence = max prob
-
-            label = ID_TO_SYMBOL.get(pred_idx, str(pred_idx)) if key in ("op1","op2") else str(pred_idx)
-            parts.append(f"{key}={label}")
-            slots_dict[key] = label
+            conf     = float(probs.max().item())
+            label    = ID_TO_SYMBOL.get(pred_idx, str(pred_idx)) if key in ("op1","op2") else str(pred_idx)
+            slots_dict[key]      = label
             slot_confidence[key] = round(conf, 4)
 
-        rule_str = " AND ".join(parts)
+        # Format v2: "a + b = c"
+        rule_str = _rts(
+            int(slots_dict["digit1"]),
+            int(slot_probs["op1"][i].argmax()),
+            int(slots_dict["digit2"]),
+            int(slots_dict["digit3"]),
+        )
         min_conf = min(slot_confidence.values())
 
         if i < n:
