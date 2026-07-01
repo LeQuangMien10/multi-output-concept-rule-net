@@ -7,7 +7,7 @@ from src.models.cnn_backbone import SimpleCNNBackbone
 # Ánh xạ cố định: slot index → concept key
 # Khớp chính xác với thứ tự paste trong generate_mnist_math.py:
 #   canvas.paste(digit1, i=0), op1 (i=1), digit2 (i=2), op2 (i=3), digit3 (i=4)
-_SLOT_TO_KEY = {0: "digit1", 1: "op1", 2: "digit2", 3: "op2"}  # digit3 không có slot trong ảnh (target label)
+_SLOT_TO_KEY = {0: "digit1", 1: "op1", 2: "digit2", 3: "op2"}  # 4 slots trong ảnh; digit3 là label, không có slot riêng
 
 
 class MultiHeadSystem1(nn.Module):
@@ -24,8 +24,7 @@ class MultiHeadSystem1(nn.Module):
         op1_head     ← slots[:, 1, :]    (vùng ảnh chứa op1)
         digit2_head  ← slots[:, 2, :]    (vùng ảnh chứa digit2)
         op2_head     ← slots[:, 3, :]    (vùng ảnh chứa op2)
-        digit3_head  ← slots.mean(dim=1) (predict answer từ context toàn biểu thức)
-        [valid_head đã bỏ — không còn valid/invalid concept]
+        digit3_head  ← slots.mean(dim=1) (predict answer, không có slot riêng)
 
     Tương thích dài hạn (ảnh y tế, da liễu):
     ─────────────────────────────────────────
@@ -41,7 +40,7 @@ class MultiHeadSystem1(nn.Module):
         slot_dim = feature_dim // 2 (mặc định 256 → slot_dim=128).
         Giữ tên feature_dim để tương thích với checkpoint cũ.
     num_slots : int
-        Số ký tự trong ảnh (mặc định 4 cho v2: digit1,op1,digit2,op2).
+        Số slot trong ảnh (mặc định 4 cho v2: digit1,op1,digit2,op2).
     dropout : float
         Dropout trong slot projection.
 
@@ -52,14 +51,13 @@ class MultiHeadSystem1(nn.Module):
         op1:    [B, 5]
         digit2: [B, 10]
         op2:    [B, 5]
-        digit3: [B, 10]
-        valid:  [B, 2]
+        digit3: [B, 10]   ← predict từ global mean (target)
     """
 
     def __init__(
         self,
         feature_dim: int = 256,
-        num_slots: int = 4,   # ảnh v2: [digit1][op1][digit2][op2]
+        num_slots: int = 4,   # v2: [digit1][op1][digit2][op2]
         dropout: float = 0.2,
     ):
         super().__init__()
@@ -84,8 +82,7 @@ class MultiHeadSystem1(nn.Module):
         self.op2_head    = nn.Linear(self.slot_dim, 5)
         self.digit3_head = nn.Linear(self.slot_dim, 10)
 
-        # digit3_head: predict answer từ global mean (không có slot riêng)
-        # Lý do: digit3 = f(digit1, op1, digit2) cần nhìn toàn bộ biểu thức
+
 
     def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
         """
@@ -101,12 +98,12 @@ class MultiHeadSystem1(nn.Module):
         slots = self.backbone(x)
 
         outputs = {
-            # Concept slots trong ảnh (4 slots: digit1, op1, digit2, op2)
+            # Các slot trong ảnh: digit1, op1, digit2, op2
             "digit1": self.digit1_head(slots[:, 0, :]),
             "op1":    self.op1_head(slots[:, 1, :]),
             "digit2": self.digit2_head(slots[:, 2, :]),
             "op2":    self.op2_head(slots[:, 3, :]),
-            # digit3 = target — predict từ global context (không có slot riêng trong ảnh)
+            # digit3 = target — predict từ global context (mean của 4 slots)
             "digit3": self.digit3_head(slots.mean(dim=1)),
         }
 
@@ -122,7 +119,7 @@ class MultiHeadSystem1(nn.Module):
 
 if __name__ == "__main__":
     model = MultiHeadSystem1(feature_dim=256, num_slots=4)
-    dummy = torch.randn(4, 1, 28, 112)  # 4 slots × 28px
+    dummy = torch.randn(4, 1, 28, 112)
     outputs = model(dummy)
 
     print(f"slot_dim = {model.slot_dim}")
@@ -130,8 +127,7 @@ if __name__ == "__main__":
     for key, value in outputs.items():
         print(f"  {key}: {value.shape}")
 
-    # Verify slot-concept mapping
-    print()
-    print("Slot mapping:")
+    print("Slot mapping (4 slots in image, digit3 from mean):")
     for i, key in _SLOT_TO_KEY.items():
         print(f"  slots[:, {i}, :] → {key}_head")
+    print("  slots.mean(dim=1)  → digit3_head")

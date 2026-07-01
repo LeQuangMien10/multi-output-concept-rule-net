@@ -20,8 +20,8 @@ from src.training.metrics import (
 from src.utils.seed import set_seed
 
 
+# v2: không còn "valid" — tất cả expressions đều valid by construction
 CONCEPT_KEYS = ["digit1", "op1", "digit2", "op2", "digit3"]
-ALL_KEYS = ["digit1", "op1", "digit2", "op2", "digit3", "valid"]
 
 
 def parse_args():
@@ -38,20 +38,14 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42)
 
     parser.add_argument("--feature_dim", type=int, default=256)
-    parser.add_argument("--num_slots", type=int, default=5,
-                        help="Số ký tự trong biểu thức (5 cho MNIST Math).")
-    parser.add_argument(
-        "--valid_loss_weight",
-        type=float,
-        default=1.0,
-        help="Weight for valid/invalid classification loss.",
-    )
+    parser.add_argument("--num_slots", type=int, default=4,
+                        help="Số slot trong ảnh v2 (4 cho MNIST Math v2: digit1,op1,digit2,op2).")
+    # valid_loss_weight đã bỏ (không còn valid label trong v2)
     parser.add_argument(
         "--monitor",
         type=str,
         default="expression_acc",
-        choices=["expression_acc", "valid_acc", "digit1_acc",
-                 "digit2_acc", "digit3_acc"],
+        choices=["expression_acc", "digit1_acc", "digit2_acc", "digit3_acc"],
         help="Metric dùng để lưu best checkpoint.",
     )
 
@@ -90,31 +84,23 @@ def make_loaders(data_dir: Path, batch_size: int, num_workers: int):
     return train_loader, val_loader, test_loader
 
 
-def system1_loss(outputs: dict[str, torch.Tensor], labels: dict[str, torch.Tensor], valid_loss_weight: float = 1.0):
+def system1_loss(outputs: dict[str, torch.Tensor], labels: dict[str, torch.Tensor]):
+    """CE loss trên 5 concept slots (v2: không có valid)."""
     loss_digit1 = F.cross_entropy(outputs["digit1"], labels["digit1"])
-    loss_op1 = F.cross_entropy(outputs["op1"], labels["op1"])
+    loss_op1    = F.cross_entropy(outputs["op1"],    labels["op1"])
     loss_digit2 = F.cross_entropy(outputs["digit2"], labels["digit2"])
-    loss_op2 = F.cross_entropy(outputs["op2"], labels["op2"])
+    loss_op2    = F.cross_entropy(outputs["op2"],    labels["op2"])
     loss_digit3 = F.cross_entropy(outputs["digit3"], labels["digit3"])
-    loss_valid = F.cross_entropy(outputs["valid"], labels["valid"])
 
-    total_loss = (
-        loss_digit1
-        + loss_op1
-        + loss_digit2
-        + loss_op2
-        + loss_digit3
-        + valid_loss_weight * loss_valid
-    )
+    total_loss = loss_digit1 + loss_op1 + loss_digit2 + loss_op2 + loss_digit3
 
     loss_dict = {
-        "loss_total": total_loss,
+        "loss_total":  total_loss,
         "loss_digit1": loss_digit1.detach(),
-        "loss_op1": loss_op1.detach(),
+        "loss_op1":    loss_op1.detach(),
         "loss_digit2": loss_digit2.detach(),
-        "loss_op2": loss_op2.detach(),
+        "loss_op2":    loss_op2.detach(),
         "loss_digit3": loss_digit3.detach(),
-        "loss_valid": loss_valid.detach(),
     }
 
     return total_loss, loss_dict
@@ -122,18 +108,17 @@ def system1_loss(outputs: dict[str, torch.Tensor], labels: dict[str, torch.Tenso
 
 def init_metric_meters():
     return {
-        "digit1_acc": AccuracyMeter(),
-        "op1_acc": AccuracyMeter(),
-        "digit2_acc": AccuracyMeter(),
-        "op2_acc": AccuracyMeter(),
-        "digit3_acc": AccuracyMeter(),
-        "valid_acc": AccuracyMeter(),
+        "digit1_acc":     AccuracyMeter(),
+        "op1_acc":        AccuracyMeter(),
+        "digit2_acc":     AccuracyMeter(),
+        "op2_acc":        AccuracyMeter(),
+        "digit3_acc":     AccuracyMeter(),
         "expression_acc": AccuracyMeter(),
     }
 
 
 def update_metric_meters(meters, outputs, labels):
-    for key in ALL_KEYS:
+    for key in CONCEPT_KEYS:
         correct, total = batch_correct_from_logits(outputs[key], labels[key])
         meters[f"{key}_acc"].update(correct, total)
 
@@ -152,7 +137,7 @@ def collect_metric_results(loss_meter, meters):
     return results
 
 
-def train_one_epoch(model, loader, optimizer, device, valid_loss_weight: float):
+def train_one_epoch(model, loader, optimizer, device):
     model.train()
 
     loss_meter = AverageMeter()
@@ -163,7 +148,7 @@ def train_one_epoch(model, loader, optimizer, device, valid_loss_weight: float):
         labels = {k: v.to(device) for k, v in labels.items()}
 
         outputs = model(images)
-        loss, _ = system1_loss(outputs, labels, valid_loss_weight=valid_loss_weight)
+        loss, _ = system1_loss(outputs, labels)
 
         optimizer.zero_grad()
         loss.backward()
@@ -178,7 +163,7 @@ def train_one_epoch(model, loader, optimizer, device, valid_loss_weight: float):
 
 
 @torch.no_grad()
-def evaluate(model, loader, device, split_name="Val", valid_loss_weight: float = 1.0):
+def evaluate(model, loader, device, split_name="Val"):
     model.eval()
 
     loss_meter = AverageMeter()
@@ -189,7 +174,7 @@ def evaluate(model, loader, device, split_name="Val", valid_loss_weight: float =
         labels = {k: v.to(device) for k, v in labels.items()}
 
         outputs = model(images)
-        loss, _ = system1_loss(outputs, labels, valid_loss_weight=valid_loss_weight)
+        loss, _ = system1_loss(outputs, labels)
 
         batch_size = images.size(0)
         loss_meter.update(loss.item(), batch_size)
@@ -240,7 +225,6 @@ def main():
             train_loader,
             optimizer,
             device,
-            valid_loss_weight=args.valid_loss_weight,
         )
 
         val_metrics = evaluate(
@@ -248,7 +232,6 @@ def main():
             val_loader,
             device,
             split_name="Val",
-            valid_loss_weight=args.valid_loss_weight,
         )
 
         row = {
@@ -262,10 +245,8 @@ def main():
         print(
             f"train_loss={row['train_loss']:.4f} | "
             f"train_expr_acc={row['train_expression_acc']:.4f} | "
-            f"train_valid_acc={row['train_valid_acc']:.4f} | "
             f"val_loss={row['val_loss']:.4f} | "
-            f"val_expr_acc={row['val_expression_acc']:.4f} | "
-            f"val_valid_acc={row['val_valid_acc']:.4f}"
+            f"val_expr_acc={row['val_expression_acc']:.4f}"
         )
 
         print(
@@ -304,7 +285,6 @@ def main():
         test_loader,
         device,
         split_name="Test",
-        valid_loss_weight=args.valid_loss_weight,
     )
 
     results = {
@@ -327,8 +307,7 @@ def main():
         f"op1={test_metrics['op1_acc']:.4f}  "
         f"d2={test_metrics['digit2_acc']:.4f}  "
         f"op2={test_metrics['op2_acc']:.4f}  "
-        f"d3={test_metrics['digit3_acc']:.4f}  "
-        f"valid={test_metrics['valid_acc']:.4f}"
+        f"d3={test_metrics['digit3_acc']:.4f}"
     )
 
 

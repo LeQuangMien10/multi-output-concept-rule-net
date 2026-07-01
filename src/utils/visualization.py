@@ -11,19 +11,15 @@ def save_dataset_preview(
     save_path: str | Path,
     num_samples: int = 16,
 ) -> None:
-    """
-    Save a grid preview of MNIST Math samples.
-    Hỗ trợ cả v1 (có valid) và v2 (không có valid, predict digit3).
-    """
+    """Grid preview — hỗ trợ v1 (has valid) và v2 (predict digit3)."""
     save_path = Path(save_path)
     save_path.parent.mkdir(parents=True, exist_ok=True)
 
-    images = batch["images"]
-    digit1 = batch["digit1"]
-    op1    = batch["op1"]
-    digit2 = batch["digit2"]
-    op2    = batch["op2"]
-    digit3 = batch["digit3"]
+    images    = batch["images"]
+    digit1    = batch["digit1"]
+    op1       = batch["op1"]
+    digit2    = batch["digit2"]
+    digit3    = batch["digit3"]
     has_valid = "valid" in batch
 
     num_samples = min(num_samples, images.shape[0])
@@ -37,16 +33,14 @@ def save_dataset_preview(
         if isinstance(img, torch.Tensor):
             img = img.squeeze(0).cpu().numpy()
 
-        # v1: show full expression; v2: show "a + b = → answer=c"
         if has_valid:
             expr  = expression_to_string(int(digit1[i]), int(op1[i]),
-                                         int(digit2[i]), int(op2[i]),
+                                         int(digit2[i]), int(batch["op2"][i]),
                                          int(digit3[i]))
             label = "valid" if int(batch["valid"][i]) == 1 else "invalid"
             title = f"{expr}\n{label}"
         else:
-            expr  = expression_to_string(int(digit1[i]), int(op1[i]),
-                                         int(digit2[i]))
+            expr  = expression_to_string(int(digit1[i]), int(op1[i]), int(digit2[i]))
             title = f"{expr}  →  ans={int(digit3[i])}"
 
         plt.subplot(rows, cols, i + 1)

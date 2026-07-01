@@ -1,31 +1,14 @@
 DIGIT_CLASSES = list(range(10))
-
-OP_SYMBOLS = ["+", "-", "*", "/", "="]
-
-SYMBOL_TO_ID = {
-    "+": 0,
-    "-": 1,
-    "*": 2,
-    "/": 3,
-    "=": 4,
-}
-
-ID_TO_SYMBOL = {v: k for k, v in SYMBOL_TO_ID.items()}
+OP_SYMBOLS    = ["+", "-", "*", "/", "="]
+SYMBOL_TO_ID  = {"+": 0, "-": 1, "*": 2, "/": 3, "=": 4}
+ID_TO_SYMBOL  = {v: k for k, v in SYMBOL_TO_ID.items()}
 
 CONCEPT_ORDER = ["digit1", "op1", "digit2", "op2", "digit3"]
+CONCEPT_SPECS = {"digit1": 10, "op1": 5, "digit2": 10, "op2": 5, "digit3": 10}
 
-CONCEPT_SPECS = {
-    "digit1": 10,
-    "op1":    5,
-    "digit2": 10,
-    "op2":    5,
-    "digit3": 10,
-}
-
-# v2 helpers
-LABEL_KEYS          = ["digit1", "op1", "digit2", "op2", "digit3"]
-INPUT_CONCEPT_KEYS  = ["digit1", "op1", "digit2", "op2"]
-TARGET_KEY          = "digit3"
+LABEL_KEYS         = ["digit1", "op1", "digit2", "op2", "digit3"]
+INPUT_CONCEPT_KEYS = ["digit1", "op1", "digit2", "op2"]
+TARGET_KEY         = "digit3"
 
 
 def expression_to_string(
@@ -36,9 +19,8 @@ def expression_to_string(
     digit3: int | None = None,
 ) -> str:
     """
-    Render expression. Tự động chọn format:
-        - Có digit3: "a + b = c"  (v1 full, hoặc v2 với answer)
-        - Không digit3: "a + b ="  (v2 display, không show answer)
+    v1 (5 args): 'a + b = c'
+    v2 (3 args): 'a + b ='
     """
     op1 = ID_TO_SYMBOL[int(op1_id)]
     if digit3 is not None:

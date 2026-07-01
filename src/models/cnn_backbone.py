@@ -47,7 +47,7 @@ class SimpleCNNBackbone(nn.Module):
         #   [B, 32, 14,  56]  after MaxPool2d(2)
         #   [B, 64,  7,  28]  after MaxPool2d(2)
         #   [B,128,  7,  28]  after conv3 + conv4
-        #   [B,128,  1,   5]  after AdaptiveAvgPool2d((1, num_slots))
+        #   [B,128,  1,   4]  after AdaptiveAvgPool2d((1, num_slots))
         #   Width 28 / num_slots 4 = 7px per slot → exact alignment
         self.conv = nn.Sequential(
             nn.Conv2d(in_channels, 32, kernel_size=3, padding=1),
@@ -96,11 +96,10 @@ class SimpleCNNBackbone(nn.Module):
 
 if __name__ == "__main__":
     model = SimpleCNNBackbone(slot_dim=128, num_slots=4)
-    dummy = torch.randn(4, 1, 28, 112)  # 4 slots × 28px
+    dummy = torch.randn(4, 1, 28, 112)
     out = model(dummy)
-    print(f"Output shape: {out.shape}")  # Expected: [4, 5, 128]
+    print(f"Output shape: {out.shape}")  # Expected: [4, 4, 128]
     print(f"  slots[b, 0, :] = digit1 features")
     print(f"  slots[b, 1, :] = op1 features")
     print(f"  slots[b, 2, :] = digit2 features")
     print(f"  slots[b, 3, :] = op2 features")
-    print(f"  slots[b, 3, :] = op2 features (digit3 is the label, not in image)")
