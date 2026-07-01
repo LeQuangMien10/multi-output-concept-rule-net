@@ -66,7 +66,7 @@ def parse_args():
                    help="slot_cosine: mỗi slot đóng góp đều nhau (recommended).")
     p.add_argument("--T_max",        type=float, default=2.0,
                    help="Temperature ban đầu (cosine annealing). Cao → exploration.")
-    p.add_argument("--T_min",        type=float, default=0.07,
+    p.add_argument("--T_min",        type=float, default=0.1,
                    help="Temperature cuối (cosine annealing). Thấp → peaked assignment.")
     p.add_argument("--init_sharp",   type=float, default=8.0,
                    help="Logit sharpness khi khởi tạo prototype từ expressions.")
