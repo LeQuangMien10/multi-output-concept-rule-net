@@ -282,8 +282,9 @@ def visualize(
     ax_img.axis("off")
 
     # Expression string in title
-    gt_expr = (f"{gt_labels['digit1']} + {gt_labels['digit2']} = {gt_labels['digit3']}"
-               f"  ({'valid' if gt_labels['valid'] == 1 else 'invalid'})")
+    has_valid_label = "valid" in gt_labels
+    _validity = f"  ({'valid' if gt_labels['valid'] == 1 else 'invalid'})" if has_valid_label else ""
+    gt_expr = f"{gt_labels['digit1']} + {gt_labels['digit2']} = {gt_labels['digit3']}{_validity}"
     ax_img.set_title(
         f"Sample #{sample_idx}   GT: {gt_expr}",
         fontsize=12, pad=8, fontweight="bold", color="#2c2c2a",
@@ -383,9 +384,9 @@ def visualize(
         for k in CONCEPT_KEYS_ORDERED:
             vi = slot_probs_r[k].argmax().item()
             vals.append(label_to_str(k, vi))
-        # Compact: "d1=3 + d2=5 = d3=8 (valid)"
-        d1,o1,d2,o2,d3,vd = vals
-        r_compact = f"  {d1} {o1} {d2} {o2} {d3}  ({'valid' if vd=='yes' else 'invalid'})"
+        # Compact: "3 + 5 = 8"
+        d1,o1,d2,o2,d3 = vals
+        r_compact = f"  {d1} {o1} {d2} {o2} {d3}"
         marker = "▶" if ridx == best_r else " "
         ax_rule.text(
             0, y_top3 - 0.15 - rank * 0.16,
