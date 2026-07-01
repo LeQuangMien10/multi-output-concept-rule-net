@@ -35,19 +35,32 @@ from src.models.rule_matching import RuleMatcher
 # Prototype initialization (dataset v2: chỉ valid expressions)
 # ─────────────────────────────────────────────────────────────
 
-def _enumerate_valid_expressions(op1_id: int = 0, op2_id: int = 4) -> list[tuple]:
+def _enumerate_valid_expressions(op2_id: int = 4) -> list[tuple]:
     """
-    Liệt kê 55 valid expressions: a + b = c  với a+b ≤ 9.
-    Tuple: (digit1, op1, digit2, op2, digit3)
-    — không có "valid" slot vì dataset v2 chỉ có valid expressions.
+    Liệt kê 110 valid expressions cho dataset v3 (op ∈ {+, −}):
+        55 phép cộng: a + b = c  với a+b ≤ 9
+        55 phép trừ: a − b = c  với a-b ≥ 0
+    Tuple: (digit1, op1_id, digit2, op2_id, digit3)
+    digit3 perfectly balanced: mỗi giá trị 0-9 xuất hiện đúng 11 lần.
     """
+    from src.utils.symbols import SYMBOL_TO_ID
+    plus_id  = SYMBOL_TO_ID["+"]   # 0
+    minus_id = SYMBOL_TO_ID["-"]   # 1
+
     exprs = []
+    # Phép cộng: 55 expressions
     for a in range(10):
         for b in range(10):
             c = a + b
             if c <= 9:
-                exprs.append((a, op1_id, b, op2_id, c))
-    return exprs  # 55 expressions
+                exprs.append((a, plus_id, b, op2_id, c))
+    # Phép trừ: 55 expressions
+    for a in range(10):
+        for b in range(10):
+            c = a - b
+            if c >= 0:
+                exprs.append((a, minus_id, b, op2_id, c))
+    return exprs  # 110 expressions
 
 
 def _build_prototype_logits(
@@ -58,7 +71,7 @@ def _build_prototype_logits(
     seed:         int   = 42,
 ) -> dict:
     """
-    Khởi tạo rule_slot_logits từ 55 valid expressions.
+    Khởi tạo rule_slot_logits từ 110 valid expressions (+ và −).
 
     Với 128 rules và 55 expressions: pad bằng cách lặp lại.
     Kết quả: mỗi rule bắt đầu từ một expression cụ thể,
@@ -68,7 +81,7 @@ def _build_prototype_logits(
     _rng.seed(seed)
 
     exprs = _enumerate_valid_expressions()
-    # Pad đến num_rules nếu cần
+    # Pad đến num_rules nếu cần (với v3: 110 expressions, num_rules=110 → không pad)
     while len(exprs) < num_rules:
         exprs.append(_rng.choice(exprs))
     _rng.shuffle(exprs)
@@ -103,7 +116,7 @@ class System2Rules(nn.Module):
 
     def __init__(
         self,
-        num_rules:      int   = 55,
+        num_rules:      int   = 110,
         concept_dim:    int   = CONCEPT_TOTAL_DIM,   # 40
         score_mode:     str   = "slot_cosine",
         temperature:    float = 2.0,

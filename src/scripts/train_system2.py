@@ -59,8 +59,8 @@ def parse_args():
     p.add_argument("--output_dir",    type=str, default="outputs/system2")
 
     # Architecture
-    p.add_argument("--num_rules",    type=int,   default=55,
-                   help="Số rule prototype. 55 cho dataset v2 (55 valid expressions).")
+    p.add_argument("--num_rules",    type=int,   default=110,
+                   help="Số rule prototype. 110 cho dataset v3 (55 phép + và 55 phép −).")
     p.add_argument("--score_mode",   type=str,   default="slot_cosine",
                    choices=["slot_cosine", "flat_cosine"],
                    help="slot_cosine: mỗi slot đóng góp đều nhau (recommended).")
