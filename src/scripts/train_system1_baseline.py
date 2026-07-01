@@ -27,7 +27,7 @@ CONCEPT_KEYS = ["digit1", "op1", "digit2", "op2", "digit3"]
 def parse_args():
     parser = argparse.ArgumentParser(description="Train multi-head System 1 baseline.")
 
-    parser.add_argument("--data_dir", type=str, required=True, help="Directory containing train.pt, val.pt, test.pt.")
+    parser.add_argument("--data_dir", type=str, required=True, help="Directory containing train.pt, valid.pt, test.pt.")
     parser.add_argument("--output_dir", type=str, default="outputs/system1_baseline")
 
     parser.add_argument("--epochs", type=int, default=10)
@@ -54,7 +54,7 @@ def parse_args():
 
 def make_loaders(data_dir: Path, batch_size: int, num_workers: int):
     train_dataset = MNISTMathPTDataset(data_dir / "train.pt")
-    val_dataset = MNISTMathPTDataset(data_dir / "val.pt")
+    val_dataset = MNISTMathPTDataset(data_dir / "valid.pt")
     test_dataset = MNISTMathPTDataset(data_dir / "test.pt")
 
     train_loader = DataLoader(
