@@ -24,8 +24,8 @@ from src.datasets.mnist_math_dataset import MNISTMathPTDataset
 from src.models.multi_head_system1 import MultiHeadSystem1
 from src.models.crl_system2 import CRLSystem2, _idx_to_concept_name
 from src.models.rule_memory import (
-    labels_to_concept_vector,
-    soft_concept_vector,
+    labels_to_input_concept_vector,
+    soft_input_concept_vector,
     CONCEPT_KEYS_ORDERED,
 )
 from src.training.metrics import AverageMeter
@@ -113,9 +113,9 @@ def get_concept_vec(
     use_gt : bool,
 ) -> torch.Tensor:
     if use_gt:
-        return labels_to_concept_vector(labels)
+        return labels_to_input_concept_vector(labels)
     s1_out = system1(images)
-    return soft_concept_vector(s1_out)
+    return soft_input_concept_vector(s1_out)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -252,12 +252,13 @@ def main():
     # ── CRL System2 ──────────────────────────────────────────
     system2 = CRLSystem2(
         num_rules   = args.num_rules,
-        concept_dim = 40,
+        concept_dim = 30,  # input-only: digit1+op1+digit2+op2, NO digit3
         num_classes = args.num_classes,
         init_std    = args.init_std,
     ).to(device)
 
     print(f"[INFO] CRL System2: {args.num_rules} rules, random init (std={args.init_std})")
+    print(f"[INFO] Input concept dim: 30 (digit1+op1+digit2+op2, NO digit3 — prevents circular reasoning)")
     print(f"[INFO] Loss: task_CE + {args.sparsity_weight}×L1 + {args.diversity_weight}×diversity")
     print(f"[INFO] Warmup GT epochs: {args.warmup_gt_epochs}")
 

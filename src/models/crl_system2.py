@@ -5,7 +5,7 @@ Thay thế prototype cosine matching bằng differentiable logic layers,
 lấy cảm hứng từ CRL (MICCAI 2025) nhưng thiết kế độc lập.
 
 Kiến trúc:
-    concept_vec [B, C]                   (C=40, softmax probs từ S1)
+    concept_vec [B, C]                   (C=30, chỉ digit1+op1+digit2+op2 — KHÔNG có digit3)
         ↓  rule_weights [R, C]           (random init, học từ data)
     rule_logit  [B, R] = cv @ W.T
         ↓  sigmoid
@@ -37,6 +37,8 @@ from src.models.rule_memory import (
     CONCEPT_KEYS_ORDERED,
     CONCEPT_DIMS,
     CONCEPT_OFFSETS,
+    INPUT_ONLY_KEYS,
+    INPUT_ONLY_DIM,
 )
 from src.utils.symbols import ID_TO_SYMBOL
 
@@ -52,7 +54,7 @@ class CRLSystem2(nn.Module):
     Parameters
     ----------
     num_rules     : int   — số rules (không biết trước, hyperparameter)
-    concept_dim   : int   — chiều concept vector (40 cho MNIST Math v3)
+    concept_dim   : int   — chiều concept vector (30 = bỏ digit3 tránh circular reasoning)
     num_classes   : int   — số class output (10 cho digit3 ∈ {0..9})
     init_std      : float — std của random init cho rule_weights
     """
@@ -60,7 +62,7 @@ class CRLSystem2(nn.Module):
     def __init__(
         self,
         num_rules   : int   = 64,
-        concept_dim : int   = CONCEPT_TOTAL_DIM,  # 40
+        concept_dim : int   = INPUT_ONLY_DIM,     # 30 (digit1+op1+digit2+op2)
         num_classes : int   = 10,
         init_std    : float = 0.1,
     ):
@@ -86,7 +88,7 @@ class CRLSystem2(nn.Module):
 
     def forward(self, concept_vec: torch.Tensor) -> dict[str, torch.Tensor]:
         """
-        concept_vec : FloatTensor[B, 40]
+        concept_vec : FloatTensor[B, 30]  — input-only, không có digit3
 
         Returns
         -------
@@ -288,9 +290,9 @@ class CRLSystem2(nn.Module):
 def _idx_to_concept_name(idx: int) -> str:
     """
     Chuyển index trong concept vector [0..39] thành tên dễ đọc.
-    Layout: digit1[0:10], op1[10:15], digit2[15:25], op2[25:30], digit3[30:40]
+    Layout: digit1[0:10], op1[10:15], digit2[15:25], op2[25:30]  (30-dim, no digit3)
     """
-    for key in CONCEPT_KEYS_ORDERED:
+    for key in INPUT_ONLY_KEYS:  # digit3 không có trong input vector
         offset = CONCEPT_OFFSETS[key]
         dim    = CONCEPT_DIMS[key]
         if offset <= idx < offset + dim:

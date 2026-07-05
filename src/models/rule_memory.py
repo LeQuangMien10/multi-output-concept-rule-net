@@ -140,3 +140,35 @@ class RuleMemory(nn.Module):
 
     def extra_repr(self) -> str:
         return f"num_rules={self.num_rules}, concept_dim={self.concept_dim}"
+
+
+# ─────────────────────────────────────────────────────────────
+# Input-only concept vector (30-dim, bỏ digit3)
+# Dùng cho CRL System2: target (digit3) không được xuất hiện
+# trong input để tránh circular reasoning.
+# Layout: digit1[0:10], op1[10:15], digit2[15:25], op2[25:30]
+# ─────────────────────────────────────────────────────────────
+
+INPUT_ONLY_KEYS: list[str] = ["digit1", "op1", "digit2", "op2"]
+INPUT_ONLY_DIM:  int       = sum(CONCEPT_DIMS[k] for k in INPUT_ONLY_KEYS)  # 30
+
+
+def labels_to_input_concept_vector(labels: dict[str, torch.Tensor]) -> torch.Tensor:
+    """GT labels → one-hot input concept vector [B, 30] (không có digit3)."""
+    B   = labels["digit1"].shape[0]
+    vec = torch.zeros(B, INPUT_ONLY_DIM, device=labels["digit1"].device)
+    off = 0
+    for key in INPUT_ONLY_KEYS:
+        dim = CONCEPT_DIMS[key]
+        idx = labels[key].long()
+        one_hot = torch.zeros(B, dim, device=idx.device)
+        one_hot.scatter_(1, idx.unsqueeze(1), 1.0)
+        vec[:, off: off + dim] = one_hot
+        off += dim
+    return vec
+
+
+def soft_input_concept_vector(outputs: dict[str, torch.Tensor]) -> torch.Tensor:
+    """System1 logits → soft input concept vector [B, 30] (không có digit3)."""
+    parts = [F.softmax(outputs[k], dim=-1) for k in INPUT_ONLY_KEYS]
+    return torch.cat(parts, dim=1)  # [B, 30]
