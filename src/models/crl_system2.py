@@ -185,47 +185,49 @@ class CRLSystem2(nn.Module):
     # ── Interpretability ─────────────────────────────────────
 
     @torch.no_grad()
-    def decode_rules(self, top_k: int = 3) -> list[dict]:
+    def decode_rules(self, weight_threshold: float = 0.5) -> list[dict]:
         """
         Decode learned rules thành dạng có thể đọc được.
 
-        Với mỗi rule r:
-            Tìm top_k concepts có |weight| lớn nhất
-            Phân loại thành positive (w > 0) và negative (w < 0)
+        Chỉ hiển thị concepts có |weight| > weight_threshold.
+        Loại bỏ noise (weights nhỏ gần 0) — chỉ giữ signal thực sự.
 
-        Returns list[dict] với keys:
-            rule_id, positive_concepts, negative_concepts, rule_string
+        Positive condition (w > threshold): concept "phải có mặt"
+        Negative condition (w < -threshold): concept "không được có"
+
+        Rules hướng tới dạng: digit1=3 AND op1=+ AND digit2=5 → digit3=8
         """
         W = self.rule_weights.detach()   # [R, C]
         decoded = []
 
         for r in range(self.num_rules):
-            w_r    = W[r]                                    # [C]
-            abs_w  = w_r.abs()
-            top_idx = abs_w.topk(top_k).indices.tolist()
+            w_r = W[r]                   # [C]
+
+            # Chỉ lấy concepts có |w| > threshold
+            pos_mask = w_r >  weight_threshold
+            neg_mask = w_r < -weight_threshold
 
             pos_concepts = []
             neg_concepts = []
 
-            for idx in top_idx:
-                concept_name = _idx_to_concept_name(idx)
-                weight_val   = w_r[idx].item()
-                if weight_val > 0:
-                    pos_concepts.append((concept_name, round(weight_val, 3)))
-                else:
-                    neg_concepts.append((concept_name, round(weight_val, 3)))
+            for idx in pos_mask.nonzero(as_tuple=True)[0].tolist():
+                pos_concepts.append((_idx_to_concept_name(idx), round(w_r[idx].item(), 3)))
+            for idx in neg_mask.nonzero(as_tuple=True)[0].tolist():
+                neg_concepts.append((_idx_to_concept_name(idx), round(w_r[idx].item(), 3)))
+
+            # Sort by |weight| descending — strongest conditions first
+            pos_concepts.sort(key=lambda x: -abs(x[1]))
+            neg_concepts.sort(key=lambda x:  abs(x[1]))
 
             # Build readable rule string
-            parts = []
-            for name, w in pos_concepts:
-                parts.append(f"{name}")
-            for name, w in neg_concepts:
-                parts.append(f"NOT {name}")
-            rule_string = " AND ".join(parts) if parts else "(no dominant concept)"
+            parts = [name for name, _ in pos_concepts]
+            parts += [f"NOT {name}" for name, _ in neg_concepts]
+            rule_string = " AND ".join(parts) if parts else "(weights below threshold — rule not learned)"
 
-            # Prediction tendency
-            pred_head_w = self.pred_head.weight[:, r].detach()  # [10]
+            # Prediction tendency: argmax of pred_head weight for this rule
+            pred_head_w = self.pred_head.weight[:, r].detach()   # [10]
             pred_class  = pred_head_w.argmax().item()
+            pred_conf   = round(float(torch.softmax(pred_head_w, dim=0).max()), 3)
 
             decoded.append({
                 "rule_id"          : r,
@@ -233,6 +235,8 @@ class CRLSystem2(nn.Module):
                 "negative_concepts": neg_concepts,
                 "rule_string"      : rule_string,
                 "predicts_digit3"  : pred_class,
+                "pred_confidence"  : pred_conf,
+                "num_conditions"   : len(parts),
                 "pred_head_weight" : pred_head_w.tolist(),
             })
 

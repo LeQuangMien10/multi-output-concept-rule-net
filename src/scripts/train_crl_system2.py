@@ -57,8 +57,8 @@ def parse_args():
     p.add_argument("--num_workers",  type=int,   default=2)
     p.add_argument("--seed",         type=int,   default=42)
 
-    p.add_argument("--sparsity_weight",  type=float, default=0.01,
-                   help="L1 regularization trên rule_weights.")
+    p.add_argument("--sparsity_weight",  type=float, default=0.05,
+                   help="L1 regularization trên rule_weights. Cao hơn → rules sparse hơn.")
     p.add_argument("--diversity_weight", type=float, default=0.01,
                    help="Penalize similar rules.")
 
@@ -66,6 +66,8 @@ def parse_args():
                    help="Số epoch đầu dùng GT concept labels thay vì S1 output.")
     p.add_argument("--monitor", type=str, default="expression_acc",
                    choices=["expression_acc", "digit3_acc"])
+    p.add_argument("--weight_threshold", type=float, default=0.5,
+                   help="Threshold |w| để hiển thị condition trong rule. Cao hơn → rules gọn hơn.")
 
     return p.parse_args()
 
@@ -82,11 +84,28 @@ def make_loaders(data_dir: Path, batch_size: int, num_workers: int):
                 return MNISTMathPTDataset(p)
         raise FileNotFoundError(f"No {split}.pt in {data_dir}")
 
-    kw = dict(batch_size=batch_size, num_workers=num_workers, pin_memory=True)
+    train_ds = _ds("train")
+
+    # Weighted sampler: cân bằng digit3 distribution trong training batch
+    # Dataset đã balanced (11 expr/class) nhưng pred_head vẫn skew về 0 và 9
+    # → oversample middle values (3,4,5,6) nhẹ để ép pred_head phân bổ đều hơn
+    digit3_labels = train_ds.data["digit3"].tolist()
+    from collections import Counter
+    class_counts = Counter(digit3_labels)
+    # Weight = 1 / frequency → inverse frequency sampling
+    weights = [1.0 / class_counts[int(d)] for d in digit3_labels]
+    sampler = torch.utils.data.WeightedRandomSampler(
+        weights=weights,
+        num_samples=len(weights),
+        replacement=True,
+    )
+
+    kw_val = dict(batch_size=batch_size, num_workers=num_workers, pin_memory=True)
     return (
-        DataLoader(_ds("train"), shuffle=True,  **kw),
-        DataLoader(_ds("val"),   shuffle=False, **kw),
-        DataLoader(_ds("test"),  shuffle=False, **kw),
+        DataLoader(train_ds, batch_size=batch_size, sampler=sampler,
+                   num_workers=num_workers, pin_memory=True),
+        DataLoader(_ds("val"),  shuffle=False, **kw_val),
+        DataLoader(_ds("test"), shuffle=False, **kw_val),
     )
 
 
@@ -210,14 +229,32 @@ def evaluate(
 # Rule printing
 # ─────────────────────────────────────────────────────────────
 
-def print_and_save_rules(system2: CRLSystem2, output_dir: Path, n: int = 20):
-    decoded = system2.decode_rules(top_k=3)
+def print_and_save_rules(system2: CRLSystem2, output_dir: Path,
+                         n: int = 20, weight_threshold: float = 0.5):
+    decoded = system2.decode_rules(weight_threshold=weight_threshold)
 
-    print(f"\n[INFO] Top {n} learned rules (từ |weight| lớn nhất):")
+    # Stats
+    no_cond   = sum(1 for r in decoded if r["num_conditions"] == 0)
+    has_op1   = sum(1 for r in decoded
+                    if any("op1" in name
+                           for name, _ in r["positive_concepts"] + r["negative_concepts"]))
+    avg_cond  = sum(r["num_conditions"] for r in decoded) / len(decoded)
+    from collections import Counter
+    pred_dist = Counter(r["predicts_digit3"] for r in decoded)
+
+    print(f"\n[INFO] Top {n} learned rules (threshold |w| > {weight_threshold}):")
     for r in decoded[:n]:
-        pred  = r["predicts_digit3"]
-        rstr  = r["rule_string"]
-        print(f"  Rule {r['rule_id']:3d} → digit3={pred}: {rstr}")
+        pred = r["predicts_digit3"]
+        conf = r["pred_confidence"]
+        rstr = r["rule_string"]
+        nc   = r["num_conditions"]
+        print(f"  Rule {r['rule_id']:3d} [{nc} cond] → digit3={pred} (conf={conf:.2f}): {rstr}")
+
+    print(f"\n[INFO] Rule quality stats:")
+    print(f"  Rules with 0 conditions (not learned): {no_cond}/{len(decoded)}")
+    print(f"  Rules using op1: {has_op1}/{len(decoded)}")
+    print(f"  Avg conditions per rule: {avg_cond:.2f}")
+    print(f"  pred_head digit3 distribution: {dict(sorted(pred_dist.items()))}")
 
     out_path = output_dir / "rule_generated.json"
     with open(out_path, "w", encoding="utf-8") as f:
@@ -326,7 +363,7 @@ def main():
     print(f"  expression_acc = {test_m['expression_acc']:.4f}")
 
     # ── Save rules ───────────────────────────────────────────
-    print_and_save_rules(system2, out_dir, n=20)
+    print_and_save_rules(system2, out_dir, n=20, weight_threshold=args.weight_threshold)
 
     # ── Save metrics ─────────────────────────────────────────
     metrics = {
