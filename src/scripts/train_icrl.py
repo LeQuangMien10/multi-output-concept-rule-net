@@ -709,7 +709,7 @@ def main():
     val_metrics  = evaluate(system1, head, val_loader,  device, memory,
                             split="val",  use_hard=args.use_hard_cv, target_key=args.target_key)
 
-    print(f"\n[DONE] Results ({split} / test):")
+    print(f"\n[DONE] Results (val / test):")
     print(f"  {'Metric':25s}  {'Val':>8}  {'Test':>8}")
     print(f"  {'-'*46}")
     for key in ["digit3_accuracy", "rule_match_accuracy",
