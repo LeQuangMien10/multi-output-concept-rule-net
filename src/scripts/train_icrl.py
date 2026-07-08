@@ -367,6 +367,23 @@ def train_head(
 # Evaluate & export
 # ─────────────────────────────────────────────────────────────
 
+def _decode_centroid_slots(
+    centroid: torch.Tensor,
+    concept_keys: list[str],
+    offsets: dict[str, int],
+    dims: dict[str, int],
+) -> dict[str, int]:
+    """
+    Decode centroid → argmax per slot.
+    Returns dict key → predicted int class.
+    """
+    result = {}
+    for key in concept_keys:
+        s, e = offsets[key], offsets[key] + dims[key]
+        result[key] = int(centroid[s:e].argmax().item())
+    return result
+
+
 @torch.no_grad()
 def evaluate(
     system1:    MultiHeadSystem1,
@@ -379,27 +396,98 @@ def evaluate(
     target_key: str  = "digit3",
 ) -> dict[str, float]:
     """
-    Inference: head(centroid[match(cv)]) → prediction.
-    Centroid-based inference — nhất quán với train_head.
+    Evaluate với 4 metrics:
+
+    digit3_accuracy      : head(centroid[match(cv)]) predict đúng digit3
+    rule_match_accuracy  : matched rule có đúng (d1, op, d2) với GT không
+    expression_accuracy  : matched rule đúng TẤT CẢ slots (d1,op,d2,d3)
+    arith_correct_rate   : % matched rules đúng arithmetic (d1 op d2 == d3 trong rule)
+
+    Tách bạch "digit3 prediction đúng" vs "đúng rule được matched",
+    cho phép đánh giá chất lượng rule riêng biệt với prediction accuracy.
     """
     head.eval()
-    correct = 0; total = 0
     centroids = memory.get_centroids().to(device)   # [R, D]
+    use_gt    = getattr(evaluate, '_use_gt', False)
 
-    use_gt = getattr(evaluate, '_use_gt', False)
+    # Decode tất cả rule centroids một lần (offline)
+    rule_slots = [
+        _decode_centroid_slots(centroids[r], CONCEPT_KEYS_ORDERED,
+                               CONCEPT_OFFSETS, CONCEPT_DIMS)
+        for r in range(memory.num_rules)
+    ]
+
+    # Input concept keys (bỏ target key ra khỏi "matching context" khi đánh giá)
+    input_keys = [k for k in CONCEPT_KEYS_ORDERED if k != target_key and k != "op2"]
+
+    # Counters
+    d3_correct    = 0   # digit3 prediction đúng
+    match_correct = 0   # rule (d1,op,d2) map đúng GT
+    expr_correct  = 0   # tất cả slots đúng đồng thời
+    arith_correct = 0   # rule arithmetic: d1 op d2 == d3 (trong rule)
+    total         = 0
 
     for images, labels in tqdm(loader, desc=f"  Eval {split}", leave=False):
-        images   = images.to(device)
-        cv       = get_concept_vec(system1, images, labels,
-                                   use_gt=use_gt, use_hard=use_hard, device=device)
-        y        = labels[target_key].to(device) if target_key in labels else labels[list(labels.keys())[0]].to(device)
-        rule_ids, _ = memory.match(cv)
-        rule_cvs = centroids[rule_ids]
-        preds    = head(rule_cvs).argmax(dim=1)
-        correct += (preds == y).sum().item()
-        total   += len(y)
+        images = images.to(device)
+        cv     = get_concept_vec(system1, images, labels,
+                                 use_gt=use_gt, use_hard=use_hard, device=device)
+        rule_ids, _ = memory.match(cv)          # [B]
+        rule_cvs    = centroids[rule_ids]        # [B, D]
+        preds       = head(rule_cvs).argmax(dim=1)  # [B]
 
-    return {"accuracy": correct / total, "correct": correct, "total": total}
+        B = len(preds)
+        for i in range(B):
+            rid   = int(rule_ids[i].item())
+            rs    = rule_slots[rid]           # decoded slots của matched rule
+            pred  = int(preds[i].item())
+
+            # GT values
+            gt = {k: int(labels[k][i].item())
+                  for k in CONCEPT_KEYS_ORDERED if k in labels}
+            gt_target = gt.get(target_key, -1)
+
+            # ── Metric 1: digit3 accuracy ──────────────────────────
+            if pred == gt_target:
+                d3_correct += 1
+
+            # ── Metric 2: rule_match_accuracy ─────────────────────
+            # Matched rule có đúng input slots (d1, op1, d2) không?
+            # Đây là core question: "đúng rule được map vào ảnh không?"
+            input_match = all(rs.get(k) == gt.get(k) for k in input_keys)
+            if input_match:
+                match_correct += 1
+
+            # ── Metric 3: expression_accuracy ─────────────────────
+            # Tất cả slots (d1, op, d2, d3) của matched rule đều đúng
+            all_slots_match = all(
+                rs.get(k) == gt.get(k)
+                for k in CONCEPT_KEYS_ORDERED
+                if k in gt and k != "op2"
+            )
+            if all_slots_match:
+                expr_correct += 1
+
+            # ── Metric 4: arith_correct_rate ──────────────────────
+            # Rule matched có đúng arithmetic không? (d1 op d2 = d3 trong rule)
+            r_d1  = rs.get("digit1", -1)
+            r_op  = rs.get("op1", -1)
+            r_d2  = rs.get("digit2", -1)
+            r_d3  = rs.get(target_key, -1)
+            if r_op == 0:   r_expected = r_d1 + r_d2   # +
+            elif r_op == 1: r_expected = r_d1 - r_d2   # -
+            else:           r_expected = -999
+            if r_expected == r_d3:
+                arith_correct += 1
+
+            total += 1
+
+    return {
+        "digit3_accuracy":     d3_correct    / total,
+        "rule_match_accuracy": match_correct / total,
+        "expression_accuracy": expr_correct  / total,
+        "arith_correct_rate":  arith_correct / total,
+        "total": total,
+    }
 
 
 def export_rules(
@@ -621,19 +709,29 @@ def main():
     val_metrics  = evaluate(system1, head, val_loader,  device, memory,
                             split="val",  use_hard=args.use_hard_cv, target_key=args.target_key)
 
-    print(f"\n[DONE] Results:")
-    print(f"  val_accuracy  = {val_metrics['accuracy']:.4f}")
-    print(f"  test_accuracy = {test_metrics['accuracy']:.4f}")
+    print(f"\n[DONE] Results ({split} / test):")
+    print(f"  {'Metric':25s}  {'Val':>8}  {'Test':>8}")
+    print(f"  {'-'*46}")
+    for key in ["digit3_accuracy", "rule_match_accuracy",
+                "expression_accuracy", "arith_correct_rate"]:
+        v = val_metrics.get(key, 0)
+        t = test_metrics.get(key, 0)
+        print(f"  {key:25s}  {v:8.4f}  {t:8.4f}")
+    print()
+    print(f"  [Interpretation]")
+    print(f"  rule_match_accuracy : % ảnh matched đúng rule (d1,op,d2)")
+    print(f"  expression_accuracy : % ảnh matched rule đúng TẤT CẢ slots")
+    print(f"  arith_correct_rate  : % matched rules đúng arithmetic (d1 op d2 = d3)")
 
     # ── Export rules ─────────────────────────────────────────
     export_rules(memory, output_dir)
 
     # ── Save metrics ─────────────────────────────────────────
     metrics = {
-        "val_accuracy":    val_metrics["accuracy"],
-        "test_accuracy":   test_metrics["accuracy"],
-        "num_rules":       memory.num_rules,
-        "concept_source":  "gt_labels" if use_gt else "system1_predictions",
+        "val":  {k: v for k, v in val_metrics.items()  if k != "total"},
+        "test": {k: v for k, v in test_metrics.items() if k != "total"},
+        "num_rules":      memory.num_rules,
+        "concept_source": "gt_labels" if use_gt else "system1_predictions",
         "args": vars(args),
         "rule_confidence_stats": {
             "mean": sum(memory.get_confidences()) / max(1, memory.num_rules),
