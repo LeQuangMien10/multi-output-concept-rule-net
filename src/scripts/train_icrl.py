@@ -42,6 +42,7 @@ from src.models.icrl_rule_memory import ICRLRuleMemory
 from src.models.rule_memory import (
     soft_concept_vector,
     logits_to_concept_vector,
+    labels_to_concept_vector,
     CONCEPT_KEYS_ORDERED,
     CONCEPT_OFFSETS,
     CONCEPT_DIMS,
@@ -94,6 +95,11 @@ def parse_args():
                    help="Số classes của target (digit3=10, benign/malignant=2).")
     p.add_argument("--target_key",   type=str,   default="digit3",
                    help="Key trong labels dict để lấy target. MNIST='digit3', Fitzpatrick='label'.")
+    p.add_argument("--use_gt_concepts", action="store_true",
+                   help="Dùng Ground Truth labels làm concept vector thay vì S1 predictions.\n"
+                        "Loại bỏ hoàn toàn S1 noise — cho phép đo ceiling accuracy của ICRL framework\n"
+                        "khi concept vector hoàn hảo. Hữu ích để debug: nếu GT vẫn thấp thì vấn đề\n"
+                        "nằm ở framework, không phải S1 noise.")
 
     # General
     p.add_argument("--batch_size",   type=int,   default=512)
@@ -140,6 +146,32 @@ def make_loaders(data_dir: Path, batch_size: int, num_workers: int):
 # Stage 2: Build rule memory
 # ─────────────────────────────────────────────────────────────
 
+def get_concept_vec(
+    system1:       "MultiHeadSystem1",
+    images:        torch.Tensor,
+    labels:        dict,
+    use_gt:        bool  = False,
+    use_hard:      bool  = False,
+    device:        torch.device | None = None,
+) -> torch.Tensor:
+    """
+    Lấy concept vector theo mode được chọn:
+      use_gt=True  : GT one-hot từ labels (loại bỏ S1 noise hoàn toàn)
+      use_gt=False : S1 predictions (soft hoặc hard argmax)
+
+    Dùng GT cho phép đo ceiling của ICRL framework độc lập với S1 quality.
+    """
+    if use_gt:
+        return labels_to_concept_vector(
+            {k: v.to(device or images.device) for k, v in labels.items()
+             if k in CONCEPT_KEYS_ORDERED}
+        ).float()
+    # S1 prediction
+    with torch.no_grad():
+        s1_out = system1(images.to(device or images.device))
+    return logits_to_concept_vector(s1_out) if use_hard else soft_concept_vector(s1_out)
+
+
 @torch.no_grad()
 def build_rule_memory(
     system1:    MultiHeadSystem1,
@@ -160,28 +192,32 @@ def build_rule_memory(
     """
     total_stats = {"created": 0, "matched": 0, "total": 0}
 
+    use_gt = getattr(build_rule_memory, '_use_gt', False)
+
     for images, labels in tqdm(loader, desc=f"  Build [{epoch_label}]", leave=False):
         images = images.to(device)
 
-        with torch.no_grad():
-            s1_out = system1(images)
+        cv = get_concept_vec(system1, images, labels,
+                             use_gt=use_gt, use_hard=use_hard, device=device)
 
-        cv = logits_to_concept_vector(s1_out) if use_hard else soft_concept_vector(s1_out)
+        # S1 confidence:
+        # GT mode: confidence=1.0 (perfect concept → full weight)
+        # S1 mode: mean max-prob across non-trivial slots
+        if use_gt:
+            s1_conf = torch.ones(cv.shape[0], device=device)
+        else:
+            with torch.no_grad():
+                s1_out_for_conf = system1(images)
+            conf_keys = s1_conf_keys or [k for k in s1_out_for_conf if k != "op2"]
+            slot_confs = [F.softmax(s1_out_for_conf[k], dim=1).max(dim=1).values
+                          for k in conf_keys if k in s1_out_for_conf]
+            s1_conf = (torch.stack(slot_confs, dim=1).mean(dim=1)
+                       if slot_confs else torch.ones(cv.shape[0], device=device))
 
-        # S1 confidence = mean max-prob across non-trivial concept slots
-        conf_keys = s1_conf_keys or [k for k in s1_out if k != "op2"]
-        slot_confs = []
-        for key in conf_keys:
-            if key in s1_out:
-                probs = F.softmax(s1_out[key], dim=1)
-                slot_confs.append(probs.max(dim=1).values)
-        s1_conf = torch.stack(slot_confs, dim=1).mean(dim=1) if slot_confs else torch.ones(cv.shape[0], device=device)
-
-        # Target label — general: từ labels dict theo target_key
+        # Target label
         if target_key in labels:
             y = labels[target_key].to(device)
         else:
-            # Fallback: nếu dataset chỉ có 1 non-image key → dùng cái đó
             candidate_keys = [k for k in labels if k != "images"]
             y = labels[candidate_keys[0]].to(device)
 
@@ -219,10 +255,12 @@ def update_rule_accuracy(
 
     centroids = memory.get_centroids().to(device)   # [R, D]
 
+    use_gt = getattr(update_rule_accuracy, '_use_gt', False)
+
     for images, labels in tqdm(loader, desc="  Update accuracy", leave=False):
         images = images.to(device)
-        s1_out = system1(images)
-        cv     = logits_to_concept_vector(s1_out) if use_hard else soft_concept_vector(s1_out)
+        cv     = get_concept_vec(system1, images, labels,
+                                 use_gt=use_gt, use_hard=use_hard, device=device)
         y      = labels[target_key].to(device) if target_key in labels else labels[list(labels.keys())[0]].to(device)
 
         rule_ids, _ = memory.match(cv)            # [B]
@@ -247,6 +285,7 @@ def train_head(
     device:       torch.device,
     use_hard:     bool = False,
     target_key:   str  = "digit3",
+    use_gt:       bool = False,
 ) -> nn.Linear:
     """
     Train linear head: centroid[match(cv)] → class.
@@ -281,10 +320,10 @@ def train_head(
         for images, labels in tqdm(train_loader, desc=f"  Head ep{epoch:2d}", leave=False):
             images = images.to(device)
             with torch.no_grad():
-                s1_out   = system1(images)
-                cv       = logits_to_concept_vector(s1_out) if use_hard else soft_concept_vector(s1_out)
-                rule_ids, _ = memory.match(cv)           # [B]
-                rule_cvs = centroids[rule_ids]           # [B, D]  ← centroid, not raw cv
+                cv       = get_concept_vec(system1, images, labels,
+                                           use_gt=use_gt, use_hard=use_hard, device=device)
+                rule_ids, _ = memory.match(cv)
+                rule_cvs = centroids[rule_ids]
             y = _get_target(labels)
 
             logits = head(rule_cvs)
@@ -300,11 +339,11 @@ def train_head(
         with torch.no_grad():
             for images, labels in val_loader:
                 images   = images.to(device)
-                s1_out   = system1(images)
-                cv       = logits_to_concept_vector(s1_out) if use_hard else soft_concept_vector(s1_out)
+                cv       = get_concept_vec(system1, images, labels,
+                                           use_gt=use_gt, use_hard=use_hard, device=device)
                 y        = _get_target(labels)
                 rule_ids, _ = memory.match(cv)
-                rule_cvs = centroids[rule_ids]           # [B, D]
+                rule_cvs = centroids[rule_ids]
                 preds    = head(rule_cvs).argmax(dim=1)
                 val_correct += (preds == y).sum().item()
                 val_total   += len(y)
@@ -347,13 +386,15 @@ def evaluate(
     correct = 0; total = 0
     centroids = memory.get_centroids().to(device)   # [R, D]
 
+    use_gt = getattr(evaluate, '_use_gt', False)
+
     for images, labels in tqdm(loader, desc=f"  Eval {split}", leave=False):
         images   = images.to(device)
-        s1_out   = system1(images)
-        cv       = logits_to_concept_vector(s1_out) if use_hard else soft_concept_vector(s1_out)
+        cv       = get_concept_vec(system1, images, labels,
+                                   use_gt=use_gt, use_hard=use_hard, device=device)
         y        = labels[target_key].to(device) if target_key in labels else labels[list(labels.keys())[0]].to(device)
         rule_ids, _ = memory.match(cv)
-        rule_cvs = centroids[rule_ids]             # [B, D]
+        rule_cvs = centroids[rule_ids]
         preds    = head(rule_cvs).argmax(dim=1)
         correct += (preds == y).sum().item()
         total   += len(y)
@@ -428,9 +469,18 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"[INFO] Device: {device}")
+    use_gt = args.use_gt_concepts
     print(f"[INFO] ICRL params: θ={args.theta}  θ_merge={args.theta_merge}  "
           f"n_min={args.n_min}  conf_min={args.conf_min}  "
           f"match_input_only={args.match_input_only}")
+    print(f"[INFO] Concept source: {'Ground Truth labels' if use_gt else 'System1 predictions'}")
+    if use_gt:
+        print(f"[INFO] GT mode: measuring ceiling accuracy of ICRL framework (no S1 noise)")
+
+    # Propagate use_gt flag via function attribute (avoids threading issues)
+    build_rule_memory._use_gt    = use_gt
+    update_rule_accuracy._use_gt = use_gt
+    evaluate._use_gt             = use_gt
 
     # ── Data ────────────────────────────────────────────────
     data_dir = Path(args.data_dir)
@@ -515,7 +565,8 @@ def main():
                 for images, batch_labels in train_loader:
                     images = images.to(device)
                     s1_out = system1(images)
-                    cv     = logits_to_concept_vector(s1_out) if args.use_hard_cv else soft_concept_vector(s1_out)
+                    cv     = get_concept_vec(system1, images, batch_labels,
+                                               use_gt=use_gt, use_hard=args.use_hard_cv, device=device)
                     rule_ids, _ = memory.match(cv)            # [B]
                     rule_cvs    = centroids_now[rule_ids]     # [B, D]
                     all_rule_cvs.append(rule_cvs.cpu())
@@ -557,6 +608,7 @@ def main():
         device=device,
         use_hard=args.use_hard_cv,
         target_key=args.target_key,
+        use_gt=use_gt,
     )
 
     # Save head
@@ -578,9 +630,10 @@ def main():
 
     # ── Save metrics ─────────────────────────────────────────
     metrics = {
-        "val_accuracy":  val_metrics["accuracy"],
-        "test_accuracy": test_metrics["accuracy"],
-        "num_rules":     memory.num_rules,
+        "val_accuracy":    val_metrics["accuracy"],
+        "test_accuracy":   test_metrics["accuracy"],
+        "num_rules":       memory.num_rules,
+        "concept_source":  "gt_labels" if use_gt else "system1_predictions",
         "args": vars(args),
         "rule_confidence_stats": {
             "mean": sum(memory.get_confidences()) / max(1, memory.num_rules),
