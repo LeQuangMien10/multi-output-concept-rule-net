@@ -475,25 +475,45 @@ def main():
 
         # Quick head để cung cấp accuracy signal cho epoch tiếp theo
         if epoch < args.epochs:
+            # Quick head để cung cấp accuracy signal cho epoch tiếp theo
+            # Dùng centroid-based inference — nhất quán với stage 3
             head = nn.Linear(CONCEPT_TOTAL_DIM, args.num_classes).to(device)
             head_opt = torch.optim.AdamW(head.parameters(), lr=1e-3)
-            head.train()
+
+            # Collect centroids và labels (one-pass, không cần lưu toàn bộ cv)
+            centroids_now = memory.get_centroids().to(device)  # [R, D]
+
             with torch.no_grad():
-                all_cvs, all_ys = [], []
-                for images, labels in train_loader:
+                all_rule_cvs, all_ys = [], []
+                for images, batch_labels in train_loader:
                     images = images.to(device)
                     s1_out = system1(images)
-                    cv = logits_to_concept_vector(s1_out) if args.use_hard_cv else soft_concept_vector(s1_out)
-                    all_cvs.append(cv)
-                _y = labels[args.target_key].to(device) if args.target_key in labels else labels[list(labels.keys())[0]].to(device)
-                all_ys.append(_y)
-            all_cvs = torch.cat(all_cvs); all_ys = torch.cat(all_ys)
-            # 5 quick epochs
+                    cv     = logits_to_concept_vector(s1_out) if args.use_hard_cv else soft_concept_vector(s1_out)
+                    rule_ids, _ = memory.match(cv)            # [B]
+                    rule_cvs    = centroids_now[rule_ids]     # [B, D]
+                    all_rule_cvs.append(rule_cvs.cpu())
+
+                    # Fix: _y nằm TRONG for loop
+                    _y = (batch_labels[args.target_key]
+                          if args.target_key in batch_labels
+                          else batch_labels[list(batch_labels.keys())[0]])
+                    all_ys.append(_y)
+
+            all_rule_cvs = torch.cat(all_rule_cvs).to(device)
+            all_ys       = torch.cat(all_ys).to(device)
+
+            # Validate label range
+            assert all_ys.min() >= 0 and all_ys.max() < args.num_classes, (
+                f"Label out of range: [{all_ys.min()}, {all_ys.max()}] "
+                f"but num_classes={args.num_classes}. Set --num_classes correctly."
+            )
+
+            head.train()
             for _ in range(5):
-                perm  = torch.randperm(len(all_cvs))
-                for i in range(0, len(all_cvs), args.batch_size):
-                    idx = perm[i:i+args.batch_size]
-                    loss = F.cross_entropy(head(all_cvs[idx]), all_ys[idx])
+                perm = torch.randperm(len(all_rule_cvs), device=device)
+                for i in range(0, len(all_rule_cvs), args.batch_size):
+                    idx  = perm[i:i + args.batch_size]
+                    loss = F.cross_entropy(head(all_rule_cvs[idx]), all_ys[idx])
                     head_opt.zero_grad(); loss.backward(); head_opt.step()
 
     # Save rule memory after building
