@@ -67,10 +67,18 @@ def parse_args():
                    help="Similarity threshold để CREATE rule mới.")
     p.add_argument("--theta_merge",  type=float, default=0.98,
                    help="Similarity threshold để MERGE 2 rules. Cao hơn theta để chỉ merge rules rất gần nhau.")
-    p.add_argument("--n_min",        type=int,   default=5,
-                   help="Số samples tối thiểu để rule survive prune.")
-    p.add_argument("--conf_min",     type=float, default=0.1,
+    p.add_argument("--n_min",        type=int,   default=2,
+                   help="Số samples tối thiểu để rule survive prune. Thấp hơn → ít mất coverage.")
+    p.add_argument("--conf_min",     type=float, default=0.05,
                    help="Confidence tối thiểu để rule survive prune.")
+    p.add_argument("--match_input_only", action="store_true",
+                   help="Dùng chỉ input slots (bỏ target slot và op2 trivial) cho MATCH/CREATE/MERGE.\n"
+                        "MNIST: slot-wise cosine trên digit1+op1+digit2 (25 dims).\n"
+                        "Fitzpatrick: đặt match_offsets thủ công qua --match_offsets_json.\n"
+                        "Giúp clustering theo input pattern thay vì output label.")
+    p.add_argument("--match_offsets_json", type=str, default=None,
+                   help="JSON list of [start,end] pairs. Override --match_input_only.\n"
+                        "Ví dụ: '[[0,10],[10,15],[15,25]]' cho digit1+op1+digit2.")
 
     # Stage 2 options
     p.add_argument("--epochs",       type=int,   default=3,
@@ -421,7 +429,8 @@ def main():
 
     print(f"[INFO] Device: {device}")
     print(f"[INFO] ICRL params: θ={args.theta}  θ_merge={args.theta_merge}  "
-          f"n_min={args.n_min}  conf_min={args.conf_min}")
+          f"n_min={args.n_min}  conf_min={args.conf_min}  "
+          f"match_input_only={args.match_input_only}")
 
     # ── Data ────────────────────────────────────────────────
     data_dir = Path(args.data_dir)
@@ -435,13 +444,31 @@ def main():
     print(f"[INFO] System1 loaded (frozen): {args.system1_ckpt}")
 
     # ── Stage 2: Build rule memory ──────────────────────────
+    # ── Resolve match_offsets ───────────────────────────────
+    match_offsets = None
+    if args.match_offsets_json:
+        import json as _json
+        match_offsets = [tuple(p) for p in _json.loads(args.match_offsets_json)]
+        print(f"[INFO] match_offsets (custom): {match_offsets}")
+    elif args.match_input_only:
+        # MNIST Math: digit1[0:10] + op1[10:15] + digit2[15:25]
+        # Bỏ op2[25:30] (trivial, luôn =) và digit3[30:40] (target)
+        # General: user chỉ định slot layout qua --match_offsets_json
+        from src.models.rule_memory import CONCEPT_OFFSETS, CONCEPT_DIMS
+        input_keys  = [k for k in CONCEPT_KEYS_ORDERED
+                       if k not in ("op2", args.target_key)]
+        match_offsets = [(CONCEPT_OFFSETS[k], CONCEPT_OFFSETS[k] + CONCEPT_DIMS[k])
+                         for k in input_keys]
+        print(f"[INFO] match_input_only: slots={input_keys}  offsets={match_offsets}")
+
     memory = ICRLRuleMemory(
-        concept_dim  = CONCEPT_TOTAL_DIM,
-        theta        = args.theta,
-        theta_merge  = args.theta_merge,
-        n_min        = args.n_min,
-        conf_min     = args.conf_min,
-        device       = str(device),
+        concept_dim   = CONCEPT_TOTAL_DIM,
+        theta         = args.theta,
+        theta_merge   = args.theta_merge,
+        n_min         = args.n_min,
+        conf_min      = args.conf_min,
+        match_offsets = match_offsets,
+        device        = str(device),
     )
 
     print(f"\n[Stage 2] Building rule memory ({args.epochs} epochs)")

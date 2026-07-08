@@ -57,19 +57,33 @@ class ICRLRuleMemory:
 
     def __init__(
         self,
-        concept_dim:  int,
-        theta:        float = 0.85,
-        theta_merge:  float = 0.95,
-        n_min:        int   = 5,
-        conf_min:     float = 0.1,
-        device:       str   = "cpu",
+        concept_dim:    int,
+        theta:          float = 0.85,
+        theta_merge:    float = 0.98,
+        n_min:          int   = 5,
+        conf_min:       float = 0.1,
+        device:         str   = "cpu",
+        match_offsets:  list | None = None,
     ):
-        self.concept_dim = concept_dim
-        self.theta       = theta
-        self.theta_merge = theta_merge
-        self.n_min       = n_min
-        self.conf_min    = conf_min
-        self.device      = device
+        """
+        match_offsets : list of (start, end) index pairs trong concept vector
+            dùng cho MATCH / CREATE / MERGE similarity.
+            None → flat cosine trên toàn bộ vector.
+
+            MNIST Math — chỉ input slots (bỏ digit3 target, op2 trivial):
+                match_offsets = [(0,10),(10,15),(15,25)]
+                → digit1(10) + op1(5) + digit2(10) = 25 dims
+
+            Fitzpatrick — tất cả concepts:
+                match_offsets = None  (hoặc [(0,48)])
+        """
+        self.concept_dim   = concept_dim
+        self.theta         = theta
+        self.theta_merge   = theta_merge
+        self.n_min         = n_min
+        self.conf_min      = conf_min
+        self.device        = device
+        self.match_offsets = match_offsets
 
         # Rule storage (Python lists — dynamic size)
         self._mu:         list[torch.Tensor] = []   # [D] each
@@ -146,7 +160,7 @@ class ICRLRuleMemory:
 
             # Compute cosine similarity với tất cả centroids
             centroids = self.get_centroids()    # [R, D]
-            sims = self._cosine(cv.unsqueeze(0), centroids).squeeze(0)  # [R]
+            sims = self._match_sim(cv.unsqueeze(0), centroids).squeeze(0)  # [R]
             best_sim, best_r = sims.max(dim=0)
             best_sim = best_sim.item()
             best_r   = best_r.item()
@@ -214,7 +228,7 @@ class ICRLRuleMemory:
         # ── 2. Merge duplicates ────────────────────────────
         if self.num_rules > 1:
             centroids = self.get_centroids()   # [R, D]
-            sims = self._cosine(centroids, centroids)  # [R, R]
+            sims = self._match_sim(centroids, centroids)  # [R, R]
 
             merged_into: dict[int, int] = {}   # rule_i → rule_j (j survives)
 
@@ -294,13 +308,33 @@ class ICRLRuleMemory:
 
     @staticmethod
     def _cosine(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        """Flat cosine. a: [M,D], b: [N,D] → [M,N]"""
+        return F.normalize(a, dim=1) @ F.normalize(b, dim=1).T
+
+    def _match_sim(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         """
-        Cosine similarity. Works for both softmax (MNIST) and sigmoid (Fitzpatrick).
-        a: [M, D], b: [N, D] → [M, N]
+        Similarity dùng cho MATCH / CREATE / MERGE.
+
+        match_offsets=None : flat cosine (toàn bộ vector)
+        match_offsets set  : slot-wise cosine trên các slots được chọn,
+                             mỗi slot đóng góp đều nhau.
+
+        Dùng input slots (bỏ target slot digit3) giúp clustering theo
+        (d1, op, d2) pattern thay vì theo digit3 — tránh merge nhầm
+        các expressions khác d1/op/d2 nhưng cùng kết quả.
+
+        a: [M,D], b: [N,D] → [M,N]
         """
-        a_n = F.normalize(a, dim=1)
-        b_n = F.normalize(b, dim=1)
-        return a_n @ b_n.T
+        if self.match_offsets is None:
+            return self._cosine(a, b)
+
+        total   = torch.zeros(a.shape[0], b.shape[0], device=a.device)
+        n_slots = len(self.match_offsets)
+        for (s, e) in self.match_offsets:
+            a_s = F.normalize(a[:, s:e], dim=1)
+            b_s = F.normalize(b[:, s:e], dim=1)
+            total += a_s @ b_s.T
+        return total / n_slots
 
     # ── Confidence ──────────────────────────────────────────
 
@@ -350,7 +384,7 @@ class ICRLRuleMemory:
 
         concept_vecs = concept_vecs.to(self.device)
         centroids    = self.get_centroids()           # [R, D]
-        sims         = self._cosine(concept_vecs, centroids)  # [B, R]
+        sims         = self._match_sim(concept_vecs, centroids)  # [B, R]
         best_ids     = sims.argmax(dim=1)             # [B]
 
         return best_ids, (sims if return_scores else None)
@@ -415,12 +449,13 @@ class ICRLRuleMemory:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         state = {
-            "concept_dim": self.concept_dim,
-            "theta":       self.theta,
-            "theta_merge": self.theta_merge,
-            "n_min":       self.n_min,
-            "conf_min":    self.conf_min,
-            "num_rules":   self.num_rules,
+            "concept_dim":   self.concept_dim,
+            "theta":         self.theta,
+            "theta_merge":   self.theta_merge,
+            "n_min":         self.n_min,
+            "conf_min":      self.conf_min,
+            "match_offsets": self.match_offsets,
+            "num_rules":     self.num_rules,
             "mu":          [m.cpu().tolist() for m in self._mu],
             "m2":          [m.cpu().tolist() for m in self._m2],
             "labels":      self._labels,
@@ -434,12 +469,13 @@ class ICRLRuleMemory:
     def load(cls, path: str | Path, device: str = "cpu") -> "ICRLRuleMemory":
         state = torch.load(path, map_location=device, weights_only=False)
         mem = cls(
-            concept_dim  = state["concept_dim"],
-            theta        = state["theta"],
-            theta_merge  = state["theta_merge"],
-            n_min        = state["n_min"],
-            conf_min     = state["conf_min"],
-            device       = device,
+            concept_dim   = state["concept_dim"],
+            theta         = state["theta"],
+            theta_merge   = state["theta_merge"],
+            n_min         = state["n_min"],
+            conf_min      = state["conf_min"],
+            match_offsets = state.get("match_offsets", None),
+            device        = device,
         )
         mem._mu          = [torch.tensor(m, device=device) for m in state["mu"]]
         mem._m2          = [torch.tensor(m, device=device) for m in state["m2"]]
@@ -452,9 +488,11 @@ class ICRLRuleMemory:
     def __repr__(self) -> str:
         confs = self.get_confidences()
         avg_conf = sum(confs) / len(confs) if confs else 0.0
+        slots_info = (f"slots={len(self.match_offsets)}"
+                      if self.match_offsets else "full_vec")
         return (
             f"ICRLRuleMemory("
             f"num_rules={self.num_rules}, "
-            f"θ={self.theta}, "
+            f"θ={self.theta}, sim={slots_info}, "
             f"avg_conf={avg_conf:.3f})"
         )
