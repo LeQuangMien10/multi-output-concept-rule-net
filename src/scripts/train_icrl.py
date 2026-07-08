@@ -65,8 +65,8 @@ def parse_args():
     # ICRL hyperparameters
     p.add_argument("--theta",        type=float, default=0.85,
                    help="Similarity threshold để CREATE rule mới.")
-    p.add_argument("--theta_merge",  type=float, default=0.95,
-                   help="Similarity threshold để MERGE 2 rules.")
+    p.add_argument("--theta_merge",  type=float, default=0.98,
+                   help="Similarity threshold để MERGE 2 rules. Cao hơn theta để chỉ merge rules rất gần nhau.")
     p.add_argument("--n_min",        type=int,   default=5,
                    help="Số samples tối thiểu để rule survive prune.")
     p.add_argument("--conf_min",     type=float, default=0.1,
@@ -84,6 +84,8 @@ def parse_args():
     p.add_argument("--head_lr",      type=float, default=1e-3)
     p.add_argument("--num_classes",  type=int,   default=10,
                    help="Số classes của target (digit3=10, benign/malignant=2).")
+    p.add_argument("--target_key",   type=str,   default="digit3",
+                   help="Key trong labels dict để lấy target. MNIST='digit3', Fitzpatrick='label'.")
 
     # General
     p.add_argument("--batch_size",   type=int,   default=512)
@@ -138,31 +140,42 @@ def build_rule_memory(
     device:     torch.device,
     use_hard:   bool = False,
     epoch_label: str = "Epoch",
+    target_key:  str = "digit3",
+    s1_conf_keys: list[str] | None = None,
 ) -> dict[str, int]:
-    """Pass qua loader một lần, update rule memory."""
+    """
+    Pass qua loader một lần, update rule memory.
+
+    target_key    : key trong labels dict để lấy y (MNIST='digit3', Fitzpatrick='label')
+    s1_conf_keys  : list slots dùng để tính S1 confidence.
+                    None → tự detect từ s1_out keys (bỏ qua op2 = trivial slot)
+    """
     total_stats = {"created": 0, "matched": 0, "total": 0}
 
     for images, labels in tqdm(loader, desc=f"  Build [{epoch_label}]", leave=False):
         images = images.to(device)
 
-        # Concept vector từ S1 (frozen)
         with torch.no_grad():
             s1_out = system1(images)
 
-        if use_hard:
-            cv = logits_to_concept_vector(s1_out)
-        else:
-            cv = soft_concept_vector(s1_out)   # [B, D]
+        cv = logits_to_concept_vector(s1_out) if use_hard else soft_concept_vector(s1_out)
 
-        # S1 confidence = mean max-prob across slots (excluding op2 = always =)
+        # S1 confidence = mean max-prob across non-trivial concept slots
+        conf_keys = s1_conf_keys or [k for k in s1_out if k != "op2"]
         slot_confs = []
-        for key in ["digit1", "op1", "digit2", "digit3"]:
-            probs = F.softmax(s1_out[key], dim=1)
-            slot_confs.append(probs.max(dim=1).values)
-        s1_conf = torch.stack(slot_confs, dim=1).mean(dim=1)   # [B]
+        for key in conf_keys:
+            if key in s1_out:
+                probs = F.softmax(s1_out[key], dim=1)
+                slot_confs.append(probs.max(dim=1).values)
+        s1_conf = torch.stack(slot_confs, dim=1).mean(dim=1) if slot_confs else torch.ones(cv.shape[0], device=device)
 
-        # Target label = digit3 (hoặc thay bằng label khác nếu dataset khác)
-        y = labels["digit3"].to(device)
+        # Target label — general: từ labels dict theo target_key
+        if target_key in labels:
+            y = labels[target_key].to(device)
+        else:
+            # Fallback: nếu dataset chỉ có 1 non-image key → dùng cái đó
+            candidate_keys = [k for k in labels if k != "images"]
+            y = labels[candidate_keys[0]].to(device)
 
         stats = memory.process_batch(cv, y, s1_conf)
         for k in total_stats:
@@ -177,18 +190,21 @@ def build_rule_memory(
 
 @torch.no_grad()
 def update_rule_accuracy(
-    system1: MultiHeadSystem1,
-    head:    nn.Linear,
-    loader:  DataLoader,
-    memory:  ICRLRuleMemory,
-    device:  torch.device,
-    use_hard: bool = False,
+    system1:    MultiHeadSystem1,
+    head:       nn.Linear,
+    loader:     DataLoader,
+    memory:     ICRLRuleMemory,
+    device:     torch.device,
+    use_hard:   bool = False,
+    target_key: str  = "digit3",
 ) -> None:
-    """Compute predictions với head hiện tại và update accuracy trong memory."""
+    """
+    Compute predictions via centroid-based head và update accuracy trong memory.
+    Dùng head(centroid[match(cv)]) — không phải head(cv) trực tiếp.
+    """
     if memory.is_empty or head is None:
         return
 
-    # Reset accuracy counters
     for i in range(memory.num_rules):
         memory._correct[i]    = 0
         memory._total_pred[i] = 0
@@ -199,12 +215,10 @@ def update_rule_accuracy(
         images = images.to(device)
         s1_out = system1(images)
         cv     = logits_to_concept_vector(s1_out) if use_hard else soft_concept_vector(s1_out)
-        y      = labels["digit3"].to(device)
+        y      = labels[target_key].to(device) if target_key in labels else labels[list(labels.keys())[0]].to(device)
 
-        # Match → rule_ids
         rule_ids, _ = memory.match(cv)            # [B]
-        # Predict via head
-        rule_cvs    = centroids[rule_ids]          # [B, D]
+        rule_cvs    = centroids[rule_ids]          # [B, D]  ← centroid, not noisy cv
         preds       = head(rule_cvs).argmax(dim=1) # [B]
 
         memory.update_accuracy(cv, y, preds)
@@ -215,30 +229,41 @@ def update_rule_accuracy(
 # ─────────────────────────────────────────────────────────────
 
 def train_head(
-    system1:     MultiHeadSystem1,
-    memory:      ICRLRuleMemory,
+    system1:      MultiHeadSystem1,
+    memory:       ICRLRuleMemory,
     train_loader: DataLoader,
-    val_loader:  DataLoader,
-    num_classes: int,
-    epochs:      int,
-    lr:          float,
-    device:      torch.device,
-    use_hard:    bool = False,
+    val_loader:   DataLoader,
+    num_classes:  int,
+    epochs:       int,
+    lr:           float,
+    device:       torch.device,
+    use_hard:     bool = False,
+    target_key:   str  = "digit3",
 ) -> nn.Linear:
     """
-    Train linear head: concept_vec → class.
-    Head input = concept vector (D-dim), output = num_classes.
+    Train linear head: centroid[match(cv)] → class.
+
+    Key design: head nhận CENTROID của best-matched rule, không phải cv trực tiếp.
+    Centroid = mean của ~1000+ ảnh → ít noise hơn single concept vector nhiều.
+    Điều này giúp ICRL tạo ra sự khác biệt so với head(cv) thuần túy.
+
+    General: target_key có thể là 'digit3' (MNIST) hoặc 'label' (Fitzpatrick).
     """
     head = nn.Linear(CONCEPT_TOTAL_DIM, num_classes).to(device)
     opt  = torch.optim.AdamW(head.parameters(), lr=lr, weight_decay=1e-4)
 
-    best_val  = 0.0
+    best_val   = 0.0
     best_state = None
 
-    centroids = memory.get_centroids().to(device)   # [R, D]
-    rule_labels = torch.tensor(memory.get_labels(), dtype=torch.long, device=device)  # [R]
+    centroids = memory.get_centroids().to(device)   # [R, D]  — frozen trong suốt stage 3
 
     print(f"\n[Stage 3] Train prediction head ({epochs} epochs)")
+    print(f"  Inference mode: head(centroid[match(cv)])  ← centroid reduces noise")
+
+    def _get_target(labels):
+        if target_key in labels:
+            return labels[target_key].to(device)
+        return labels[list(labels.keys())[0]].to(device)
 
     for epoch in range(1, epochs + 1):
         # ── Train ──
@@ -248,11 +273,13 @@ def train_head(
         for images, labels in tqdm(train_loader, desc=f"  Head ep{epoch:2d}", leave=False):
             images = images.to(device)
             with torch.no_grad():
-                s1_out = system1(images)
-                cv     = logits_to_concept_vector(s1_out) if use_hard else soft_concept_vector(s1_out)
-            y = labels["digit3"].to(device)
+                s1_out   = system1(images)
+                cv       = logits_to_concept_vector(s1_out) if use_hard else soft_concept_vector(s1_out)
+                rule_ids, _ = memory.match(cv)           # [B]
+                rule_cvs = centroids[rule_ids]           # [B, D]  ← centroid, not raw cv
+            y = _get_target(labels)
 
-            logits = head(cv)
+            logits = head(rule_cvs)
             loss   = F.cross_entropy(logits, y)
             opt.zero_grad(); loss.backward(); opt.step()
 
@@ -264,11 +291,13 @@ def train_head(
         val_correct = 0; val_total = 0
         with torch.no_grad():
             for images, labels in val_loader:
-                images = images.to(device)
-                s1_out = system1(images)
-                cv     = logits_to_concept_vector(s1_out) if use_hard else soft_concept_vector(s1_out)
-                y      = labels["digit3"].to(device)
-                preds  = head(cv).argmax(dim=1)
+                images   = images.to(device)
+                s1_out   = system1(images)
+                cv       = logits_to_concept_vector(s1_out) if use_hard else soft_concept_vector(s1_out)
+                y        = _get_target(labels)
+                rule_ids, _ = memory.match(cv)
+                rule_cvs = centroids[rule_ids]           # [B, D]
+                preds    = head(rule_cvs).argmax(dim=1)
                 val_correct += (preds == y).sum().item()
                 val_total   += len(y)
 
@@ -293,22 +322,31 @@ def train_head(
 
 @torch.no_grad()
 def evaluate(
-    system1:  MultiHeadSystem1,
-    head:     nn.Linear,
-    loader:   DataLoader,
-    device:   torch.device,
-    split:    str = "test",
-    use_hard: bool = False,
+    system1:    MultiHeadSystem1,
+    head:       nn.Linear,
+    loader:     DataLoader,
+    device:     torch.device,
+    memory:     ICRLRuleMemory,
+    split:      str  = "test",
+    use_hard:   bool = False,
+    target_key: str  = "digit3",
 ) -> dict[str, float]:
+    """
+    Inference: head(centroid[match(cv)]) → prediction.
+    Centroid-based inference — nhất quán với train_head.
+    """
     head.eval()
     correct = 0; total = 0
+    centroids = memory.get_centroids().to(device)   # [R, D]
 
     for images, labels in tqdm(loader, desc=f"  Eval {split}", leave=False):
-        images = images.to(device)
-        s1_out = system1(images)
-        cv     = logits_to_concept_vector(s1_out) if use_hard else soft_concept_vector(s1_out)
-        y      = labels["digit3"].to(device)
-        preds  = head(cv).argmax(dim=1)
+        images   = images.to(device)
+        s1_out   = system1(images)
+        cv       = logits_to_concept_vector(s1_out) if use_hard else soft_concept_vector(s1_out)
+        y        = labels[target_key].to(device) if target_key in labels else labels[list(labels.keys())[0]].to(device)
+        rule_ids, _ = memory.match(cv)
+        rule_cvs = centroids[rule_ids]             # [B, D]
+        preds    = head(rule_cvs).argmax(dim=1)
         correct += (preds == y).sum().item()
         total   += len(y)
 
@@ -417,13 +455,15 @@ def main():
             system1, train_loader, memory, device,
             use_hard=args.use_hard_cv,
             epoch_label=f"{epoch}/{args.epochs}",
+            target_key=args.target_key,
         )
         print(f"  Created={stats['created']}  Matched={stats['matched']}  "
               f"Rules so far={memory.num_rules}")
 
         # Update accuracy nếu đã có head
         if head is not None:
-            update_rule_accuracy(system1, head, train_loader, memory, device, args.use_hard_cv)
+            update_rule_accuracy(system1, head, train_loader, memory, device,
+                                 use_hard=args.use_hard_cv, target_key=args.target_key)
 
         # Prune
         memory.prune(verbose=True)
@@ -444,7 +484,9 @@ def main():
                     images = images.to(device)
                     s1_out = system1(images)
                     cv = logits_to_concept_vector(s1_out) if args.use_hard_cv else soft_concept_vector(s1_out)
-                    all_cvs.append(cv); all_ys.append(labels["digit3"].to(device))
+                    all_cvs.append(cv)
+                _y = labels[args.target_key].to(device) if args.target_key in labels else labels[list(labels.keys())[0]].to(device)
+                all_ys.append(_y)
             all_cvs = torch.cat(all_cvs); all_ys = torch.cat(all_ys)
             # 5 quick epochs
             for _ in range(5):
@@ -467,6 +509,7 @@ def main():
         lr=args.head_lr,
         device=device,
         use_hard=args.use_hard_cv,
+        target_key=args.target_key,
     )
 
     # Save head
@@ -474,8 +517,10 @@ def main():
 
     # ── Evaluate ────────────────────────────────────────────
     print("\n[INFO] Evaluating...")
-    test_metrics = evaluate(system1, head, test_loader, device, "test", args.use_hard_cv)
-    val_metrics  = evaluate(system1, head, val_loader,  device, "val",  args.use_hard_cv)
+    test_metrics = evaluate(system1, head, test_loader, device, memory,
+                            split="test", use_hard=args.use_hard_cv, target_key=args.target_key)
+    val_metrics  = evaluate(system1, head, val_loader,  device, memory,
+                            split="val",  use_hard=args.use_hard_cv, target_key=args.target_key)
 
     print(f"\n[DONE] Results:")
     print(f"  val_accuracy  = {val_metrics['accuracy']:.4f}")
