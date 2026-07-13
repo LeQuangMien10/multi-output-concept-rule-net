@@ -42,7 +42,6 @@ from src.models.icrl_rule_memory import ICRLRuleMemory
 from src.models.rule_memory import (
     soft_concept_vector,
     logits_to_concept_vector,
-    labels_to_concept_vector,
     CONCEPT_KEYS_ORDERED,
     CONCEPT_OFFSETS,
     CONCEPT_DIMS,
@@ -66,20 +65,12 @@ def parse_args():
     # ICRL hyperparameters
     p.add_argument("--theta",        type=float, default=0.85,
                    help="Similarity threshold để CREATE rule mới.")
-    p.add_argument("--theta_merge",  type=float, default=0.98,
-                   help="Similarity threshold để MERGE 2 rules. Cao hơn theta để chỉ merge rules rất gần nhau.")
-    p.add_argument("--n_min",        type=int,   default=2,
-                   help="Số samples tối thiểu để rule survive prune. Thấp hơn → ít mất coverage.")
-    p.add_argument("--conf_min",     type=float, default=0.05,
+    p.add_argument("--theta_merge",  type=float, default=0.95,
+                   help="Similarity threshold để MERGE 2 rules.")
+    p.add_argument("--n_min",        type=int,   default=5,
+                   help="Số samples tối thiểu để rule survive prune.")
+    p.add_argument("--conf_min",     type=float, default=0.1,
                    help="Confidence tối thiểu để rule survive prune.")
-    p.add_argument("--match_input_only", action="store_true",
-                   help="Dùng chỉ input slots (bỏ target slot và op2 trivial) cho MATCH/CREATE/MERGE.\n"
-                        "MNIST: slot-wise cosine trên digit1+op1+digit2 (25 dims).\n"
-                        "Fitzpatrick: đặt match_offsets thủ công qua --match_offsets_json.\n"
-                        "Giúp clustering theo input pattern thay vì output label.")
-    p.add_argument("--match_offsets_json", type=str, default=None,
-                   help="JSON list of [start,end] pairs. Override --match_input_only.\n"
-                        "Ví dụ: '[[0,10],[10,15],[15,25]]' cho digit1+op1+digit2.")
 
     # Stage 2 options
     p.add_argument("--epochs",       type=int,   default=3,
@@ -93,13 +84,6 @@ def parse_args():
     p.add_argument("--head_lr",      type=float, default=1e-3)
     p.add_argument("--num_classes",  type=int,   default=10,
                    help="Số classes của target (digit3=10, benign/malignant=2).")
-    p.add_argument("--target_key",   type=str,   default="digit3",
-                   help="Key trong labels dict để lấy target. MNIST='digit3', Fitzpatrick='label'.")
-    p.add_argument("--use_gt_concepts", action="store_true",
-                   help="Dùng Ground Truth labels làm concept vector thay vì S1 predictions.\n"
-                        "Loại bỏ hoàn toàn S1 noise — cho phép đo ceiling accuracy của ICRL framework\n"
-                        "khi concept vector hoàn hảo. Hữu ích để debug: nếu GT vẫn thấp thì vấn đề\n"
-                        "nằm ở framework, không phải S1 noise.")
 
     # General
     p.add_argument("--batch_size",   type=int,   default=512)
@@ -146,32 +130,6 @@ def make_loaders(data_dir: Path, batch_size: int, num_workers: int):
 # Stage 2: Build rule memory
 # ─────────────────────────────────────────────────────────────
 
-def get_concept_vec(
-    system1:       "MultiHeadSystem1",
-    images:        torch.Tensor,
-    labels:        dict,
-    use_gt:        bool  = False,
-    use_hard:      bool  = False,
-    device:        torch.device | None = None,
-) -> torch.Tensor:
-    """
-    Lấy concept vector theo mode được chọn:
-      use_gt=True  : GT one-hot từ labels (loại bỏ S1 noise hoàn toàn)
-      use_gt=False : S1 predictions (soft hoặc hard argmax)
-
-    Dùng GT cho phép đo ceiling của ICRL framework độc lập với S1 quality.
-    """
-    if use_gt:
-        return labels_to_concept_vector(
-            {k: v.to(device or images.device) for k, v in labels.items()
-             if k in CONCEPT_KEYS_ORDERED}
-        ).float()
-    # S1 prediction
-    with torch.no_grad():
-        s1_out = system1(images.to(device or images.device))
-    return logits_to_concept_vector(s1_out) if use_hard else soft_concept_vector(s1_out)
-
-
 @torch.no_grad()
 def build_rule_memory(
     system1:    MultiHeadSystem1,
@@ -180,46 +138,31 @@ def build_rule_memory(
     device:     torch.device,
     use_hard:   bool = False,
     epoch_label: str = "Epoch",
-    target_key:  str = "digit3",
-    s1_conf_keys: list[str] | None = None,
 ) -> dict[str, int]:
-    """
-    Pass qua loader một lần, update rule memory.
-
-    target_key    : key trong labels dict để lấy y (MNIST='digit3', Fitzpatrick='label')
-    s1_conf_keys  : list slots dùng để tính S1 confidence.
-                    None → tự detect từ s1_out keys (bỏ qua op2 = trivial slot)
-    """
+    """Pass qua loader một lần, update rule memory."""
     total_stats = {"created": 0, "matched": 0, "total": 0}
-
-    use_gt = getattr(build_rule_memory, '_use_gt', False)
 
     for images, labels in tqdm(loader, desc=f"  Build [{epoch_label}]", leave=False):
         images = images.to(device)
 
-        cv = get_concept_vec(system1, images, labels,
-                             use_gt=use_gt, use_hard=use_hard, device=device)
+        # Concept vector từ S1 (frozen)
+        with torch.no_grad():
+            s1_out = system1(images)
 
-        # S1 confidence:
-        # GT mode: confidence=1.0 (perfect concept → full weight)
-        # S1 mode: mean max-prob across non-trivial slots
-        if use_gt:
-            s1_conf = torch.ones(cv.shape[0], device=device)
+        if use_hard:
+            cv = logits_to_concept_vector(s1_out)
         else:
-            with torch.no_grad():
-                s1_out_for_conf = system1(images)
-            conf_keys = s1_conf_keys or [k for k in s1_out_for_conf if k != "op2"]
-            slot_confs = [F.softmax(s1_out_for_conf[k], dim=1).max(dim=1).values
-                          for k in conf_keys if k in s1_out_for_conf]
-            s1_conf = (torch.stack(slot_confs, dim=1).mean(dim=1)
-                       if slot_confs else torch.ones(cv.shape[0], device=device))
+            cv = soft_concept_vector(s1_out)   # [B, D]
 
-        # Target label
-        if target_key in labels:
-            y = labels[target_key].to(device)
-        else:
-            candidate_keys = [k for k in labels if k != "images"]
-            y = labels[candidate_keys[0]].to(device)
+        # S1 confidence = mean max-prob across slots (excluding op2 = always =)
+        slot_confs = []
+        for key in ["digit1", "op1", "digit2", "digit3"]:
+            probs = F.softmax(s1_out[key], dim=1)
+            slot_confs.append(probs.max(dim=1).values)
+        s1_conf = torch.stack(slot_confs, dim=1).mean(dim=1)   # [B]
+
+        # Target label = digit3 (hoặc thay bằng label khác nếu dataset khác)
+        y = labels["digit3"].to(device)
 
         stats = memory.process_batch(cv, y, s1_conf)
         for k in total_stats:
@@ -234,37 +177,34 @@ def build_rule_memory(
 
 @torch.no_grad()
 def update_rule_accuracy(
-    system1:    MultiHeadSystem1,
-    head:       nn.Linear,
-    loader:     DataLoader,
-    memory:     ICRLRuleMemory,
-    device:     torch.device,
-    use_hard:   bool = False,
-    target_key: str  = "digit3",
+    system1: MultiHeadSystem1,
+    head:    nn.Linear,
+    loader:  DataLoader,
+    memory:  ICRLRuleMemory,
+    device:  torch.device,
+    use_hard: bool = False,
 ) -> None:
-    """
-    Compute predictions via centroid-based head và update accuracy trong memory.
-    Dùng head(centroid[match(cv)]) — không phải head(cv) trực tiếp.
-    """
+    """Compute predictions với head hiện tại và update accuracy trong memory."""
     if memory.is_empty or head is None:
         return
 
+    # Reset accuracy counters
     for i in range(memory.num_rules):
         memory._correct[i]    = 0
         memory._total_pred[i] = 0
 
     centroids = memory.get_centroids().to(device)   # [R, D]
 
-    use_gt = getattr(update_rule_accuracy, '_use_gt', False)
-
     for images, labels in tqdm(loader, desc="  Update accuracy", leave=False):
         images = images.to(device)
-        cv     = get_concept_vec(system1, images, labels,
-                                 use_gt=use_gt, use_hard=use_hard, device=device)
-        y      = labels[target_key].to(device) if target_key in labels else labels[list(labels.keys())[0]].to(device)
+        s1_out = system1(images)
+        cv     = logits_to_concept_vector(s1_out) if use_hard else soft_concept_vector(s1_out)
+        y      = labels["digit3"].to(device)
 
+        # Match → rule_ids
         rule_ids, _ = memory.match(cv)            # [B]
-        rule_cvs    = centroids[rule_ids]          # [B, D]  ← centroid, not noisy cv
+        # Predict via head
+        rule_cvs    = centroids[rule_ids]          # [B, D]
         preds       = head(rule_cvs).argmax(dim=1) # [B]
 
         memory.update_accuracy(cv, y, preds)
@@ -275,42 +215,30 @@ def update_rule_accuracy(
 # ─────────────────────────────────────────────────────────────
 
 def train_head(
-    system1:      MultiHeadSystem1,
-    memory:       ICRLRuleMemory,
+    system1:     MultiHeadSystem1,
+    memory:      ICRLRuleMemory,
     train_loader: DataLoader,
-    val_loader:   DataLoader,
-    num_classes:  int,
-    epochs:       int,
-    lr:           float,
-    device:       torch.device,
-    use_hard:     bool = False,
-    target_key:   str  = "digit3",
-    use_gt:       bool = False,
+    val_loader:  DataLoader,
+    num_classes: int,
+    epochs:      int,
+    lr:          float,
+    device:      torch.device,
+    use_hard:    bool = False,
 ) -> nn.Linear:
     """
-    Train linear head: centroid[match(cv)] → class.
-
-    Key design: head nhận CENTROID của best-matched rule, không phải cv trực tiếp.
-    Centroid = mean của ~1000+ ảnh → ít noise hơn single concept vector nhiều.
-    Điều này giúp ICRL tạo ra sự khác biệt so với head(cv) thuần túy.
-
-    General: target_key có thể là 'digit3' (MNIST) hoặc 'label' (Fitzpatrick).
+    Train linear head: concept_vec → class.
+    Head input = concept vector (D-dim), output = num_classes.
     """
     head = nn.Linear(CONCEPT_TOTAL_DIM, num_classes).to(device)
     opt  = torch.optim.AdamW(head.parameters(), lr=lr, weight_decay=1e-4)
 
-    best_val   = 0.0
+    best_val  = 0.0
     best_state = None
 
-    centroids = memory.get_centroids().to(device)   # [R, D]  — frozen trong suốt stage 3
+    centroids = memory.get_centroids().to(device)   # [R, D]
+    rule_labels = torch.tensor(memory.get_labels(), dtype=torch.long, device=device)  # [R]
 
     print(f"\n[Stage 3] Train prediction head ({epochs} epochs)")
-    print(f"  Inference mode: head(centroid[match(cv)])  ← centroid reduces noise")
-
-    def _get_target(labels):
-        if target_key in labels:
-            return labels[target_key].to(device)
-        return labels[list(labels.keys())[0]].to(device)
 
     for epoch in range(1, epochs + 1):
         # ── Train ──
@@ -320,13 +248,11 @@ def train_head(
         for images, labels in tqdm(train_loader, desc=f"  Head ep{epoch:2d}", leave=False):
             images = images.to(device)
             with torch.no_grad():
-                cv       = get_concept_vec(system1, images, labels,
-                                           use_gt=use_gt, use_hard=use_hard, device=device)
-                rule_ids, _ = memory.match(cv)
-                rule_cvs = centroids[rule_ids]
-            y = _get_target(labels)
+                s1_out = system1(images)
+                cv     = logits_to_concept_vector(s1_out) if use_hard else soft_concept_vector(s1_out)
+            y = labels["digit3"].to(device)
 
-            logits = head(rule_cvs)
+            logits = head(cv)
             loss   = F.cross_entropy(logits, y)
             opt.zero_grad(); loss.backward(); opt.step()
 
@@ -338,13 +264,11 @@ def train_head(
         val_correct = 0; val_total = 0
         with torch.no_grad():
             for images, labels in val_loader:
-                images   = images.to(device)
-                cv       = get_concept_vec(system1, images, labels,
-                                           use_gt=use_gt, use_hard=use_hard, device=device)
-                y        = _get_target(labels)
-                rule_ids, _ = memory.match(cv)
-                rule_cvs = centroids[rule_ids]
-                preds    = head(rule_cvs).argmax(dim=1)
+                images = images.to(device)
+                s1_out = system1(images)
+                cv     = logits_to_concept_vector(s1_out) if use_hard else soft_concept_vector(s1_out)
+                y      = labels["digit3"].to(device)
+                preds  = head(cv).argmax(dim=1)
                 val_correct += (preds == y).sum().item()
                 val_total   += len(y)
 
@@ -367,127 +291,28 @@ def train_head(
 # Evaluate & export
 # ─────────────────────────────────────────────────────────────
 
-def _decode_centroid_slots(
-    centroid: torch.Tensor,
-    concept_keys: list[str],
-    offsets: dict[str, int],
-    dims: dict[str, int],
-) -> dict[str, int]:
-    """
-    Decode centroid → argmax per slot.
-    Returns dict key → predicted int class.
-    """
-    result = {}
-    for key in concept_keys:
-        s, e = offsets[key], offsets[key] + dims[key]
-        result[key] = int(centroid[s:e].argmax().item())
-    return result
-
-
 @torch.no_grad()
 def evaluate(
-    system1:    MultiHeadSystem1,
-    head:       nn.Linear,
-    loader:     DataLoader,
-    device:     torch.device,
-    memory:     ICRLRuleMemory,
-    split:      str  = "test",
-    use_hard:   bool = False,
-    target_key: str  = "digit3",
+    system1:  MultiHeadSystem1,
+    head:     nn.Linear,
+    loader:   DataLoader,
+    device:   torch.device,
+    split:    str = "test",
+    use_hard: bool = False,
 ) -> dict[str, float]:
-    """
-    Evaluate với 4 metrics:
-
-    digit3_accuracy      : head(centroid[match(cv)]) predict đúng digit3
-    rule_match_accuracy  : matched rule có đúng (d1, op, d2) với GT không
-    expression_accuracy  : matched rule đúng TẤT CẢ slots (d1,op,d2,d3)
-    arith_correct_rate   : % matched rules đúng arithmetic (d1 op d2 == d3 trong rule)
-
-    Tách bạch "digit3 prediction đúng" vs "đúng rule được matched",
-    cho phép đánh giá chất lượng rule riêng biệt với prediction accuracy.
-    """
     head.eval()
-    centroids = memory.get_centroids().to(device)   # [R, D]
-    use_gt    = getattr(evaluate, '_use_gt', False)
-
-    # Decode tất cả rule centroids một lần (offline)
-    rule_slots = [
-        _decode_centroid_slots(centroids[r], CONCEPT_KEYS_ORDERED,
-                               CONCEPT_OFFSETS, CONCEPT_DIMS)
-        for r in range(memory.num_rules)
-    ]
-
-    # Input concept keys (bỏ target key ra khỏi "matching context" khi đánh giá)
-    input_keys = [k for k in CONCEPT_KEYS_ORDERED if k != target_key and k != "op2"]
-
-    # Counters
-    d3_correct    = 0   # digit3 prediction đúng
-    match_correct = 0   # rule (d1,op,d2) map đúng GT
-    expr_correct  = 0   # tất cả slots đúng đồng thời
-    arith_correct = 0   # rule arithmetic: d1 op d2 == d3 (trong rule)
-    total         = 0
+    correct = 0; total = 0
 
     for images, labels in tqdm(loader, desc=f"  Eval {split}", leave=False):
         images = images.to(device)
-        cv     = get_concept_vec(system1, images, labels,
-                                 use_gt=use_gt, use_hard=use_hard, device=device)
-        rule_ids, _ = memory.match(cv)          # [B]
-        rule_cvs    = centroids[rule_ids]        # [B, D]
-        preds       = head(rule_cvs).argmax(dim=1)  # [B]
+        s1_out = system1(images)
+        cv     = logits_to_concept_vector(s1_out) if use_hard else soft_concept_vector(s1_out)
+        y      = labels["digit3"].to(device)
+        preds  = head(cv).argmax(dim=1)
+        correct += (preds == y).sum().item()
+        total   += len(y)
 
-        B = len(preds)
-        for i in range(B):
-            rid   = int(rule_ids[i].item())
-            rs    = rule_slots[rid]           # decoded slots của matched rule
-            pred  = int(preds[i].item())
-
-            # GT values
-            gt = {k: int(labels[k][i].item())
-                  for k in CONCEPT_KEYS_ORDERED if k in labels}
-            gt_target = gt.get(target_key, -1)
-
-            # ── Metric 1: digit3 accuracy ──────────────────────────
-            if pred == gt_target:
-                d3_correct += 1
-
-            # ── Metric 2: rule_match_accuracy ─────────────────────
-            # Matched rule có đúng input slots (d1, op1, d2) không?
-            # Đây là core question: "đúng rule được map vào ảnh không?"
-            input_match = all(rs.get(k) == gt.get(k) for k in input_keys)
-            if input_match:
-                match_correct += 1
-
-            # ── Metric 3: expression_accuracy ─────────────────────
-            # Tất cả slots (d1, op, d2, d3) của matched rule đều đúng
-            all_slots_match = all(
-                rs.get(k) == gt.get(k)
-                for k in CONCEPT_KEYS_ORDERED
-                if k in gt and k != "op2"
-            )
-            if all_slots_match:
-                expr_correct += 1
-
-            # ── Metric 4: arith_correct_rate ──────────────────────
-            # Rule matched có đúng arithmetic không? (d1 op d2 = d3 trong rule)
-            r_d1  = rs.get("digit1", -1)
-            r_op  = rs.get("op1", -1)
-            r_d2  = rs.get("digit2", -1)
-            r_d3  = rs.get(target_key, -1)
-            if r_op == 0:   r_expected = r_d1 + r_d2   # +
-            elif r_op == 1: r_expected = r_d1 - r_d2   # -
-            else:           r_expected = -999
-            if r_expected == r_d3:
-                arith_correct += 1
-
-            total += 1
-
-    return {
-        "digit3_accuracy":     d3_correct    / total,
-        "rule_match_accuracy": match_correct / total,
-        "expression_accuracy": expr_correct  / total,
-        "arith_correct_rate":  arith_correct / total,
-        "total": total,
-    }
+    return {"accuracy": correct / total, "correct": correct, "total": total}
 
 
 def export_rules(
@@ -557,18 +382,8 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"[INFO] Device: {device}")
-    use_gt = args.use_gt_concepts
     print(f"[INFO] ICRL params: θ={args.theta}  θ_merge={args.theta_merge}  "
-          f"n_min={args.n_min}  conf_min={args.conf_min}  "
-          f"match_input_only={args.match_input_only}")
-    print(f"[INFO] Concept source: {'Ground Truth labels' if use_gt else 'System1 predictions'}")
-    if use_gt:
-        print(f"[INFO] GT mode: measuring ceiling accuracy of ICRL framework (no S1 noise)")
-
-    # Propagate use_gt flag via function attribute (avoids threading issues)
-    build_rule_memory._use_gt    = use_gt
-    update_rule_accuracy._use_gt = use_gt
-    evaluate._use_gt             = use_gt
+          f"n_min={args.n_min}  conf_min={args.conf_min}")
 
     # ── Data ────────────────────────────────────────────────
     data_dir = Path(args.data_dir)
@@ -582,31 +397,13 @@ def main():
     print(f"[INFO] System1 loaded (frozen): {args.system1_ckpt}")
 
     # ── Stage 2: Build rule memory ──────────────────────────
-    # ── Resolve match_offsets ───────────────────────────────
-    match_offsets = None
-    if args.match_offsets_json:
-        import json as _json
-        match_offsets = [tuple(p) for p in _json.loads(args.match_offsets_json)]
-        print(f"[INFO] match_offsets (custom): {match_offsets}")
-    elif args.match_input_only:
-        # MNIST Math: digit1[0:10] + op1[10:15] + digit2[15:25]
-        # Bỏ op2[25:30] (trivial, luôn =) và digit3[30:40] (target)
-        # General: user chỉ định slot layout qua --match_offsets_json
-        from src.models.rule_memory import CONCEPT_OFFSETS, CONCEPT_DIMS
-        input_keys  = [k for k in CONCEPT_KEYS_ORDERED
-                       if k not in ("op2", args.target_key)]
-        match_offsets = [(CONCEPT_OFFSETS[k], CONCEPT_OFFSETS[k] + CONCEPT_DIMS[k])
-                         for k in input_keys]
-        print(f"[INFO] match_input_only: slots={input_keys}  offsets={match_offsets}")
-
     memory = ICRLRuleMemory(
-        concept_dim   = CONCEPT_TOTAL_DIM,
-        theta         = args.theta,
-        theta_merge   = args.theta_merge,
-        n_min         = args.n_min,
-        conf_min      = args.conf_min,
-        match_offsets = match_offsets,
-        device        = str(device),
+        concept_dim  = CONCEPT_TOTAL_DIM,
+        theta        = args.theta,
+        theta_merge  = args.theta_merge,
+        n_min        = args.n_min,
+        conf_min     = args.conf_min,
+        device       = str(device),
     )
 
     print(f"\n[Stage 2] Building rule memory ({args.epochs} epochs)")
@@ -620,15 +417,13 @@ def main():
             system1, train_loader, memory, device,
             use_hard=args.use_hard_cv,
             epoch_label=f"{epoch}/{args.epochs}",
-            target_key=args.target_key,
         )
         print(f"  Created={stats['created']}  Matched={stats['matched']}  "
               f"Rules so far={memory.num_rules}")
 
         # Update accuracy nếu đã có head
         if head is not None:
-            update_rule_accuracy(system1, head, train_loader, memory, device,
-                                 use_hard=args.use_hard_cv, target_key=args.target_key)
+            update_rule_accuracy(system1, head, train_loader, memory, device, args.use_hard_cv)
 
         # Prune
         memory.prune(verbose=True)
@@ -640,46 +435,23 @@ def main():
 
         # Quick head để cung cấp accuracy signal cho epoch tiếp theo
         if epoch < args.epochs:
-            # Quick head để cung cấp accuracy signal cho epoch tiếp theo
-            # Dùng centroid-based inference — nhất quán với stage 3
             head = nn.Linear(CONCEPT_TOTAL_DIM, args.num_classes).to(device)
             head_opt = torch.optim.AdamW(head.parameters(), lr=1e-3)
-
-            # Collect centroids và labels (one-pass, không cần lưu toàn bộ cv)
-            centroids_now = memory.get_centroids().to(device)  # [R, D]
-
+            head.train()
             with torch.no_grad():
-                all_rule_cvs, all_ys = [], []
-                for images, batch_labels in train_loader:
+                all_cvs, all_ys = [], []
+                for images, labels in train_loader:
                     images = images.to(device)
                     s1_out = system1(images)
-                    cv     = get_concept_vec(system1, images, batch_labels,
-                                               use_gt=use_gt, use_hard=args.use_hard_cv, device=device)
-                    rule_ids, _ = memory.match(cv)            # [B]
-                    rule_cvs    = centroids_now[rule_ids]     # [B, D]
-                    all_rule_cvs.append(rule_cvs.cpu())
-
-                    # Fix: _y nằm TRONG for loop
-                    _y = (batch_labels[args.target_key]
-                          if args.target_key in batch_labels
-                          else batch_labels[list(batch_labels.keys())[0]])
-                    all_ys.append(_y)
-
-            all_rule_cvs = torch.cat(all_rule_cvs).to(device)
-            all_ys       = torch.cat(all_ys).to(device)
-
-            # Validate label range
-            assert all_ys.min() >= 0 and all_ys.max() < args.num_classes, (
-                f"Label out of range: [{all_ys.min()}, {all_ys.max()}] "
-                f"but num_classes={args.num_classes}. Set --num_classes correctly."
-            )
-
-            head.train()
+                    cv = logits_to_concept_vector(s1_out) if args.use_hard_cv else soft_concept_vector(s1_out)
+                    all_cvs.append(cv); all_ys.append(labels["digit3"].to(device))
+            all_cvs = torch.cat(all_cvs); all_ys = torch.cat(all_ys)
+            # 5 quick epochs
             for _ in range(5):
-                perm = torch.randperm(len(all_rule_cvs), device=device)
-                for i in range(0, len(all_rule_cvs), args.batch_size):
-                    idx  = perm[i:i + args.batch_size]
-                    loss = F.cross_entropy(head(all_rule_cvs[idx]), all_ys[idx])
+                perm  = torch.randperm(len(all_cvs))
+                for i in range(0, len(all_cvs), args.batch_size):
+                    idx = perm[i:i+args.batch_size]
+                    loss = F.cross_entropy(head(all_cvs[idx]), all_ys[idx])
                     head_opt.zero_grad(); loss.backward(); head_opt.step()
 
     # Save rule memory after building
@@ -695,8 +467,6 @@ def main():
         lr=args.head_lr,
         device=device,
         use_hard=args.use_hard_cv,
-        target_key=args.target_key,
-        use_gt=use_gt,
     )
 
     # Save head
@@ -704,34 +474,21 @@ def main():
 
     # ── Evaluate ────────────────────────────────────────────
     print("\n[INFO] Evaluating...")
-    test_metrics = evaluate(system1, head, test_loader, device, memory,
-                            split="test", use_hard=args.use_hard_cv, target_key=args.target_key)
-    val_metrics  = evaluate(system1, head, val_loader,  device, memory,
-                            split="val",  use_hard=args.use_hard_cv, target_key=args.target_key)
+    test_metrics = evaluate(system1, head, test_loader, device, "test", args.use_hard_cv)
+    val_metrics  = evaluate(system1, head, val_loader,  device, "val",  args.use_hard_cv)
 
-    print(f"\n[DONE] Results (val / test):")
-    print(f"  {'Metric':25s}  {'Val':>8}  {'Test':>8}")
-    print(f"  {'-'*46}")
-    for key in ["digit3_accuracy", "rule_match_accuracy",
-                "expression_accuracy", "arith_correct_rate"]:
-        v = val_metrics.get(key, 0)
-        t = test_metrics.get(key, 0)
-        print(f"  {key:25s}  {v:8.4f}  {t:8.4f}")
-    print()
-    print(f"  [Interpretation]")
-    print(f"  rule_match_accuracy : % ảnh matched đúng rule (d1,op,d2)")
-    print(f"  expression_accuracy : % ảnh matched rule đúng TẤT CẢ slots")
-    print(f"  arith_correct_rate  : % matched rules đúng arithmetic (d1 op d2 = d3)")
+    print(f"\n[DONE] Results:")
+    print(f"  val_accuracy  = {val_metrics['accuracy']:.4f}")
+    print(f"  test_accuracy = {test_metrics['accuracy']:.4f}")
 
     # ── Export rules ─────────────────────────────────────────
     export_rules(memory, output_dir)
 
     # ── Save metrics ─────────────────────────────────────────
     metrics = {
-        "val":  {k: v for k, v in val_metrics.items()  if k != "total"},
-        "test": {k: v for k, v in test_metrics.items() if k != "total"},
-        "num_rules":      memory.num_rules,
-        "concept_source": "gt_labels" if use_gt else "system1_predictions",
+        "val_accuracy":  val_metrics["accuracy"],
+        "test_accuracy": test_metrics["accuracy"],
+        "num_rules":     memory.num_rules,
         "args": vars(args),
         "rule_confidence_stats": {
             "mean": sum(memory.get_confidences()) / max(1, memory.num_rules),
