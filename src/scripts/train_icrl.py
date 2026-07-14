@@ -425,42 +425,32 @@ def main():
         if head is not None:
             update_rule_accuracy(system1, head, train_loader, memory, device, args.use_hard_cv)
 
-        # Prune: Stage 2 chỉ dùng coherence (accuracy signal chưa ổn định)
-        memory.prune(verbose=True, coherence_only=True)
+        # Prune
+        memory.prune(verbose=True)
         print(f"  After prune: {memory.num_rules} rules")
         print(f"  Confidence: "
               f"mean={sum(memory.get_confidences())/max(1,memory.num_rules):.3f}  "
               f"min={min(memory.get_confidences()):.3f}  "
               f"max={max(memory.get_confidences()):.3f}")
 
-        # Quick head để cung cấp accuracy signal cho epoch tiếp theo.
-        # Dùng head(cv) — KHÔNG phải head(centroid).
-        # Lý do: head(centroid) cho acc=100% mọi rule (circular, centroid
-        # đã encode digit3 đúng) → signal không phân biệt rules tốt/xấu.
-        # head(cv) đo khả năng predict từ noisy concept vector thực →
-        # rules có concept coherent thì acc cao → survive prune đúng.
+        # Quick head để cung cấp accuracy signal cho epoch tiếp theo
         if epoch < args.epochs:
             head = nn.Linear(CONCEPT_TOTAL_DIM, args.num_classes).to(device)
             head_opt = torch.optim.AdamW(head.parameters(), lr=1e-3)
-
+            head.train()
             with torch.no_grad():
                 all_cvs, all_ys = [], []
                 for images, labels in train_loader:
                     images = images.to(device)
                     s1_out = system1(images)
-                    cv = (logits_to_concept_vector(s1_out) if args.use_hard_cv
-                          else soft_concept_vector(s1_out))
-                    all_cvs.append(cv)
-                    all_ys.append(labels["digit3"])
-
-            all_cvs = torch.cat(all_cvs).to(device)
-            all_ys  = torch.cat(all_ys).to(device)
-
-            head.train()
+                    cv = logits_to_concept_vector(s1_out) if args.use_hard_cv else soft_concept_vector(s1_out)
+                    all_cvs.append(cv); all_ys.append(labels["digit3"].to(device))
+            all_cvs = torch.cat(all_cvs); all_ys = torch.cat(all_ys)
+            # 5 quick epochs
             for _ in range(5):
-                perm = torch.randperm(len(all_cvs), device=device)
+                perm  = torch.randperm(len(all_cvs))
                 for i in range(0, len(all_cvs), args.batch_size):
-                    idx  = perm[i:i + args.batch_size]
+                    idx = perm[i:i+args.batch_size]
                     loss = F.cross_entropy(head(all_cvs[idx]), all_ys[idx])
                     head_opt.zero_grad(); loss.backward(); head_opt.step()
 
