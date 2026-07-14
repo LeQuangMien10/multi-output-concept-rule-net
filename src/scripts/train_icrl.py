@@ -434,24 +434,32 @@ def main():
               f"max={max(memory.get_confidences()):.3f}")
 
         # Quick head để cung cấp accuracy signal cho epoch tiếp theo
+        # Dùng centroid-based — nhất quán với update_rule_accuracy
         if epoch < args.epochs:
             head = nn.Linear(CONCEPT_TOTAL_DIM, args.num_classes).to(device)
             head_opt = torch.optim.AdamW(head.parameters(), lr=1e-3)
-            head.train()
+            centroids_q = memory.get_centroids().to(device)   # [R, D]
+
             with torch.no_grad():
-                all_cvs, all_ys = [], []
+                all_rule_cvs, all_ys = [], []
                 for images, labels in train_loader:
-                    images = images.to(device)
-                    s1_out = system1(images)
-                    cv = logits_to_concept_vector(s1_out) if args.use_hard_cv else soft_concept_vector(s1_out)
-                    all_cvs.append(cv); all_ys.append(labels["digit3"].to(device))
-            all_cvs = torch.cat(all_cvs); all_ys = torch.cat(all_ys)
-            # 5 quick epochs
+                    images  = images.to(device)
+                    s1_out  = system1(images)
+                    cv      = (logits_to_concept_vector(s1_out) if args.use_hard_cv
+                               else soft_concept_vector(s1_out))
+                    rule_ids, _ = memory.match(cv)
+                    all_rule_cvs.append(centroids_q[rule_ids].cpu())
+                    all_ys.append(labels["digit3"])
+
+            all_rule_cvs = torch.cat(all_rule_cvs).to(device)
+            all_ys       = torch.cat(all_ys).to(device)
+
+            head.train()
             for _ in range(5):
-                perm  = torch.randperm(len(all_cvs))
-                for i in range(0, len(all_cvs), args.batch_size):
-                    idx = perm[i:i+args.batch_size]
-                    loss = F.cross_entropy(head(all_cvs[idx]), all_ys[idx])
+                perm = torch.randperm(len(all_rule_cvs), device=device)
+                for i in range(0, len(all_rule_cvs), args.batch_size):
+                    idx  = perm[i:i + args.batch_size]
+                    loss = F.cross_entropy(head(all_rule_cvs[idx]), all_ys[idx])
                     head_opt.zero_grad(); loss.backward(); head_opt.step()
 
     # Save rule memory after building
