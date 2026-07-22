@@ -57,19 +57,33 @@ class ICRLRuleMemory:
 
     def __init__(
         self,
-        concept_dim:  int,
-        theta:        float = 0.85,
-        theta_merge:  float = 0.95,
-        n_min:        int   = 5,
-        conf_min:     float = 0.1,
-        device:       str   = "cpu",
+        concept_dim:   int,
+        theta:         float = 0.85,
+        theta_merge:   float = 0.95,
+        n_min:         int   = 5,
+        conf_min:      float = 0.1,
+        device:        str   = "cpu",
+        cluster_dims:  tuple[int, int] | None = None,
     ):
-        self.concept_dim = concept_dim
-        self.theta       = theta
-        self.theta_merge = theta_merge
-        self.n_min       = n_min
-        self.conf_min    = conf_min
-        self.device      = device
+        """
+        cluster_dims : (start, end) — slice của concept vector dùng cho
+            MATCH / CREATE / MERGE similarity. None → dùng toàn bộ vector.
+
+            MNIST Math — chỉ input slots, bỏ op2(trivial) và digit3(target):
+                cluster_dims = (0, 25)   # digit1(10) + op1(5) + digit2(10)
+                → d3 noise không ảnh hưởng clustering
+                → mỗi (d1,op,d2) combo có rule riêng
+
+            Fitzpatrick — tất cả concept features:
+                cluster_dims = None      # dùng toàn bộ 48 dims
+        """
+        self.concept_dim  = concept_dim
+        self.theta        = theta
+        self.theta_merge  = theta_merge
+        self.n_min        = n_min
+        self.conf_min     = conf_min
+        self.device       = device
+        self.cluster_dims = cluster_dims   # None = full vector
 
         # Rule storage (Python lists — dynamic size)
         self._mu:         list[torch.Tensor] = []   # [D] each
@@ -146,7 +160,7 @@ class ICRLRuleMemory:
 
             # Compute cosine similarity với tất cả centroids
             centroids = self.get_centroids()    # [R, D]
-            sims = self._cosine(cv.unsqueeze(0), centroids).squeeze(0)  # [R]
+            sims = self._cluster_sim(cv.unsqueeze(0), centroids).squeeze(0)  # [R]
             best_sim, best_r = sims.max(dim=0)
             best_sim = best_sim.item()
             best_r   = best_r.item()
@@ -178,7 +192,7 @@ class ICRLRuleMemory:
         predictions  = predictions.to(self.device)
 
         centroids = self.get_centroids()   # [R, D]
-        sims      = self._cosine(concept_vecs, centroids)  # [B, R]
+        sims      = self._cluster_sim(concept_vecs, centroids)  # [B, R]
         rule_ids  = sims.argmax(dim=1)     # [B]
 
         for i in range(len(labels)):
@@ -214,7 +228,7 @@ class ICRLRuleMemory:
         # ── 2. Merge duplicates ────────────────────────────
         if self.num_rules > 1:
             centroids = self.get_centroids()   # [R, D]
-            sims = self._cosine(centroids, centroids)  # [R, R]
+            sims = self._cluster_sim(centroids, centroids)  # [R, R]
 
             merged_into: dict[int, int] = {}   # rule_i → rule_j (j survives)
 
@@ -294,13 +308,19 @@ class ICRLRuleMemory:
 
     @staticmethod
     def _cosine(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        """Flat cosine. a:[M,D] b:[N,D] → [M,N]"""
+        return F.normalize(a, dim=1) @ F.normalize(b, dim=1).T
+
+    def _cluster_sim(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         """
-        Cosine similarity. Works for both softmax (MNIST) and sigmoid (Fitzpatrick).
-        a: [M, D], b: [N, D] → [M, N]
+        Similarity dùng cho MATCH / CREATE / MERGE.
+        cluster_dims=(s,e) → cosine trên a[:,s:e] và b[:,s:e] only.
+        None → flat cosine trên toàn bộ vector.
         """
-        a_n = F.normalize(a, dim=1)
-        b_n = F.normalize(b, dim=1)
-        return a_n @ b_n.T
+        if self.cluster_dims is None:
+            return self._cosine(a, b)
+        s, e = self.cluster_dims
+        return self._cosine(a[:, s:e], b[:, s:e])
 
     # ── Confidence ──────────────────────────────────────────
 
@@ -415,12 +435,13 @@ class ICRLRuleMemory:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         state = {
-            "concept_dim": self.concept_dim,
-            "theta":       self.theta,
-            "theta_merge": self.theta_merge,
-            "n_min":       self.n_min,
-            "conf_min":    self.conf_min,
-            "num_rules":   self.num_rules,
+            "concept_dim":  self.concept_dim,
+            "theta":        self.theta,
+            "theta_merge":  self.theta_merge,
+            "n_min":        self.n_min,
+            "conf_min":     self.conf_min,
+            "cluster_dims": self.cluster_dims,
+            "num_rules":    self.num_rules,
             "mu":          [m.cpu().tolist() for m in self._mu],
             "m2":          [m.cpu().tolist() for m in self._m2],
             "labels":      self._labels,
@@ -434,12 +455,13 @@ class ICRLRuleMemory:
     def load(cls, path: str | Path, device: str = "cpu") -> "ICRLRuleMemory":
         state = torch.load(path, map_location=device, weights_only=False)
         mem = cls(
-            concept_dim  = state["concept_dim"],
-            theta        = state["theta"],
-            theta_merge  = state["theta_merge"],
-            n_min        = state["n_min"],
-            conf_min     = state["conf_min"],
-            device       = device,
+            concept_dim   = state["concept_dim"],
+            theta         = state["theta"],
+            theta_merge   = state["theta_merge"],
+            n_min         = state["n_min"],
+            conf_min      = state["conf_min"],
+            cluster_dims  = state.get("cluster_dims", None),
+            device        = device,
         )
         mem._mu          = [torch.tensor(m, device=device) for m in state["mu"]]
         mem._m2          = [torch.tensor(m, device=device) for m in state["m2"]]
@@ -452,9 +474,11 @@ class ICRLRuleMemory:
     def __repr__(self) -> str:
         confs = self.get_confidences()
         avg_conf = sum(confs) / len(confs) if confs else 0.0
+        cd = (f"dims={self.cluster_dims[0]}:{self.cluster_dims[1]}"
+              if self.cluster_dims else "full_vec")
         return (
             f"ICRLRuleMemory("
             f"num_rules={self.num_rules}, "
-            f"θ={self.theta}, "
+            f"θ={self.theta}, sim={cd}, "
             f"avg_conf={avg_conf:.3f})"
         )
