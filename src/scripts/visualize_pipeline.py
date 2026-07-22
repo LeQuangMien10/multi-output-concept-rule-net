@@ -467,6 +467,68 @@ def visualize(
 model_s2_ref: System2Rules | None = None  # global ref for top-3 decode
 
 
+def find_sample(data, N, model_s1, device, want_correct: bool,
+                seed: int = 42) -> int:
+    """
+    Scan dataset để tìm sample mà S1 predict digit3 đúng (want_correct=True)
+    hoặc sai (want_correct=False).
+    Trả về index đầu tiên thoả điều kiện sau khi shuffle.
+    """
+    import random as _random
+    indices = list(range(N))
+    _random.seed(seed)
+    _random.shuffle(indices)
+
+    for idx in indices:
+        gt_d3  = data["digit3"][idx].item()
+        image  = data["images"][[idx]].to(device)
+        with torch.no_grad():
+            s1_out = model_s1(image)
+        pred_d3 = int(F.softmax(s1_out["digit3"][0], dim=0).argmax().item())
+        correct  = (pred_d3 == gt_d3)
+        if correct == want_correct:
+            label = "CORRECT" if want_correct else "WRONG"
+            print(f"[INFO] Found {label} sample: idx={idx}  "
+                  f"GT digit3={gt_d3}  S1 pred digit3={pred_d3}")
+            return idx
+
+    raise RuntimeError("Không tìm được sample thoả điều kiện trong toàn bộ dataset.")
+
+
+def run_one(idx, data, model_s1, model_s2, device, output_path):
+    """Chạy pipeline và visualize cho một sample index."""
+    gt_labels = {k: data[k][idx].item() for k in CONCEPT_KEYS_ORDERED}
+    if "valid" in data:
+        gt_labels["valid"] = data["valid"][idx].item()
+
+    image = data["images"][[idx]].to(device)
+    with torch.no_grad():
+        s1_out = model_s1(image)
+        cv     = soft_concept_vector(s1_out)
+        s2_out = model_s2.infer(cv)
+
+    s1_out_cpu = {k: v.cpu() for k, v in s1_out.items()}
+    s2_out_cpu = {
+        k: (v.cpu() if hasattr(v, "cpu") else v)
+        for k, v in s2_out.items()
+    }
+    if isinstance(s2_out_cpu["pred_slot"], dict):
+        s2_out_cpu["pred_slot"] = {k: v.cpu() for k, v in s2_out_cpu["pred_slot"].items()}
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    visualize(
+        image       = image.cpu(),
+        gt_labels   = gt_labels,
+        s1_outputs  = s1_out_cpu,
+        s2_infer    = s2_out_cpu,
+        sample_idx  = idx,
+        output_path = output_path,
+        symbol_width= 28,
+    )
+
+
 def main():
     global model_s2_ref
 
@@ -485,6 +547,13 @@ def main():
                    help="Lọc theo loại sample.")
     p.add_argument("--seed",          type=int, default=42)
     p.add_argument("--output_path",   type=str, default="outputs/pipeline_vis.png")
+    p.add_argument("--pick_correct",  action="store_true",
+                   help="Tìm và visualize 1 ảnh S1 predict ĐÚNG digit3.")
+    p.add_argument("--pick_wrong",    action="store_true",
+                   help="Tìm và visualize 1 ảnh S1 predict SAI digit3.")
+    p.add_argument("--output_path_wrong", type=str, default=None,
+                   help="Output path cho ảnh sai (dùng kết hợp với --pick_correct"
+                        " để lưu cả 2 cùng lúc).")
     args = p.parse_args()
 
     random.seed(args.seed)
@@ -519,7 +588,46 @@ def main():
     data  = _ds.data   # raw dict
     N     = _ds.length
 
-    # Select sample index
+    # Load models
+    s1_ckpt  = Path(args.system1_ckpt) if args.system1_ckpt else None
+    s2_ckpt  = Path(args.system2_ckpt) if args.system2_ckpt else None
+    model_s1 = load_system1(s1_ckpt, device)
+    model_s2 = load_system2(s2_ckpt, device)
+    model_s2_ref = model_s2
+
+    # ── Mode: correct + wrong side by side ───────────────────
+    if args.pick_correct or args.pick_wrong:
+        if args.pick_correct and args.pick_wrong:
+            # Cả hai: lưu 2 file riêng
+            idx_ok   = find_sample(data, N, model_s1, device,
+                                   want_correct=True,  seed=args.seed)
+            idx_fail = find_sample(data, N, model_s1, device,
+                                   want_correct=False, seed=args.seed + 1)
+
+            out_ok   = args.output_path
+            out_fail = (args.output_path_wrong
+                        if args.output_path_wrong
+                        else args.output_path.replace(".png", "_wrong.png"))
+
+            print(f"[INFO] Saving CORRECT sample → {out_ok}")
+            run_one(idx_ok,   data, model_s1, model_s2, device, out_ok)
+
+            print(f"[INFO] Saving WRONG   sample → {out_fail}")
+            run_one(idx_fail, data, model_s1, model_s2, device, out_fail)
+
+        elif args.pick_correct:
+            idx = find_sample(data, N, model_s1, device,
+                              want_correct=True, seed=args.seed)
+            run_one(idx, data, model_s1, model_s2, device, args.output_path)
+
+        else:  # pick_wrong only
+            idx = find_sample(data, N, model_s1, device,
+                              want_correct=False, seed=args.seed)
+            run_one(idx, data, model_s1, model_s2, device, args.output_path)
+
+        return
+
+    # ── Mode: chỉ định / random / pick valid|invalid (cũ) ────
     if args.sample_idx is not None:
         idx = args.sample_idx
     elif args.pick is not None:
@@ -527,64 +635,14 @@ def main():
             target_valid = 1 if args.pick == "valid" else 0
             pool = [i for i in range(N) if data["valid"][i].item() == target_valid]
         else:
-            pool = list(range(N))   # v2: tất cả đều valid
+            pool = list(range(N))
         idx = random.choice(pool)
     elif args.random:
         idx = random.randint(0, N - 1)
     else:
         idx = 0
 
-    print(f"[INFO] Sample #{idx} from {args.split} set")
-
-    gt_labels = {k: data[k][idx].item() for k in CONCEPT_KEYS_ORDERED}
-    if "valid" in data:
-        gt_labels["valid"] = data["valid"][idx].item()
-    print(
-        f"[INFO] GT: "
-        f"digit1={gt_labels['digit1']} "
-        f"op1={label_to_str('op1', gt_labels['op1'])} "
-        f"digit2={gt_labels['digit2']} "
-        f"op2={label_to_str('op2', gt_labels['op2'])} "
-        f"digit3={gt_labels['digit3']}"
-    )
-
-    # Load models
-    s1_ckpt = Path(args.system1_ckpt) if args.system1_ckpt else None
-    s2_ckpt = Path(args.system2_ckpt) if args.system2_ckpt else None
-    model_s1 = load_system1(s1_ckpt, device)
-    model_s2 = load_system2(s2_ckpt, device)
-    model_s2_ref = model_s2
-
-    image = data["images"][[idx]].to(device)
-
-    with torch.no_grad():
-        s1_out  = model_s1(image)
-        cv      = soft_concept_vector(s1_out)
-        s2_out  = model_s2.infer(cv)
-
-    # Move to CPU for plotting
-    s1_out_cpu = {k: v.cpu() for k, v in s1_out.items()}
-    s2_out_cpu = {
-        k: (v.cpu() if hasattr(v, "cpu") else v)
-        for k, v in s2_out.items()
-    }
-    if isinstance(s2_out_cpu["pred_slot"], dict):
-        s2_out_cpu["pred_slot"] = {
-            k: v.cpu() for k, v in s2_out_cpu["pred_slot"].items()
-        }
-
-    output_path = Path(args.output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    visualize(
-        image      = image.cpu(),
-        gt_labels  = gt_labels,
-        s1_outputs = s1_out_cpu,
-        s2_infer   = s2_out_cpu,
-        sample_idx = idx,
-        output_path= output_path,
-        symbol_width= 28,
-    )
+    run_one(idx, data, model_s1, model_s2, device, args.output_path)
 
 
 if __name__ == "__main__":
