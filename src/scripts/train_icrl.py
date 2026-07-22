@@ -442,47 +442,20 @@ def main():
         print(f"  Created={stats['created']}  Matched={stats['matched']}  "
               f"Rules so far={memory.num_rules}")
 
-        # Update accuracy nếu đã có head
-        if head is not None:
-            update_rule_accuracy(system1, head, train_loader, memory, device, args.use_hard_cv)
-
-        # Prune strategy:
-        # Epoch < cuối: chỉ prune theo n_min (bỏ qua conf_min).
-        #   Lý do: accuracy signal từ quick head chưa tốt (head mới 5 epochs,
-        #   val_acc~0.21). Confidence = coherence × accuracy thấp dù cluster
-        #   hợp lệ → conf_min prune kills legitimate rules sớm.
-        # Epoch cuối: prune đầy đủ cả n_min và conf_min.
-        is_last_epoch = (epoch == args.epochs)
-        if is_last_epoch:
-            memory.prune(verbose=True)
-        else:
-            memory.prune(verbose=True, conf_min_override=0.0)
+        # Prune chỉ theo coherence và n_min — không dùng accuracy.
+        # Accuracy signal từ quick head gây mismatch (head train trên cv
+        # nhưng evaluate trên centroid → phân phối khác → accuracy sai lệch
+        # → prune nhầm rules hợp lệ).
+        # Coherence đủ để phân biệt: ghost clusters (ít samples, scatter) có
+        # coherence thấp; legitimate clusters (nhiều samples từ cùng expression)
+        # có coherence cao (~0.966). Prediction head chỉ train ở Stage 3.
+        memory.prune(verbose=True, conf_min_override=0.0)
         print(f"  After prune: {memory.num_rules} rules")
-        print(f"  Confidence: "
-              f"mean={sum(memory.get_confidences())/max(1,memory.num_rules):.3f}  "
-              f"min={min(memory.get_confidences()):.3f}  "
-              f"max={max(memory.get_confidences()):.3f}")
-
-        # Quick head để cung cấp accuracy signal cho epoch tiếp theo
-        if epoch < args.epochs:
-            head = nn.Linear(CONCEPT_TOTAL_DIM, args.num_classes).to(device)
-            head_opt = torch.optim.AdamW(head.parameters(), lr=1e-3)
-            head.train()
-            with torch.no_grad():
-                all_cvs, all_ys = [], []
-                for images, labels in train_loader:
-                    images = images.to(device)
-                    s1_out = system1(images)
-                    cv = logits_to_concept_vector(s1_out) if args.use_hard_cv else soft_concept_vector(s1_out)
-                    all_cvs.append(cv); all_ys.append(labels["digit3"].to(device))
-            all_cvs = torch.cat(all_cvs); all_ys = torch.cat(all_ys)
-            # 5 quick epochs
-            for _ in range(5):
-                perm  = torch.randperm(len(all_cvs))
-                for i in range(0, len(all_cvs), args.batch_size):
-                    idx = perm[i:i+args.batch_size]
-                    loss = F.cross_entropy(head(all_cvs[idx]), all_ys[idx])
-                    head_opt.zero_grad(); loss.backward(); head_opt.step()
+        cohs = [memory._compute_coherence(i) for i in range(memory.num_rules)]
+        print(f"  Coherence: "
+              f"mean={sum(cohs)/max(1,len(cohs)):.3f}  "
+              f"min={min(cohs) if cohs else 0:.3f}  "
+              f"max={max(cohs) if cohs else 0:.3f}")
 
     # Save rule memory after building
     memory_path = output_dir / "icrl_rule_memory.pt"
