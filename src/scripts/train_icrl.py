@@ -84,12 +84,6 @@ def parse_args():
     p.add_argument("--head_lr",      type=float, default=1e-3)
     p.add_argument("--num_classes",  type=int,   default=10,
                    help="Số classes của target (digit3=10, benign/malignant=2).")
-    p.add_argument("--cluster_input_only", action="store_true",
-                   help="Dùng chỉ input concept slots (bỏ op2 trivial và target slot)\n"
-                        "cho MATCH/CREATE/MERGE similarity.\n"
-                        "MNIST Math: cluster theo (d1,op,d2) = 25 dims.\n"
-                        "→ d3 noise không ảnh hưởng coverage.\n"
-                        "→ Mỗi expression riêng biệt được discover.")
 
     # General
     p.add_argument("--batch_size",   type=int,   default=512)
@@ -403,28 +397,13 @@ def main():
     print(f"[INFO] System1 loaded (frozen): {args.system1_ckpt}")
 
     # ── Stage 2: Build rule memory ──────────────────────────
-    # Resolve cluster_dims từ arg
-    if args.cluster_input_only:
-        from src.models.rule_memory import CONCEPT_OFFSETS, CONCEPT_DIMS
-        # Input slots: digit1(0:10) + op1(10:15) + digit2(15:25)
-        # Bỏ op2(25:30) trivial và digit3(30:40) target
-        _start = CONCEPT_OFFSETS["digit1"]
-        _end   = CONCEPT_OFFSETS["digit2"] + CONCEPT_DIMS["digit2"]  # 25
-        cluster_dims = (_start, _end)
-        print(f"[INFO] cluster_input_only: sim dims={cluster_dims} "
-              f"(digit1+op1+digit2, bỏ op2 và digit3)")
-    else:
-        cluster_dims = None
-        print(f"[INFO] cluster_dims: full vector ({CONCEPT_TOTAL_DIM} dims)")
-
     memory = ICRLRuleMemory(
-        concept_dim   = CONCEPT_TOTAL_DIM,
-        theta         = args.theta,
-        theta_merge   = args.theta_merge,
-        n_min         = args.n_min,
-        conf_min      = args.conf_min,
-        cluster_dims  = cluster_dims,
-        device        = str(device),
+        concept_dim  = CONCEPT_TOTAL_DIM,
+        theta        = args.theta,
+        theta_merge  = args.theta_merge,
+        n_min        = args.n_min,
+        conf_min     = args.conf_min,
+        device       = str(device),
     )
 
     print(f"\n[Stage 2] Building rule memory ({args.epochs} epochs)")
@@ -446,17 +425,8 @@ def main():
         if head is not None:
             update_rule_accuracy(system1, head, train_loader, memory, device, args.use_hard_cv)
 
-        # Prune strategy:
-        # Epoch < cuối: chỉ prune theo n_min (bỏ qua conf_min).
-        #   Lý do: accuracy signal từ quick head chưa tốt (head mới 5 epochs,
-        #   val_acc~0.21). Confidence = coherence × accuracy thấp dù cluster
-        #   hợp lệ → conf_min prune kills legitimate rules sớm.
-        # Epoch cuối: prune đầy đủ cả n_min và conf_min.
-        is_last_epoch = (epoch == args.epochs)
-        if is_last_epoch:
-            memory.prune(verbose=True)
-        else:
-            memory.prune(verbose=True, conf_min_override=0.0)
+        # Prune
+        memory.prune(verbose=True)
         print(f"  After prune: {memory.num_rules} rules")
         print(f"  Confidence: "
               f"mean={sum(memory.get_confidences())/max(1,memory.num_rules):.3f}  "
