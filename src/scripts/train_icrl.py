@@ -446,8 +446,17 @@ def main():
         if head is not None:
             update_rule_accuracy(system1, head, train_loader, memory, device, args.use_hard_cv)
 
-        # Prune
-        memory.prune(verbose=True)
+        # Prune strategy:
+        # Epoch < cuối: chỉ prune theo n_min (bỏ qua conf_min).
+        #   Lý do: accuracy signal từ quick head chưa tốt (head mới 5 epochs,
+        #   val_acc~0.21). Confidence = coherence × accuracy thấp dù cluster
+        #   hợp lệ → conf_min prune kills legitimate rules sớm.
+        # Epoch cuối: prune đầy đủ cả n_min và conf_min.
+        is_last_epoch = (epoch == args.epochs)
+        if is_last_epoch:
+            memory.prune(verbose=True)
+        else:
+            memory.prune(verbose=True, conf_min_override=0.0)
         print(f"  After prune: {memory.num_rules} rules")
         print(f"  Confidence: "
               f"mean={sum(memory.get_confidences())/max(1,memory.num_rules):.3f}  "

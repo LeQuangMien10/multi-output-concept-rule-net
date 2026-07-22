@@ -202,22 +202,29 @@ class ICRLRuleMemory:
             self._correct[r]    += int(pred == y)
             self._total_pred[r] += 1
 
-    def prune(self, verbose: bool = True) -> dict[str, int]:
+    def prune(self, verbose: bool = True,
+             conf_min_override: float | None = None) -> dict[str, int]:
         """
         Loại bỏ rules yếu và merge rules trùng lặp.
 
+        conf_min_override : ghi đè conf_min tạm thời.
+            0.0 = chỉ prune theo n_min, bỏ qua accuracy signal.
+            Dùng cho early epochs khi accuracy signal chưa đáng tin.
+
         Returns stats: removed_weak, removed_duplicate, merged, final_count
         """
+        conf_threshold = (conf_min_override if conf_min_override is not None
+                          else self.conf_min)
         initial = self.num_rules
         stats   = {"removed_weak": 0, "removed_duplicate": 0,
                    "merged": 0, "final_count": 0}
 
-        # ── 1. Mark yếu (n < n_min hoặc conf < conf_min) ──
+        # ── 1. Mark yếu (n < n_min hoặc conf < conf_threshold) ──
         keep_mask = []
         for i in range(self.num_rules):
             n    = self._n[i]
             conf = self._compute_conf(i)
-            keep = (n >= self.n_min) and (conf >= self.conf_min)
+            keep = (n >= self.n_min) and (conf >= conf_threshold)
             keep_mask.append(keep)
             if not keep:
                 stats["removed_weak"] += 1
