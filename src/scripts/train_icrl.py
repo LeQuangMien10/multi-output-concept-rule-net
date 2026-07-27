@@ -221,30 +221,38 @@ def update_rule_accuracy(
 # ─────────────────────────────────────────────────────────────
 
 def train_head(
-    system1:     MultiHeadSystem1,
-    memory:      ICRLRuleMemory,
+    system1:      MultiHeadSystem1,
+    memory:       ICRLRuleMemory,
     train_loader: DataLoader,
-    val_loader:  DataLoader,
-    num_classes: int,
-    epochs:      int,
-    lr:          float,
-    device:      torch.device,
-    use_hard:    bool = False,
+    val_loader:   DataLoader,
+    num_classes:  int,
+    epochs:       int,
+    lr:           float,
+    device:       torch.device,
+    use_hard:     bool = False,
 ) -> nn.Linear:
     """
-    Train linear head: concept_vec → class.
-    Head input = concept vector (D-dim), output = num_classes.
+    Train linear head: centroid[match(cv)] → class.
+
+    Thay vì head(cv), dùng head(centroid[matched_rule]):
+      - cv từ S1 có d3 slot noisy (42% ảnh sai d3)
+      - centroid = mean của 454+ ảnh → d3 slot ít nhiễu hơn
+      - head học từ centroid sạch → accuracy cao hơn S1 ceiling
+
+    Đây là cách ICRL khai thác rules: ảnh "5-2=3" với S1 sai d3=2
+    vẫn match vào rule "5-2=3" (d1,op,d2 đúng 80% score),
+    centroid của rule có d3≈3 → head predict đúng.
     """
     head = nn.Linear(CONCEPT_TOTAL_DIM, num_classes).to(device)
     opt  = torch.optim.AdamW(head.parameters(), lr=lr, weight_decay=1e-4)
 
-    best_val  = 0.0
+    best_val   = 0.0
     best_state = None
 
-    centroids = memory.get_centroids().to(device)   # [R, D]
-    rule_labels = torch.tensor(memory.get_labels(), dtype=torch.long, device=device)  # [R]
+    centroids = memory.get_centroids().to(device)   # [R, D] — frozen
 
     print(f"\n[Stage 3] Train prediction head ({epochs} epochs)")
+    print(f"  Inference: head(centroid[match(cv)]) — rule corrects S1 noise")
 
     for epoch in range(1, epochs + 1):
         # ── Train ──
@@ -254,11 +262,13 @@ def train_head(
         for images, labels in tqdm(train_loader, desc=f"  Head ep{epoch:2d}", leave=False):
             images = images.to(device)
             with torch.no_grad():
-                s1_out = system1(images)
-                cv     = logits_to_concept_vector(s1_out) if use_hard else soft_concept_vector(s1_out)
+                s1_out   = system1(images)
+                cv       = logits_to_concept_vector(s1_out) if use_hard else soft_concept_vector(s1_out)
+                rule_ids, _ = memory.match(cv)      # [B] — match cv → rule
+                rule_cvs = centroids[rule_ids]      # [B, D] — clean centroid
             y = labels["digit3"].to(device)
 
-            logits = head(cv)
+            logits = head(rule_cvs)                 # predict từ centroid
             loss   = F.cross_entropy(logits, y)
             opt.zero_grad(); loss.backward(); opt.step()
 
@@ -270,11 +280,13 @@ def train_head(
         val_correct = 0; val_total = 0
         with torch.no_grad():
             for images, labels in val_loader:
-                images = images.to(device)
-                s1_out = system1(images)
-                cv     = logits_to_concept_vector(s1_out) if use_hard else soft_concept_vector(s1_out)
-                y      = labels["digit3"].to(device)
-                preds  = head(cv).argmax(dim=1)
+                images   = images.to(device)
+                s1_out   = system1(images)
+                cv       = logits_to_concept_vector(s1_out) if use_hard else soft_concept_vector(s1_out)
+                y        = labels["digit3"].to(device)
+                rule_ids, _ = memory.match(cv)
+                rule_cvs = centroids[rule_ids]
+                preds    = head(rule_cvs).argmax(dim=1)
                 val_correct += (preds == y).sum().item()
                 val_total   += len(y)
 
@@ -303,18 +315,30 @@ def evaluate(
     head:     nn.Linear,
     loader:   DataLoader,
     device:   torch.device,
+    memory:   ICRLRuleMemory,
     split:    str = "test",
     use_hard: bool = False,
 ) -> dict[str, float]:
+    """
+    Inference: cv → match rule → head(centroid) → prediction.
+
+    Dùng centroid của matched rule thay vì cv trực tiếp:
+      - S1 sai d3 → cv noisy, nhưng d1/op/d2 đúng → match đúng rule
+      - centroid rule có d3 sạch hơn (mean 454+ ảnh)
+      - head(centroid) correct S1 noise → accuracy vượt S1 ceiling
+    """
     head.eval()
     correct = 0; total = 0
+    centroids = memory.get_centroids().to(device)   # [R, D]
 
     for images, labels in tqdm(loader, desc=f"  Eval {split}", leave=False):
-        images = images.to(device)
-        s1_out = system1(images)
-        cv     = logits_to_concept_vector(s1_out) if use_hard else soft_concept_vector(s1_out)
-        y      = labels["digit3"].to(device)
-        preds  = head(cv).argmax(dim=1)
+        images   = images.to(device)
+        s1_out   = system1(images)
+        cv       = logits_to_concept_vector(s1_out) if use_hard else soft_concept_vector(s1_out)
+        y        = labels["digit3"].to(device)
+        rule_ids, _ = memory.match(cv)              # [B]
+        rule_cvs = centroids[rule_ids]              # [B, D]
+        preds    = head(rule_cvs).argmax(dim=1)
         correct += (preds == y).sum().item()
         total   += len(y)
 
@@ -477,8 +501,8 @@ def main():
 
     # ── Evaluate ────────────────────────────────────────────
     print("\n[INFO] Evaluating...")
-    test_metrics = evaluate(system1, head, test_loader, device, "test", args.use_hard_cv)
-    val_metrics  = evaluate(system1, head, val_loader,  device, "val",  args.use_hard_cv)
+    test_metrics = evaluate(system1, head, test_loader, device, memory, "test", args.use_hard_cv)
+    val_metrics  = evaluate(system1, head, val_loader,  device, memory, "val",  args.use_hard_cv)
 
     print(f"\n[DONE] Results:")
     print(f"  val_accuracy  = {val_metrics['accuracy']:.4f}")
