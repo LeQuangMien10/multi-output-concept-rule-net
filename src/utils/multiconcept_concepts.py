@@ -67,6 +67,35 @@ NUM_CONCEPTS: int = len(CONCEPT_NAMES)
 LABEL_NAMES: list[str] = ["non_neoplastic", "benign", "malignant"]
 NUM_LABELS: int = len(LABEL_NAMES)
 
+
+# ─────────────────────────────────────────────────────────────
+# Layout của FULL concept vector dùng cho ICRL clustering — nhãn được
+# S1 dự đoán như MỘT CONCEPT nữa (softmax 3-way), nối vào sau 16 concept
+# nhị phân, giống hệt cách digit3 nằm trong concept vector 40-dim của
+# MNIST Math (xem rule_memory.py::CONCEPT_OFFSETS/CONCEPT_DIMS).
+#
+# QUAN TRỌNG: slot này chỉ dùng để MATCH/CLUSTER (Stage 2). Nhãn dùng để
+# train prediction head (Stage 3) vẫn PHẢI lấy từ memory.get_labels()
+# (ground-truth ngoài, tracked riêng qua y trong process_batch) — không
+# bao giờ đọc trực tiếp giá trị slot này làm nhãn train, vì đó chính là
+# lỗi đã phải fix ở MNIST Math (slot mang nhiễu của S1, không phải sự thật).
+# ─────────────────────────────────────────────────────────────
+
+S1_LABEL_CONCEPT_KEY: str = "s1_label_pred"
+
+FULL_CONCEPT_KEYS: list[str] = CONCEPT_NAMES + [S1_LABEL_CONCEPT_KEY]
+
+FULL_CONCEPT_DIMS: dict[str, int] = {name: 1 for name in CONCEPT_NAMES}
+FULL_CONCEPT_DIMS[S1_LABEL_CONCEPT_KEY] = NUM_LABELS
+
+FULL_CONCEPT_OFFSETS: dict[str, int] = {}
+_off = 0
+for _name in FULL_CONCEPT_KEYS:
+    FULL_CONCEPT_OFFSETS[_name] = _off
+    _off += FULL_CONCEPT_DIMS[_name]
+
+FULL_CV_DIM: int = _off   # NUM_CONCEPTS + NUM_LABELS = 16 + 3 = 19
+
 # Bias mặc định (khi không concept nào kích hoạt) — thiên về non_neoplastic,
 # giống phân bố lệch thật của Fitzpatrick (73% non-neoplastic).
 LABEL_BIAS: list[float] = [1.0, -0.5, -1.0]

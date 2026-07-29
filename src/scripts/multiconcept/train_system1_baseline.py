@@ -1,14 +1,21 @@
 """
-train_multiconcept_system1_baseline.py — Train S1 cho MNIST-MultiConcept
-==========================================================================
+train_system1_baseline.py — Train S1 cho MNIST-MultiConcept
+==============================================================
 
-S1 chỉ học predict CONCEPT (multi-label, sigmoid) — KHÔNG học nhãn đích 3 lớp
-(non_neoplastic/benign/malignant), vì trong thiết kế tổng quát (khớp Fitzpatrick),
-nhãn đích nằm HOÀN TOÀN ngoài concept vector, không có "slot" nào trong concept
-đại diện cho nó (khác MNIST Math nơi digit3 vừa là target vừa là 1 slot concept).
+S1 học 2 việc song song, cả hai đều là "concept" theo đúng tinh thần MNIST
+Math (digit3 vừa là target vừa là 1 slot trong concept vector):
+  - concept_head : 16 concept thị giác nhị phân (multi-label, sigmoid),
+                    chỉ supervised trên concept_mask=1 (~25% train, mô
+                    phỏng SkinCon ~22% coverage).
+  - label_head   : nhãn 3 lớp (non_neoplastic/benign/malignant), supervised
+                    FULL (100% ảnh luôn có nhãn, giống Fitzpatrick thật —
+                    three_partition_label có ở mọi ảnh, chỉ SkinCon concept
+                    mới khan hiếm).
 
-Chỉ concept_mask=1 (mô phỏng SkinCon ~22% coverage trên train) mới đóng góp
-vào loss — val/test luôn concept_mask=1 (đánh giá công bằng).
+Output của label_head sẽ được nối vào concept vector ở Stage 2 (ICRL) để
+cluster — xem soft_concept_vector trong models/multiconcept/system1.py.
+Nhãn dùng để train prediction head Stage 3 vẫn lấy từ memory.get_labels()
+(ground-truth ngoài), KHÔNG đọc trực tiếp label_head.
 
 Usage (Kaggle mặc định, override --data_dir nếu chạy local):
     python -m src.scripts.multiconcept.train_system1_baseline \\
@@ -29,7 +36,7 @@ from tqdm import tqdm
 
 from src.datasets.multiconcept.mnist_multiconcept_dataset import MNISTMultiConceptPTDataset
 from src.models.multiconcept.system1 import MultiConceptSystem1
-from src.utils.multiconcept_concepts import NUM_CONCEPTS
+from src.utils.multiconcept_concepts import NUM_CONCEPTS, NUM_LABELS
 from src.utils.seed import set_seed
 
 
@@ -51,9 +58,10 @@ def parse_args():
 
     p.add_argument("--feature_dim",  type=int, default=256)
     p.add_argument("--num_concepts", type=int, default=NUM_CONCEPTS)
+    p.add_argument("--num_labels",   type=int, default=NUM_LABELS)
 
     p.add_argument("--monitor", type=str, default="concept_macro_f1",
-                    choices=["concept_macro_f1", "concept_mean_acc"],
+                    choices=["concept_macro_f1", "concept_mean_acc", "label_acc"],
                     help="Metric dùng để lưu best checkpoint.")
 
     return p.parse_args()
@@ -119,9 +127,12 @@ def train_one_epoch(model, loader, optimizer, device):
         images       = images.to(device)
         concepts     = labels["concepts"].to(device)
         concept_mask = labels["concept_mask"].to(device)
+        target_label = labels["label"].to(device)
 
-        logits = model(images)
-        loss   = masked_bce_loss(logits, concepts, concept_mask)
+        out = model(images)
+        concept_loss = masked_bce_loss(out["concepts"], concepts, concept_mask)
+        label_loss   = F.cross_entropy(out["label"], target_label)   # full supervision
+        loss = concept_loss + label_loss
 
         optimizer.zero_grad(); loss.backward(); optimizer.step()
 
@@ -134,24 +145,32 @@ def train_one_epoch(model, loader, optimizer, device):
 @torch.no_grad()
 def evaluate(model, loader, device, split_name="Val"):
     model.eval()
-    all_logits, all_targets = [], []
+    all_concept_logits, all_concept_targets = [], []
+    label_correct, label_total = 0, 0
     total_loss, total_n = 0.0, 0
 
     for images, labels in tqdm(loader, desc=split_name, leave=False):
         images       = images.to(device)
         concepts     = labels["concepts"].to(device)
         concept_mask = labels["concept_mask"].to(device)
+        target_label = labels["label"].to(device)
 
-        logits = model(images)
-        loss   = masked_bce_loss(logits, concepts, concept_mask)
+        out = model(images)
+        concept_loss = masked_bce_loss(out["concepts"], concepts, concept_mask)
+        label_loss   = F.cross_entropy(out["label"], target_label)
+        loss = concept_loss + label_loss
 
         total_loss += loss.item() * images.size(0)
         total_n    += images.size(0)
 
-        all_logits.append(logits.cpu())
-        all_targets.append(concepts.cpu())
+        all_concept_logits.append(out["concepts"].cpu())
+        all_concept_targets.append(concepts.cpu())
 
-    metrics = compute_concept_metrics(torch.cat(all_logits), torch.cat(all_targets))
+        label_correct += (out["label"].argmax(dim=1) == target_label).sum().item()
+        label_total   += images.size(0)
+
+    metrics = compute_concept_metrics(torch.cat(all_concept_logits), torch.cat(all_concept_targets))
+    metrics["label_acc"] = label_correct / label_total
     metrics["loss"] = total_loss / total_n
     return metrics
 
@@ -176,6 +195,7 @@ def main():
     model = MultiConceptSystem1(
         feature_dim=args.feature_dim,
         num_concepts=args.num_concepts,
+        num_labels=args.num_labels,
     ).to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -198,7 +218,8 @@ def main():
 
         print(f"train_loss={row['train_loss']:.4f} | val_loss={row['val_loss']:.4f} | "
               f"val_concept_macro_f1={row['val_concept_macro_f1']:.4f} | "
-              f"val_concept_mean_acc={row['val_concept_mean_acc']:.4f}")
+              f"val_concept_mean_acc={row['val_concept_mean_acc']:.4f} | "
+              f"val_label_acc={row['val_label_acc']:.4f}")
 
         monitored = val_metrics[args.monitor]
         if monitored > best_val_metric:
@@ -232,6 +253,7 @@ def main():
     print(f"  best_val_{args.monitor} = {best_val_metric:.4f}")
     print(f"  test_concept_macro_f1  = {test_metrics['concept_macro_f1']:.4f}")
     print(f"  test_concept_mean_acc  = {test_metrics['concept_mean_acc']:.4f}")
+    print(f"  test_label_acc         = {test_metrics['label_acc']:.4f}  (S1-alone baseline, so sánh với ICRL sau)")
 
 
 if __name__ == "__main__":

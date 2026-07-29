@@ -2,17 +2,23 @@
 train_icrl_multiconcept.py — ICRL Stage 2/3 cho MNIST-MultiConcept
 ======================================================================
 
-Giống train_icrl.py (MNIST Math) nhưng:
-  - concept vector là 16 concept nhị phân ĐỘC LẬP (sigmoid), không phải 5 slot
-    loại trừ nhau (softmax theo nhóm) -> cluster_dims=None dùng toàn bộ vector,
-    không có khái niệm "input-only slots" vs "target slot" (đúng thiết lập
-    Fitzpatrick: nhãn đích KHÔNG nằm trong concept vector).
-  - nhãn đích (--target_key mặc định "label", 3 lớp non_neoplastic/benign/
-    malignant) được sample từ softmax lúc sinh dataset -> cluster có thể
-    KHÔNG thuần khiết 100% (khác MNIST Math nơi digit3 tất định từ d1/op/d2).
+Giống train_icrl.py (MNIST Math), và NHÃN LÀ MỘT CONCEPT giống hệt digit3:
+  - S1 (MultiConceptSystem1) dự đoán 16 concept nhị phân ĐỘC LẬP (sigmoid)
+    + 1 label 3-way (softmax) -> concept vector FULL 19 chiều
+    (16 concept + 3 label), nối đúng thứ tự FULL_CONCEPT_OFFSETS trong
+    multiconcept_concepts.py. cluster_dims=None dùng toàn bộ 19 chiều để
+    match/cluster — giống hệt digit3 nằm trong concept vector 40-dim của
+    MNIST Math.
+  - nhãn đích (3 lớp non_neoplastic/benign/malignant) được sample từ softmax
+    lúc sinh dataset -> cluster có thể KHÔNG thuần khiết 100% (khác MNIST
+    Math nơi digit3 tất định từ d1/op/d2).
   - Stage 3 dùng đúng fix đã verify trên MNIST Math: train head trực tiếp
     trên R centroids với rule_labels = memory.get_labels() (majority-vote
-    ground-truth), weight_decay=0, đủ step để đạt separable fit.
+    ground-truth NGOÀI concept vector), weight_decay=0, đủ step để đạt
+    separable fit. QUAN TRỌNG: dù label đã là 1 slot trong concept vector
+    (dùng để match/cluster), Stage 3 vẫn KHÔNG được đọc trực tiếp slot đó
+    làm nhãn train — slot mang nhiễu của S1, memory.get_labels() mới là
+    sự thật. Đây chính là bài học đã fix ở MNIST Math, áp dụng lại ở đây.
 
 Usage (Kaggle mặc định, override --data_dir/--system1_ckpt nếu chạy local):
     python -m src.scripts.multiconcept.train_icrl \\
@@ -40,7 +46,11 @@ from src.models.multiconcept.system1 import (
 )
 from src.models.icrl_rule_memory import ICRLRuleMemory
 from src.utils.seed import set_seed
-from src.utils.multiconcept_concepts import CONCEPT_NAMES, NUM_CONCEPTS, LABEL_NAMES, NUM_LABELS
+from src.utils.multiconcept_concepts import (
+    CONCEPT_NAMES, NUM_CONCEPTS, LABEL_NAMES, NUM_LABELS,
+    FULL_CONCEPT_KEYS, FULL_CONCEPT_OFFSETS, FULL_CONCEPT_DIMS, FULL_CV_DIM,
+    S1_LABEL_CONCEPT_KEY,
+)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -87,7 +97,8 @@ def load_system1(ckpt_path: Path, device: torch.device) -> MultiConceptSystem1:
     saved_args  = ckpt.get("args", {})
     feature_dim = saved_args.get("feature_dim", 256)
     num_concepts = saved_args.get("num_concepts", NUM_CONCEPTS)
-    model = MultiConceptSystem1(feature_dim=feature_dim, num_concepts=num_concepts)
+    num_labels   = saved_args.get("num_labels", NUM_LABELS)
+    model = MultiConceptSystem1(feature_dim=feature_dim, num_concepts=num_concepts, num_labels=num_labels)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval().to(device)
     for p in model.parameters():
@@ -127,15 +138,19 @@ def build_rule_memory(
         images = images.to(device)
 
         with torch.no_grad():
-            concept_logits = system1(images)
+            s1_out = system1(images)   # dict: {"concepts": [B,16], "label": [B,3]}
 
-        cv = hard_concept_vector(concept_logits) if use_hard else soft_concept_vector(concept_logits)
+        cv = hard_concept_vector(s1_out) if use_hard else soft_concept_vector(s1_out)
 
-        # S1 confidence per sample: trung bình |sigmoid - 0.5| * 2 across concepts
-        # (0 = hoàn toàn không chắc, 1 = tuyệt đối chắc) — thay cho max-softmax-prob
-        # vốn chỉ áp dụng cho phân loại categorical.
-        probs = torch.sigmoid(concept_logits)
-        s1_conf = (2.0 * (probs - 0.5).abs()).mean(dim=1)   # [B]
+        # S1 confidence per sample: trung bình của 2 khối tín hiệu —
+        #   concept_conf: trung bình |sigmoid-0.5|*2 trên 16 concept nhị phân
+        #   label_conf:   max-softmax-prob của label 3-way
+        # (mirror "mean max-prob across slots" của MNIST Math, ở đây 2 khối
+        # concept-block và label-block được coi ngang nhau).
+        concept_probs = torch.sigmoid(s1_out["concepts"])
+        concept_conf  = (2.0 * (concept_probs - 0.5).abs()).mean(dim=1)   # [B]
+        label_conf    = F.softmax(s1_out["label"], dim=-1).max(dim=1).values  # [B]
+        s1_conf = (concept_conf + label_conf) / 2.0
 
         y = labels["label"].to(device)
 
@@ -165,11 +180,13 @@ def train_head(
     Xem giải thích chi tiết trong train_icrl.py::train_head (MNIST Math) —
     cùng nguyên tắc: nhãn train head = memory.get_labels() (majority-vote
     ground-truth per rule), weight_decay=0 để đạt separable fit trong ngân
-    sách step hợp lý. Ở MultiConcept, nguyên tắc này càng bắt buộc vì nhãn
-    đích không hề nằm trong concept vector — memory.get_labels() là nguồn
-    nhãn DUY NHẤT khả dụng để train head.
+    sách step hợp lý. Ở MultiConcept, nhãn GIỜ ĐÃ nằm trong concept vector
+    (slot s1_label_pred, dùng để match/cluster) — nhưng nguyên tắc vẫn giữ
+    nguyên: KHÔNG đọc slot đó làm nhãn train head, vì nó mang nhiễu của S1.
+    memory.get_labels() (ground-truth ngoài, tracked qua y lúc
+    process_batch) mới là nguồn nhãn hợp lệ duy nhất.
     """
-    head = nn.Linear(NUM_CONCEPTS, num_classes).to(device)
+    head = nn.Linear(FULL_CV_DIM, num_classes).to(device)
     opt  = torch.optim.AdamW(head.parameters(), lr=lr, weight_decay=0.0)
 
     best_val   = 0.0
@@ -195,8 +212,8 @@ def train_head(
         with torch.no_grad():
             for images, labels in val_loader:
                 images = images.to(device)
-                concept_logits = system1(images)
-                cv = hard_concept_vector(concept_logits) if use_hard else soft_concept_vector(concept_logits)
+                s1_out = system1(images)
+                cv = hard_concept_vector(s1_out) if use_hard else soft_concept_vector(s1_out)
                 y = labels["label"].to(device)
                 rule_ids, _ = memory.match(cv)
                 rule_cvs = centroids[rule_ids]
@@ -229,8 +246,8 @@ def evaluate(system1, head, loader, device, memory, split="test", use_hard=False
 
     for images, labels in tqdm(loader, desc=f"  Eval {split}", leave=False):
         images = images.to(device)
-        concept_logits = system1(images)
-        cv = hard_concept_vector(concept_logits) if use_hard else soft_concept_vector(concept_logits)
+        s1_out = system1(images)
+        cv = hard_concept_vector(s1_out) if use_hard else soft_concept_vector(s1_out)
         y = labels["label"].to(device)
         rule_ids, _ = memory.match(cv)
         rule_cvs = centroids[rule_ids]
@@ -242,20 +259,39 @@ def evaluate(system1, head, loader, device, memory, split="test", use_hard=False
 
 
 def export_rules(memory: ICRLRuleMemory, output_dir: Path, n_show: int = 20) -> None:
-    concept_offsets = {name: i for i, name in enumerate(CONCEPT_NAMES)}
-    concept_dims    = {name: 1 for name in CONCEPT_NAMES}
-
+    """
+    decode_rule trả về 2 khái niệm "nhãn" khác nhau cho mỗi rule — dễ nhầm,
+    cần phân biệt rõ khi đọc JSON:
+      - label_name          : decoded["label"] = majority-vote GROUND-TRUTH
+                               (memory.get_labels()) — đây là nhãn ĐÚNG, dùng
+                               để train Stage-3 head.
+      - s1_label_guess_name  : decoded["slots"]["s1_label_pred"] = giá trị
+                               S1 tự đoán (nằm trong centroid, chỉ dùng để
+                               match/cluster) — có thể SAI so với label_name,
+                               đặc biệt ở rule impure (xem is_palindrome,
+                               strictly_increasing trong phân tích trước).
+    So sánh 2 cột này chính là cách kiểm chứng "S1 đoán nhãn tốt tới đâu"
+    độc lập với "S2 sửa được bao nhiêu qua clustering".
+    """
     rules_data = []
     for r in range(memory.num_rules):
         decoded = memory.decode_rule(
             rule_id=r,
-            concept_keys=CONCEPT_NAMES,
-            concept_offsets=concept_offsets,
-            concept_dims=concept_dims,
+            concept_keys=FULL_CONCEPT_KEYS,
+            concept_offsets=FULL_CONCEPT_OFFSETS,
+            concept_dims=FULL_CONCEPT_DIMS,
             id_to_symbol=None,
         )
-        present = [k for k, v in decoded["slots"].items() if v["value"] == "present"]
+        present = [k for k, v in decoded["slots"].items()
+                   if k != S1_LABEL_CONCEPT_KEY and v["value"] == "present"]
+
+        s1_label_idx = int(decoded["slots"][S1_LABEL_CONCEPT_KEY]["value"])
+        s1_label_conf = decoded["slots"][S1_LABEL_CONCEPT_KEY]["confidence"]
+
         decoded["label_name"] = LABEL_NAMES[decoded["label"]] if 0 <= decoded["label"] < NUM_LABELS else "?"
+        decoded["s1_label_guess_name"] = LABEL_NAMES[s1_label_idx]
+        decoded["s1_label_guess_confidence"] = s1_label_conf
+        decoded["s1_label_agrees_with_truth"] = (LABEL_NAMES[s1_label_idx] == decoded["label_name"])
         decoded["present_concepts"] = present
         rules_data.append(decoded)
 
@@ -266,12 +302,17 @@ def export_rules(memory: ICRLRuleMemory, output_dir: Path, n_show: int = 20) -> 
         json.dump(rules_data, f, indent=2, ensure_ascii=False)
     print(f"\n[INFO] {len(rules_data)} rules exported to {json_path}")
 
+    n_agree = sum(1 for r in rules_data if r["s1_label_agrees_with_truth"])
+    print(f"[INFO] S1's own label guess (concept slot) agrees with ground-truth "
+          f"majority label: {n_agree}/{len(rules_data)} rules")
+
     print(f"\n[INFO] Top {min(n_show, len(rules_data))} rules (sorted by confidence):")
     for r in rules_data[:n_show]:
         bar = "█" * int(r["confidence"] * 20)
         concepts_str = "+".join(r["present_concepts"]) or "(none)"
-        print(f"  [{r['confidence']:.3f}] {r['label_name']:15s}  n={r['n']:4d}  "
-              f"coh={r['coherence']:.3f}  {concepts_str[:60]:60s}  {bar}")
+        agree = "=" if r["s1_label_agrees_with_truth"] else "≠"
+        print(f"  [{r['confidence']:.3f}] {r['label_name']:15s} (S1 {agree} {r['s1_label_guess_name']:15s})  "
+              f"n={r['n']:4d}  coh={r['coherence']:.3f}  {concepts_str[:50]:50s}  {bar}")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -303,12 +344,12 @@ def main():
     print(f"[INFO] System1 loaded (frozen): {args.system1_ckpt}")
 
     memory = ICRLRuleMemory(
-        concept_dim  = NUM_CONCEPTS,
+        concept_dim  = FULL_CV_DIM,   # 16 concept + 3 label-slot (nối như digit3 ở MNIST Math)
         theta        = args.theta,
         theta_merge  = args.theta_merge,
         n_min        = args.n_min,
         conf_min     = args.conf_min,
-        cluster_dims = None,   # toàn bộ 16 concept — không có "target slot" để loại trừ
+        cluster_dims = None,   # toàn bộ 19 chiều, bao gồm cả label slot
         device       = str(device),
     )
 
