@@ -221,61 +221,73 @@ def update_rule_accuracy(
 # ─────────────────────────────────────────────────────────────
 
 def train_head(
-    system1:      MultiHeadSystem1,
-    memory:       ICRLRuleMemory,
-    train_loader: DataLoader,
-    val_loader:   DataLoader,
-    num_classes:  int,
-    epochs:       int,
-    lr:           float,
-    device:       torch.device,
-    use_hard:     bool = False,
+    system1:     MultiHeadSystem1,
+    memory:      ICRLRuleMemory,
+    val_loader:  DataLoader,
+    num_classes: int,
+    epochs:      int,
+    lr:          float,
+    device:      torch.device,
+    use_hard:    bool = False,
+    steps_per_epoch: int = 250,
 ) -> nn.Linear:
     """
-    Train linear head: centroid[match(cv)] → class.
+    Train linear head trực tiếp trên R rule centroids (không lặp qua ảnh).
 
-    Thay vì head(cv), dùng head(centroid[matched_rule]):
-      - cv từ S1 có d3 slot noisy (42% ảnh sai d3)
-      - centroid = mean của 454+ ảnh → d3 slot ít nhiễu hơn
-      - head học từ centroid sạch → accuracy cao hơn S1 ceiling
+    rule_labels lấy từ memory.get_labels() — majority-vote GROUND-TRUTH
+    của các ảnh đã match vào từng rule trong Stage 2 — KHÔNG suy ra từ
+    bất kỳ slot nào trong concept vector.
 
-    Đây là cách ICRL khai thác rules: ảnh "5-2=3" với S1 sai d3=2
-    vẫn match vào rule "5-2=3" (d1,op,d2 đúng 80% score),
-    centroid của rule có d3≈3 → head predict đúng.
+    Lý do: nếu suy nhãn từ centroid (vd. argmax của target-slot khi target
+    tình cờ là 1 phần concept vector, như digit3 ở MNIST Math), nhãn đó
+    vẫn mang chính xác cái nhiễu của S1 mà ta đang cố sửa — với những rule
+    mà S1 nhầm HỆ THỐNG (không phải nhiễu ngẫu nhiên) trên toàn bộ ảnh
+    trong cluster, trung bình cộng không khử được lỗi, và head học lại
+    đúng cái sai đó.
+
+    Cách này cũng generalize sang domain không có target-slot trong concept
+    vector (vd. Fitzpatrick17k: 48 concept khám bệnh, nhãn ác/lành tính
+    hoàn toàn nằm ngoài concept vector) — memory.get_labels() là nguồn
+    nhãn duy nhất hợp lệ trong mọi trường hợp.
+
+    Vì chỉ train trên R điểm (rule centroids) thay vì toàn bộ train set,
+    mỗi "epoch" chạy `steps_per_epoch` bước full-batch gradient descent
+    để giữ số bước cập nhật tương đương phiên bản cũ (per-image, nhiều
+    epoch quét toàn bộ train loader).
+
+    weight_decay=0: tại inference, head CHỈ BAO GIỜ nhận đúng R vector
+    centroid này làm input (không nhận cv thô của ảnh) — nên "overfit"
+    khớp chính xác R điểm này chính là mục tiêu, không phải rủi ro cần
+    regularize. Đã verify thực nghiệm: R=113 điểm với nhãn đúng linearly
+    separable (đạt 100% train acc), nhưng weight_decay>0 cản trở việc
+    đạt margin cần thiết trong ngân sách step hợp lý — khiến head bị
+    under-fit và vẫn dự đoán sai đúng những rule "khó" (kể cả khi nhãn
+    đã đúng), dễ bị hiểu lầm là do nhãn/model vẫn còn lỗi.
     """
     head = nn.Linear(CONCEPT_TOTAL_DIM, num_classes).to(device)
-    opt  = torch.optim.AdamW(head.parameters(), lr=lr, weight_decay=1e-4)
+    opt  = torch.optim.AdamW(head.parameters(), lr=lr, weight_decay=0.0)
 
     best_val   = 0.0
     best_state = None
 
-    centroids = memory.get_centroids().to(device)   # [R, D] — frozen
+    centroids   = memory.get_centroids().to(device)                              # [R, D] — frozen
+    rule_labels = torch.tensor(memory.get_labels(), dtype=torch.long, device=device)  # [R]
 
-    print(f"\n[Stage 3] Train prediction head ({epochs} epochs)")
+    print(f"\n[Stage 3] Train prediction head trực tiếp trên {memory.num_rules} rule centroids "
+          f"({epochs} epochs x {steps_per_epoch} steps)")
+    print(f"  Nhãn: memory.get_labels() (majority-vote ground-truth mỗi rule)")
     print(f"  Inference: head(centroid[match(cv)]) — rule corrects S1 noise")
 
     for epoch in range(1, epochs + 1):
-        # ── Train ──
+        # ── Train: full-batch gradient descent trên R centroids ──
         head.train()
-        train_correct = 0; train_total = 0
-
-        for images, labels in tqdm(train_loader, desc=f"  Head ep{epoch:2d}", leave=False):
-            images = images.to(device)
-            with torch.no_grad():
-                s1_out   = system1(images)
-                cv       = logits_to_concept_vector(s1_out) if use_hard else soft_concept_vector(s1_out)
-                rule_ids, _ = memory.match(cv)      # [B] — match cv → rule
-                rule_cvs = centroids[rule_ids]      # [B, D] — clean centroid
-            y = labels["digit3"].to(device)
-
-            logits = head(rule_cvs)                 # predict từ centroid
-            loss   = F.cross_entropy(logits, y)
+        for _ in range(steps_per_epoch):
+            logits = head(centroids)                # [R, num_classes]
+            loss   = F.cross_entropy(logits, rule_labels)
             opt.zero_grad(); loss.backward(); opt.step()
+        train_acc = (logits.argmax(dim=1) == rule_labels).float().mean().item()
 
-            train_correct += (logits.argmax(dim=1) == y).sum().item()
-            train_total   += len(y)
-
-        # ── Val ──
+        # ── Val (trên ảnh thật, qua pipeline đầy đủ) ──
         head.eval()
         val_correct = 0; val_total = 0
         with torch.no_grad():
@@ -290,10 +302,9 @@ def train_head(
                 val_correct += (preds == y).sum().item()
                 val_total   += len(y)
 
-        train_acc = train_correct / train_total
-        val_acc   = val_correct   / val_total
+        val_acc = val_correct / val_total
 
-        print(f"  Ep {epoch:2d}/{epochs}: train_acc={train_acc:.4f}  val_acc={val_acc:.4f}")
+        print(f"  Ep {epoch:2d}/{epochs}: rule_train_acc={train_acc:.4f}  val_acc={val_acc:.4f}")
 
         if val_acc > best_val:
             best_val   = val_acc
@@ -488,7 +499,7 @@ def main():
 
     # ── Stage 3: Train prediction head ──────────────────────
     head = train_head(
-        system1, memory, train_loader, val_loader,
+        system1, memory, val_loader,
         num_classes=args.num_classes,
         epochs=args.head_epochs,
         lr=args.head_lr,
