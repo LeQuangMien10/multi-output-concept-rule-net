@@ -8,8 +8,14 @@ v2 — "Parity": concept và label liên hệ TRỰC TIẾP bằng 1 phép toán
 Ảnh: K=4 chữ số MNIST ghép ngang. Concept:
   - has_digit_0 .. has_digit_9 (10 concept): chữ số GIÁ TRỊ v có xuất hiện
     trong ảnh hay không (không phân biệt xuất hiện mấy lần).
-  - 3 decoy đơn giản, dễ nhận biết, KHÔNG ảnh hưởng nhãn: all_distinct,
-    has_repeated_digit, contains_closed_loop.
+
+  TẠM BỎ decoy (all_distinct/has_repeated_digit/contains_closed_loop, có ở
+  bản trước): dù các concept này về mặt toán học weight=0 với nhãn, chúng
+  vẫn tham gia vector dùng để cluster nên khiến việc đọc/kiểm tra rule bằng
+  mắt khó hơn (phải tự lọc bỏ concept nào là decoy mỗi lần xem). Bỏ tạm để
+  vòng phân tích hiện tại chỉ còn đúng 10 concept has_digit_X — mọi concept
+  hiện ra trong 1 rule đều liên quan trực tiếp đến nhãn, không cần lọc.
+  DECOY_CONCEPTS giữ lại dạng rỗng để dễ bật lại sau.
 
 Nhãn = so sánh số lượng chữ số lẻ vs chẵn trong 4 chữ số:
     n_odd > n_even  → "odd"
@@ -50,14 +56,12 @@ def _has_digit(value: int):
 
 DIGIT_CONCEPTS: list[str] = [f"has_digit_{v}" for v in range(10)]
 
-# Decoy: đơn giản, dễ nhận biết bằng mắt, KHÔNG đóng góp vào nhãn (weight=0).
-DECOY_CONCEPTS: list[str] = ["all_distinct", "has_repeated_digit", "contains_closed_loop"]
+# Tạm bỏ decoy — xem docstring đầu file. Giữ list rỗng để dễ bật lại sau
+# (chỉ cần thêm lại tên + hàm vào CONCEPT_FUNCS).
+DECOY_CONCEPTS: list[str] = []
 
 CONCEPT_FUNCS: dict[str, "callable"] = {
     **{f"has_digit_{v}": _has_digit(v) for v in range(10)},
-    "all_distinct":         lambda d: int(len(set(d)) == len(d)),
-    "has_repeated_digit":   lambda d: int(len(set(d)) < len(d)),
-    "contains_closed_loop": lambda d: int(any(x in (0, 6, 8, 9) for x in d)),
 }
 
 CONCEPT_NAMES: list[str] = DIGIT_CONCEPTS + DECOY_CONCEPTS

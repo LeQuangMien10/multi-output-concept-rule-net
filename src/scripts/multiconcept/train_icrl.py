@@ -3,24 +3,29 @@ train_icrl_multiconcept.py — ICRL Stage 2/3 cho MNIST-MultiConcept
 ======================================================================
 
 Giống train_icrl.py (MNIST Math), và NHÃN LÀ MỘT CONCEPT giống hệt digit3:
-  - S1 (MultiConceptSystem1) dự đoán 13 concept nhị phân ĐỘC LẬP (sigmoid)
-    + 1 label 3-way (softmax) -> concept vector FULL 16 chiều (13 concept +
-    3 label), nối đúng thứ tự FULL_CONCEPT_OFFSETS trong
-    multiconcept_concepts.py. Centroid VẪN lưu đủ 16 chiều (dùng cho
-    export_rules/so sánh s1_label_guess, Stage 3 head).
+  - S1 (MultiConceptSystem1) dự đoán N concept nhị phân ĐỘC LẬP (sigmoid)
+    + 1 label 3-way (softmax) -> concept vector FULL, nối đúng thứ tự
+    FULL_CONCEPT_OFFSETS trong multiconcept_concepts.py.
 
-  - cluster_dims = (0, NUM_CONCEPTS) — CHỈ 13 concept thị giác tham gia
-    MATCH/CREATE/MERGE, KHÔNG bao gồm slot label. Lý do (phát hiện qua kiểm
-    chứng thực nghiệm — xem hội thoại thiết kế): nếu để label tham gia
-    similarity, CÙNG một concept pattern has_digit_X có thể bị TÁCH thành
-    nhiều rule khác nhau, vì S1 vẫn "nhìn" ảnh gốc nên dự đoán label khác
-    nhau tuỳ digit nào bị lặp lại dù pattern concept giống hệt — đo được
-    35% pattern bị phân mảnh khi cluster_dims=None. Giới hạn về 13 chiều
-    concept đưa fraction "rule sai" (so với nhãn thật tính trực tiếp từ
-    digits) từ ~19% mẫu xuống còn ~1%. Đánh đổi: accuracy cuối giảm (do
-    head mất tín hiệu tinh của S1 để phân biệt sub-case) nhưng đổi lại mỗi
-    rule ứng với ĐÚNG MỘT concept pattern — ưu tiên diễn giải được đúng như
-    mục tiêu ban đầu của S2, không phải tối đa accuracy (S1 alone đã ~98%).
+  - cluster_dims = None — TOÀN BỘ vector (concept + label-slot) tham gia
+    MATCH/CREATE/MERGE, kể cả sau khi phát hiện 1 concept pattern has_digit_X
+    (vd. {2,3,4}) có thể bị TÁCH thành nhiều rule (S1 vẫn "nhìn" ảnh gốc,
+    dự đoán label khác nhau tuỳ digit nào bị lặp lại dù pattern concept giống
+    hệt). Từng thử giới hạn cluster_dims chỉ còn phần concept (loại label)
+    để ép mỗi pattern về đúng 1 rule — nhưng verify trực tiếp trên dữ liệu
+    thật (tracking digit nào bị lặp lại trong từng rule) cho thấy các rule
+    "tách" đó KHÔNG phải nhiễu: chúng bắt đúng sub-population thật mà
+    presence-only concept (has_digit_X chỉ ghi có/không, không ghi số lần
+    lặp) không thể phân biệt — vd. với pattern {2,3,4} (2 chẵn digit 2,4 +
+    1 lẻ digit 3), rule "even" bắt 100% ảnh có digit CHẴN bị lặp, rule
+    "equal" bắt 85% ảnh có digit LẺ (3) bị lặp — đúng logic toán (lặp digit
+    lẻ duy nhất → 2 lẻ+2 chẵn → equal). Giới hạn cluster_dims xoá bỏ đúng
+    tín hiệu thật này mà không thu lợi tương xứng — mất ~13 điểm accuracy
+    oan uổng để đổi lấy 1 ràng buộc hình thức ("1 rule = 1 presence-pattern")
+    không thật sự cần thiết cho tính đúng đắn. Giữ cluster_dims=None; theta
+    (bên dưới) đã tăng 0.85->0.93 mới là fix cho vấn đề THẬT (gộp nhầm 2
+    presence-pattern KHÁC NHAU thành 1 rule, không phải phân mảnh cùng 1
+    pattern).
 
   - nhãn đích (3 lớp even/equal/odd) TẤT ĐỊNH từ digits (đếm chẵn/lẻ) —
     impurity của cluster đến từ việc concept has_digit_X không ghi nhận số
@@ -360,22 +365,27 @@ def main():
     print(f"[INFO] System1 loaded (frozen): {args.system1_ckpt}")
 
     memory = ICRLRuleMemory(
-        concept_dim  = FULL_CV_DIM,   # 13 concept + 3 label-slot (nối như digit3 ở MNIST Math)
+        concept_dim  = FULL_CV_DIM,   # concept + label-slot (nối như digit3 ở MNIST Math)
         theta        = args.theta,
         theta_merge  = args.theta_merge,
         n_min        = args.n_min,
         conf_min     = args.conf_min,
-        # cluster_dims chỉ dùng 13 concept đầu (KHÔNG gồm s1_label_pred) cho
-        # MATCH/CREATE/MERGE. Lý do: nếu để label_pred tham gia similarity,
-        # cùng 1 presence-pattern has_digit_X (vd. {2,3,4}) có thể bị TÁCH
-        # thành 2+ rule khác nhau tuỳ digit nào bị lặp lại — S1 vẫn "nhìn"
-        # được ảnh gốc nên dự đoán label khác nhau dù concept pattern giống
-        # hệt nhau, kéo các ảnh cùng pattern rẽ sang rule khác nhau (đã đo
-        # thực nghiệm: 132/377 pattern bị phân mảnh khi để None). label_pred
-        # vẫn được lưu trong centroid (dùng để hiển thị/so sánh trong
-        # export_rules, Stage 3 head vẫn nhận đủ FULL_CV_DIM) — chỉ loại
-        # khỏi phép so khớp để giữ đúng 1 rule cho mỗi presence-pattern.
-        cluster_dims = (0, NUM_CONCEPTS),
+        # cluster_dims=None: dùng TOÀN BỘ vector (concept + label-slot) cho
+        # MATCH/CREATE/MERGE — đã thử giới hạn về riêng phần concept (loại
+        # label_pred) để tránh 1 presence-pattern has_digit_X (vd. {2,3,4})
+        # bị tách thành nhiều rule, nhưng verify trực tiếp trên dữ liệu thật
+        # (tracking digit nào bị lặp lại trong mỗi rule) cho thấy các rule
+        # "tách" đó KHÔNG phải nhiễu — chúng bắt đúng sub-population thật mà
+        # presence-only concept không thể phân biệt được (vd. rule "even" bắt
+        # 100% ảnh có digit chẵn bị lặp, rule "equal" bắt 85% ảnh có digit lẻ
+        # bị lặp — đúng logic, vì lặp digit lẻ duy nhất trong {even,even,odd}
+        # cho n_odd=n_even). Giới hạn cluster_dims xoá bỏ tín hiệu thật này
+        # (S1 nhìn được ảnh gốc, phân biệt được sub-case) mà không thu được
+        # lợi ích tương xứng — đổi lại mất ~13 điểm accuracy oan uổng. Giữ
+        # None; theta đã tăng 0.85->0.93 (bên dưới) mới là fix cho vấn đề
+        # thật (gộp nhầm 2 presence-pattern KHÁC NHAU, không phải phân mảnh
+        # cùng 1 pattern).
+        cluster_dims = None,
         device       = str(device),
     )
 

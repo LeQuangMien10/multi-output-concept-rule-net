@@ -12,9 +12,9 @@ cùng kích thước với MNIST Math để tái dùng backbone tương thích).
 
 Mỗi sample có:
   - concepts      [NUM_CONCEPTS]  multi-hot nhị phân: has_digit_0..9 (quyết
-                                   định nhãn) + 3 decoy (all_distinct,
-                                   has_repeated_digit, contains_closed_loop —
-                                   không ảnh hưởng nhãn)
+                                   định nhãn). Decoy (all_distinct/
+                                   has_repeated_digit/contains_closed_loop)
+                                   tạm bỏ — xem multiconcept_concepts.py.
   - concept_mask  scalar          1 nếu concept ground-truth được "công bố" cho
                                    sample này (chỉ áp dụng cho train, mô phỏng
                                    SkinCon chỉ phủ 22% ảnh Fitzpatrick — val/test
@@ -195,9 +195,10 @@ def generate_mnist_multiconcept_dataset(config: dict[str, Any]) -> None:
                    "has_digit_X concepts record PRESENCE only, losing "
                    "multiplicity info (e.g. (3,3,4,4) and (3,3,3,4) share the "
                    "same concept pattern {has_digit_3,has_digit_4} but differ "
-                   "in true label). 3 decoy concepts (all_distinct, "
-                   "has_repeated_digit, contains_closed_loop) contribute "
-                   "nothing to the label.",
+                   "in true label). Decoy concepts (all_distinct, "
+                   "has_repeated_digit, contains_closed_loop) temporarily "
+                   "removed -- see multiconcept_concepts.py -- to keep every "
+                   "concept shown in a rule directly relevant to the label.",
         "image_shape": [1, image_height, symbol_width * num_digits],
         "symbol_width": symbol_width,
         "image_height": image_height,
