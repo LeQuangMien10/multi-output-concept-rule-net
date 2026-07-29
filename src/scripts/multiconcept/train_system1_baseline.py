@@ -1,0 +1,238 @@
+"""
+train_multiconcept_system1_baseline.py — Train S1 cho MNIST-MultiConcept
+==========================================================================
+
+S1 chỉ học predict CONCEPT (multi-label, sigmoid) — KHÔNG học nhãn đích 3 lớp
+(non_neoplastic/benign/malignant), vì trong thiết kế tổng quát (khớp Fitzpatrick),
+nhãn đích nằm HOÀN TOÀN ngoài concept vector, không có "slot" nào trong concept
+đại diện cho nó (khác MNIST Math nơi digit3 vừa là target vừa là 1 slot concept).
+
+Chỉ concept_mask=1 (mô phỏng SkinCon ~22% coverage trên train) mới đóng góp
+vào loss — val/test luôn concept_mask=1 (đánh giá công bằng).
+
+Usage (Kaggle mặc định, override --data_dir nếu chạy local):
+    python -m src.scripts.multiconcept.train_system1_baseline \\
+        --data_dir /kaggle/input/mnist-multiconcept \\
+        --output_dir /kaggle/working/outputs/multiconcept_system1 \\
+        --epochs 40
+"""
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+
+import torch
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+
+from src.datasets.multiconcept.mnist_multiconcept_dataset import MNISTMultiConceptPTDataset
+from src.models.multiconcept.system1 import MultiConceptSystem1
+from src.utils.multiconcept_concepts import NUM_CONCEPTS
+from src.utils.seed import set_seed
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Train MultiConceptSystem1 (S1) baseline.")
+
+    # Kaggle-first defaults — override bằng đường dẫn local nếu cần.
+    p.add_argument("--data_dir", type=str, default="/kaggle/input/mnist-multiconcept",
+                    help="Thư mục chứa train.pt/valid.pt/test.pt. "
+                         "Mặc định trỏ Kaggle input; đổi sang path local (vd. data/mnist_multiconcept_v1) nếu chạy máy local.")
+    p.add_argument("--output_dir", type=str, default="/kaggle/working/outputs/multiconcept_system1")
+
+    p.add_argument("--epochs",       type=int,   default=40)
+    p.add_argument("--batch_size",   type=int,   default=128)
+    p.add_argument("--lr",           type=float, default=1e-3)
+    p.add_argument("--weight_decay", type=float, default=1e-4)
+    p.add_argument("--num_workers",  type=int,   default=2)
+    p.add_argument("--seed",         type=int,   default=42)
+
+    p.add_argument("--feature_dim",  type=int, default=256)
+    p.add_argument("--num_concepts", type=int, default=NUM_CONCEPTS)
+
+    p.add_argument("--monitor", type=str, default="concept_macro_f1",
+                    choices=["concept_macro_f1", "concept_mean_acc"],
+                    help="Metric dùng để lưu best checkpoint.")
+
+    return p.parse_args()
+
+
+def make_loaders(data_dir: Path, batch_size: int, num_workers: int):
+    train_dataset = MNISTMultiConceptPTDataset(data_dir / "train.pt")
+    val_dataset   = MNISTMultiConceptPTDataset(data_dir / "valid.pt")
+    test_dataset  = MNISTMultiConceptPTDataset(data_dir / "test.pt")
+
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
+                               num_workers=num_workers, pin_memory=True)
+    val_loader   = DataLoader(val_dataset, batch_size=batch_size, shuffle=False,
+                               num_workers=num_workers, pin_memory=True)
+    test_loader  = DataLoader(test_dataset, batch_size=batch_size, shuffle=False,
+                               num_workers=num_workers, pin_memory=True)
+
+    return train_loader, val_loader, test_loader
+
+
+def masked_bce_loss(concept_logits: torch.Tensor, concepts: torch.Tensor,
+                     concept_mask: torch.Tensor) -> torch.Tensor:
+    """
+    BCE trung bình theo concept, chỉ tính trên sample có concept_mask=1.
+    concept_logits, concepts: [B, C]   concept_mask: [B]
+    """
+    per_sample = F.binary_cross_entropy_with_logits(
+        concept_logits, concepts, reduction="none"
+    ).mean(dim=1)                                    # [B]
+    denom = concept_mask.sum().clamp(min=1.0)
+    return (per_sample * concept_mask).sum() / denom
+
+
+@torch.no_grad()
+def compute_concept_metrics(all_logits: torch.Tensor, all_targets: torch.Tensor) -> dict:
+    """Per-concept accuracy + macro-F1 trên toàn bộ split (luôn full supervision)."""
+    preds = (torch.sigmoid(all_logits) > 0.5).float()
+
+    tp = ((preds == 1) & (all_targets == 1)).sum(dim=0).float()
+    fp = ((preds == 1) & (all_targets == 0)).sum(dim=0).float()
+    fn = ((preds == 0) & (all_targets == 1)).sum(dim=0).float()
+
+    precision = tp / (tp + fp).clamp(min=1e-8)
+    recall    = tp / (tp + fn).clamp(min=1e-8)
+    f1        = 2 * precision * recall / (precision + recall).clamp(min=1e-8)
+    # Concept không xuất hiện dương lần nào trong split -> F1 không xác định, coi là 0
+    has_pos = (all_targets.sum(dim=0) > 0)
+    f1 = torch.where(has_pos, f1, torch.zeros_like(f1))
+
+    acc = (preds == all_targets).float().mean(dim=0)
+
+    return {
+        "concept_mean_acc": acc.mean().item(),
+        "concept_macro_f1": f1[has_pos].mean().item() if has_pos.any() else 0.0,
+    }
+
+
+def train_one_epoch(model, loader, optimizer, device):
+    model.train()
+    total_loss, total_n = 0.0, 0
+
+    for images, labels in tqdm(loader, desc="Train", leave=False):
+        images       = images.to(device)
+        concepts     = labels["concepts"].to(device)
+        concept_mask = labels["concept_mask"].to(device)
+
+        logits = model(images)
+        loss   = masked_bce_loss(logits, concepts, concept_mask)
+
+        optimizer.zero_grad(); loss.backward(); optimizer.step()
+
+        total_loss += loss.item() * images.size(0)
+        total_n    += images.size(0)
+
+    return {"loss": total_loss / total_n}
+
+
+@torch.no_grad()
+def evaluate(model, loader, device, split_name="Val"):
+    model.eval()
+    all_logits, all_targets = [], []
+    total_loss, total_n = 0.0, 0
+
+    for images, labels in tqdm(loader, desc=split_name, leave=False):
+        images       = images.to(device)
+        concepts     = labels["concepts"].to(device)
+        concept_mask = labels["concept_mask"].to(device)
+
+        logits = model(images)
+        loss   = masked_bce_loss(logits, concepts, concept_mask)
+
+        total_loss += loss.item() * images.size(0)
+        total_n    += images.size(0)
+
+        all_logits.append(logits.cpu())
+        all_targets.append(concepts.cpu())
+
+    metrics = compute_concept_metrics(torch.cat(all_logits), torch.cat(all_targets))
+    metrics["loss"] = total_loss / total_n
+    return metrics
+
+
+def main():
+    args = parse_args()
+    set_seed(args.seed)
+
+    data_dir   = Path(args.data_dir)
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"[INFO] Device: {device}")
+    print(f"[INFO] Data dir: {data_dir}")
+    print(f"[INFO] Output dir: {output_dir}")
+
+    train_loader, val_loader, test_loader = make_loaders(
+        data_dir=data_dir, batch_size=args.batch_size, num_workers=args.num_workers,
+    )
+
+    model = MultiConceptSystem1(
+        feature_dim=args.feature_dim,
+        num_concepts=args.num_concepts,
+    ).to(device)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+
+    best_val_metric = -1.0
+    history = []
+
+    for epoch in range(1, args.epochs + 1):
+        print(f"\nEpoch {epoch}/{args.epochs}")
+
+        train_metrics = train_one_epoch(model, train_loader, optimizer, device)
+        val_metrics   = evaluate(model, val_loader, device, split_name="Val")
+
+        row = {
+            "epoch": epoch,
+            **{f"train_{k}": v for k, v in train_metrics.items()},
+            **{f"val_{k}": v for k, v in val_metrics.items()},
+        }
+        history.append(row)
+
+        print(f"train_loss={row['train_loss']:.4f} | val_loss={row['val_loss']:.4f} | "
+              f"val_concept_macro_f1={row['val_concept_macro_f1']:.4f} | "
+              f"val_concept_mean_acc={row['val_concept_mean_acc']:.4f}")
+
+        monitored = val_metrics[args.monitor]
+        if monitored > best_val_metric:
+            best_val_metric = monitored
+            ckpt_path = output_dir / "best_model.pt"
+            torch.save({
+                "model_state_dict": model.state_dict(),
+                "args": vars(args),
+                "best_val_metric": best_val_metric,
+                "monitor": args.monitor,
+                "epoch": epoch,
+            }, ckpt_path)
+            print(f"[INFO] Saved best checkpoint ({args.monitor}={best_val_metric:.4f})")
+
+    best_ckpt = torch.load(output_dir / "best_model.pt", map_location=device, weights_only=False)
+    model.load_state_dict(best_ckpt["model_state_dict"])
+
+    test_metrics = evaluate(model, test_loader, device, split_name="Test")
+
+    results = {
+        "best_val_metric": best_val_metric,
+        "monitor": args.monitor,
+        "test_metrics": test_metrics,
+        "history": history,
+        "args": vars(args),
+    }
+    with open(output_dir / "metrics.json", "w", encoding="utf-8") as f:
+        json.dump(results, f, indent=2)
+
+    print("\n[DONE] MultiConcept System1 results:")
+    print(f"  best_val_{args.monitor} = {best_val_metric:.4f}")
+    print(f"  test_concept_macro_f1  = {test_metrics['concept_macro_f1']:.4f}")
+    print(f"  test_concept_mean_acc  = {test_metrics['concept_mean_acc']:.4f}")
+
+
+if __name__ == "__main__":
+    main()
