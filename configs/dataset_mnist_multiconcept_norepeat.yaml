@@ -1,0 +1,29 @@
+dataset:
+  name: mnist_multiconcept_norepeat_v1
+
+  # Sinh dataset luôn chạy LOCAL (không phải trên Kaggle) — sau khi sinh xong,
+  # zip output_dir và upload thủ công lên Kaggle Dataset.
+  root_dir: data
+  output_dir: data/mnist_multiconcept_norepeat_v1
+
+  train_size: 40000
+  val_size:   8000
+  test_size:  8000
+
+  num_digits:   4      # K chữ số MNIST ghép ngang -> ảnh 28x112 (khớp MNIST Math)
+  image_height: 28
+  symbol_width: 28
+
+  # Biến thể kiểm chứng: sample KHÔNG hoàn lại -> luôn đúng 4 giá trị phân biệt.
+  # has_digit_X khi đó ghi nhận ĐỦ thông tin (không mất bội số) -> nhãn tất
+  # định 100% từ concept nhìn thấy được -> không thể có 2 rule cùng pattern
+  # nhưng khác nhãn (đối chứng cho vấn đề mâu thuẫn rule đã phát hiện trên
+  # bản allow_repeated_digits=true).
+  allow_repeated_digits: false
+
+  # Tỉ lệ ảnh TRAIN được công bố concept ground-truth (mô phỏng SkinCon chỉ phủ
+  # ~22% ảnh Fitzpatrick17k). val/test luôn được công bố đầy đủ (đánh giá công bằng).
+  concept_supervision_ratio: 0.25
+
+  seed: 2026
+  save_format: pt

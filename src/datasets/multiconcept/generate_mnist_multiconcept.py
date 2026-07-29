@@ -84,11 +84,19 @@ def generate_split(
     image_height: int,
     concept_supervision_ratio: float,
     rng: random.Random,
+    allow_repeated_digits: bool = True,
 ) -> dict[str, torch.Tensor]:
     """
     concept_supervision_ratio: tỉ lệ sample được "công bố" concept ground-truth.
     Luôn = 1.0 cho val/test (đánh giá cần concept đầy đủ); chỉ giới hạn ở train
     để mô phỏng SkinCon chỉ phủ ~22% ảnh Fitzpatrick.
+
+    allow_repeated_digits=False: sample KHÔNG hoàn lại (rng.sample) -> luôn
+    đúng 4 giá trị phân biệt, has_digit_X ghi nhận đủ thông tin (không mất
+    bội số) -> nhãn tất định 100% từ concept nhìn thấy được, không thể có
+    2 rule cùng pattern nhưng khác nhãn. Dùng để kiểm chứng riêng biệt: liệu
+    mâu thuẫn rule đến từ đúng nguyên nhân "mất thông tin bội số" hay không,
+    trước khi quyết định có thêm concept has_digit_X_repeated hay không.
     """
     to_tensor = transforms.ToTensor()
 
@@ -99,7 +107,10 @@ def generate_split(
     digits_l     = []
 
     for _ in tqdm(range(split_size), desc=f"Generating {split_name}"):
-        digits = tuple(rng.randint(0, 9) for _ in range(num_digits))
+        if allow_repeated_digits:
+            digits = tuple(rng.randint(0, 9) for _ in range(num_digits))
+        else:
+            digits = tuple(rng.sample(range(10), num_digits))
 
         img = render_multiconcept_image(
             digits=digits,
@@ -144,6 +155,7 @@ def generate_mnist_multiconcept_dataset(config: dict[str, Any]) -> None:
     image_height = int(dataset_cfg.get("image_height", 28))
 
     concept_supervision_ratio = float(dataset_cfg.get("concept_supervision_ratio", 0.25))
+    allow_repeated_digits = bool(dataset_cfg.get("allow_repeated_digits", True))
 
     print("[INFO] Loading MNIST...")
     mnist_train = MNIST(root=root_dir, train=True, download=True, transform=None)
@@ -157,18 +169,21 @@ def generate_mnist_multiconcept_dataset(config: dict[str, Any]) -> None:
         mnist_dataset=mnist_train, digit_to_indices=train_digit_to_indices,
         num_digits=num_digits, symbol_width=symbol_width, image_height=image_height,
         concept_supervision_ratio=concept_supervision_ratio, rng=rng,
+        allow_repeated_digits=allow_repeated_digits,
     )
     val_data = generate_split(
         split_name="val", split_size=val_size,
         mnist_dataset=mnist_test, digit_to_indices=test_digit_to_indices,
         num_digits=num_digits, symbol_width=symbol_width, image_height=image_height,
         concept_supervision_ratio=1.0, rng=rng,   # val luôn full concept supervision
+        allow_repeated_digits=allow_repeated_digits,
     )
     test_data = generate_split(
         split_name="test", split_size=test_size,
         mnist_dataset=mnist_test, digit_to_indices=test_digit_to_indices,
         num_digits=num_digits, symbol_width=symbol_width, image_height=image_height,
         concept_supervision_ratio=1.0, rng=rng,   # test luôn full concept supervision
+        allow_repeated_digits=allow_repeated_digits,
     )
 
     torch.save(train_data, output_dir / "train.pt")
@@ -207,6 +222,16 @@ def generate_mnist_multiconcept_dataset(config: dict[str, Any]) -> None:
                            "extension is variable K per image (not all "
                            "dermatology images activate the same number of "
                            "concepts either).",
+        "allow_repeated_digits": allow_repeated_digits,
+        "allow_repeated_digits_note": (
+            "False: digits sampled WITHOUT replacement (always 4 distinct "
+            "values) -- has_digit_X then fully determines the digit multiset, "
+            "so label is a deterministic function of visible concepts with "
+            "zero information loss (no rule can contradict another sharing "
+            "the same concept pattern). True: digits sampled WITH replacement "
+            "-- has_digit_X loses multiplicity, which is the deliberate "
+            "source of cluster impurity (see purpose)."
+        ),
         "num_concepts": NUM_CONCEPTS,
         "concept_names": CONCEPT_NAMES,
         "digit_concepts": DIGIT_CONCEPTS,
