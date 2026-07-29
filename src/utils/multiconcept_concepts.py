@@ -2,28 +2,42 @@
 multiconcept_concepts.py — Định nghĩa concept + luật sinh nhãn cho MNIST-MultiConcept
 ========================================================================================
 
-Dataset trung gian giữa MNIST Math và Fitzpatrick17k. Khác với MNIST Math
-(5 slot loại trừ nhau, nhãn tất định từ digit1/op1/digit2), dataset này có:
+v2 — "Parity": concept và label liên hệ TRỰC TIẾP bằng 1 phép toán phổ quát
+(đếm), không phải bảng trọng số tùy ý phải tra cứu.
 
-  - Concept NHỊ PHÂN ĐỘC LẬP, không loại trừ nhau (giống 48 concept SkinCon)
-    — một ảnh có thể vừa has_repeated_digit vừa sum_high vừa contains_closed_loop.
-  - Tần suất concept LỆCH mạnh: có concept phổ biến (~60%) lẫn concept hiếm (~1-2%),
-    mô phỏng phổ tần suất Erythema (58%) vs Burrow (0.1%) của SkinCon.
-  - Nhãn đích (3 lớp, đặt tên song song với three_partition_label của Fitzpatrick:
-    non_neoplastic/benign/malignant) là hàm XÁC SUẤT của MỘT TẬP CON concept
-    (không phải toàn bộ) — các concept còn lại là "nhiễu"/không liên quan tới nhãn,
-    giống việc không phải concept da liễu nào cũng mang tính chẩn đoán.
-  - Nhãn được SAMPLE từ softmax (không lấy argmax) → cùng một concept vector có thể
-    ra nhãn khác nhau giữa các lần sample → rule-cluster KHÔNG thuần khiết 100% như
-    MNIST Math (nơi label = f(d1,op,d2) tất định tuyệt đối).
+Ảnh: K=4 chữ số MNIST ghép ngang. Concept:
+  - has_digit_0 .. has_digit_9 (10 concept): chữ số GIÁ TRỊ v có xuất hiện
+    trong ảnh hay không (không phân biệt xuất hiện mấy lần).
+  - 3 decoy đơn giản, dễ nhận biết, KHÔNG ảnh hưởng nhãn: all_distinct,
+    has_repeated_digit, contains_closed_loop.
 
-Vì ta biết trước z-score/weight thật, có thể so sánh định lượng rule mà ICRL học
-được với luật sinh thật — điều không thể làm trên Fitzpatrick thật.
+Nhãn = so sánh số lượng chữ số lẻ vs chẵn trong 4 chữ số:
+    n_odd > n_even  → "odd"
+    n_even > n_odd  → "even"
+    n_odd == n_even → "equal"
+
+Đây là hàm TẤT ĐỊNH, giống hệt digit3 = digit1 − digit2 của MNIST Math:
+chỉ cần biết "digit nào lẻ/chẵn" (kiến thức phổ thông), không cần bảng
+trọng số nào — is_palindrome trước đây "nặng 1.8 điểm về malignant" phải
+tra cứu mới biết; has_digit_3 present bây giờ "là lẻ" thì ai cũng thấy
+ngay không cần tra gì.
+
+Impurity của rule-cluster giờ xuất hiện TỰ NHIÊN, không cần sample từ
+softmax nữa: concept has_digit_X chỉ ghi nhận "có xuất hiện", MẤT thông
+tin về số lần lặp. Ví dụ (3,3,4,4) và (3,3,3,4) cho CÙNG concept pattern
+{has_digit_3, has_digit_4} nhưng nhãn thật khác nhau (equal vs odd) — mất
+thông tin khi nén ảnh → concept, đúng bản chất khiến concept y khoa
+(SkinCon) cũng không quyết định nhãn 100%, không phải nhiễu giả lập.
+
+Vì digit chẵn/lẻ đối xứng tuyệt đối, rule "odd" sẽ có centroid vừa
+has_digit_{lẻ} present cao vừa has_digit_{chẵn} ABSENT cao — "NOT" xuất
+hiện tự nhiên, không phải trọng số âm tùy ý.
+
+Ghi chú: K=4 cố định (thử nghiệm). Ý tưởng mở rộng: K thay đổi theo ảnh
+(giống ảnh da liễu không phải ảnh nào cũng activate cùng số concept) —
+để dành cho vòng lặp sau.
 """
 from __future__ import annotations
-
-import math
-import random
 
 
 # ─────────────────────────────────────────────────────────────
@@ -34,43 +48,75 @@ def _has_digit(value: int):
     return lambda d: int(value in d)
 
 
+DIGIT_CONCEPTS: list[str] = [f"has_digit_{v}" for v in range(10)]
+
+# Decoy: đơn giản, dễ nhận biết bằng mắt, KHÔNG đóng góp vào nhãn (weight=0).
+DECOY_CONCEPTS: list[str] = ["all_distinct", "has_repeated_digit", "contains_closed_loop"]
+
 CONCEPT_FUNCS: dict[str, "callable"] = {
-    "has_digit_0":          _has_digit(0),
-    "has_digit_7":          _has_digit(7),
-    "has_repeated_digit":   lambda d: int(len(set(d)) < len(d)),
+    **{f"has_digit_{v}": _has_digit(v) for v in range(10)},
     "all_distinct":         lambda d: int(len(set(d)) == len(d)),
-    "sum_high":             lambda d: int(sum(d) > 5 * len(d)),
-    "sum_low":              lambda d: int(sum(d) < 2 * len(d)),
+    "has_repeated_digit":   lambda d: int(len(set(d)) < len(d)),
     "contains_closed_loop": lambda d: int(any(x in (0, 6, 8, 9) for x in d)),
-    "majority_even":        lambda d: int(sum(1 for x in d if x % 2 == 0) > len(d) / 2),
-    "majority_odd":         lambda d: int(sum(1 for x in d if x % 2 == 1) > len(d) / 2),
-    "leftmost_is_max":      lambda d: int(d[0] == max(d)),
-    "rightmost_is_min":     lambda d: int(d[-1] == min(d)),
-    "strictly_increasing":  lambda d: int(all(d[i] < d[i + 1] for i in range(len(d) - 1))),
-    "strictly_decreasing":  lambda d: int(all(d[i] > d[i + 1] for i in range(len(d) - 1))),
-    "is_palindrome":        lambda d: int(tuple(d) == tuple(reversed(d))),
-    "has_pair_sum10":       lambda d: int(any(d[i] + d[j] == 10
-                                               for i in range(len(d))
-                                               for j in range(i + 1, len(d)))),
-    "max_digit_ge8":        lambda d: int(max(d) >= 8),
 }
 
-CONCEPT_NAMES: list[str] = list(CONCEPT_FUNCS.keys())
+CONCEPT_NAMES: list[str] = DIGIT_CONCEPTS + DECOY_CONCEPTS
 NUM_CONCEPTS: int = len(CONCEPT_NAMES)
 
+# Alias để tương thích code cũ gọi INFORMATIVE_CONCEPTS (= concept quyết định nhãn).
+INFORMATIVE_CONCEPTS: list[str] = DIGIT_CONCEPTS
+
 
 # ─────────────────────────────────────────────────────────────
-# Luật sinh nhãn — chỉ MỘT TẬP CON concept mang tính "chẩn đoán",
-# các concept còn lại có weight=0 (nhiễu/không liên quan tới nhãn).
+# Luật sinh nhãn — ĐẾM, không có trọng số nào để tra cứu.
 # ─────────────────────────────────────────────────────────────
 
-LABEL_NAMES: list[str] = ["non_neoplastic", "benign", "malignant"]
+LABEL_NAMES: list[str] = ["even", "equal", "odd"]
 NUM_LABELS: int = len(LABEL_NAMES)
+
+
+def label_of(digits: tuple[int, ...]) -> int:
+    """
+    So n_odd (số chữ số lẻ) với n_even (số chữ số chẵn) trong digits.
+    Tất định 100% — giống digit3 = digit1 − digit2 của MNIST Math.
+    """
+    n_odd = sum(1 for d in digits if d % 2 == 1)
+    n_even = len(digits) - n_odd
+    if n_odd > n_even:
+        return LABEL_NAMES.index("odd")
+    if n_even > n_odd:
+        return LABEL_NAMES.index("even")
+    return LABEL_NAMES.index("equal")
+
+
+def compute_concept_vector(digits: tuple[int, ...]) -> list[int]:
+    """digits (K chữ số) -> concept vector nhị phân [NUM_CONCEPTS]."""
+    return [CONCEPT_FUNCS[name](digits) for name in CONCEPT_NAMES]
+
+
+def label_distribution_for_pattern(present_digit_values: set[int], k: int = 4) -> dict[int, int]:
+    """
+    Diagnostic/debug: với đúng 1 concept pattern (tập giá trị digit xuất
+    hiện, bỏ qua decoy), liệt kê phân phối nhãn thật trên MỌI tổ hợp K
+    chữ số khớp CHÍNH XÁC tập giá trị đó (dùng để kiểm tra impurity tự
+    nhiên — xem phân tích trong hội thoại thiết kế).
+
+    Trả về {label_index: count}. Brute-force 10**k — chỉ dùng offline/debug,
+    không gọi trong training loop.
+    """
+    from itertools import product
+    from collections import Counter
+    counts = Counter()
+    target = frozenset(present_digit_values)
+    for combo in product(range(10), repeat=k):
+        if frozenset(combo) == target:
+            counts[label_of(combo)] += 1
+    return dict(counts)
 
 
 # ─────────────────────────────────────────────────────────────
 # Layout của FULL concept vector dùng cho ICRL clustering — nhãn được
-# S1 dự đoán như MỘT CONCEPT nữa (softmax 3-way), nối vào sau 16 concept
+# S1 dự đoán như MỘT CONCEPT nữa (softmax 3-way), nối vào sau 13 concept
 # nhị phân, giống hệt cách digit3 nằm trong concept vector 40-dim của
 # MNIST Math (xem rule_memory.py::CONCEPT_OFFSETS/CONCEPT_DIMS).
 #
@@ -94,66 +140,4 @@ for _name in FULL_CONCEPT_KEYS:
     FULL_CONCEPT_OFFSETS[_name] = _off
     _off += FULL_CONCEPT_DIMS[_name]
 
-FULL_CV_DIM: int = _off   # NUM_CONCEPTS + NUM_LABELS = 16 + 3 = 19
-
-# Bias mặc định (khi không concept nào kích hoạt) — thiên về non_neoplastic,
-# giống phân bố lệch thật của Fitzpatrick (73% non-neoplastic).
-LABEL_BIAS: list[float] = [1.0, -0.5, -1.0]
-
-# weight[concept] = [Δnon_neoplastic, Δbenign, Δmalignant]
-# Chỉ 8/16 concept có mặt ở đây — 8 concept còn lại weight=0 (decoy).
-LABEL_WEIGHTS: dict[str, list[float]] = {
-    "has_repeated_digit":   [0.0, 0.5, 1.2],
-    "sum_high":              [0.0, 0.3, 1.0],
-    "contains_closed_loop":  [0.0, 0.6, 0.3],
-    "strictly_increasing":   [0.0, 1.5, -1.5],   # concept hiếm, tín hiệu benign mạnh
-    "is_palindrome":         [0.0, -1.0, 1.8],   # concept hiếm, tín hiệu malignant mạnh
-    "has_pair_sum10":        [0.0, 0.2, 0.6],
-    "max_digit_ge8":         [0.0, 0.2, 0.7],
-    "has_digit_0":           [0.0, -0.4, -0.6],  # bảo vệ (giảm nguy cơ)
-}
-
-INFORMATIVE_CONCEPTS: list[str] = list(LABEL_WEIGHTS.keys())
-DECOY_CONCEPTS: list[str] = [c for c in CONCEPT_NAMES if c not in LABEL_WEIGHTS]
-
-
-def compute_concept_vector(digits: tuple[int, ...]) -> list[int]:
-    """digits (K chữ số) -> concept vector nhị phân [NUM_CONCEPTS]."""
-    return [CONCEPT_FUNCS[name](digits) for name in CONCEPT_NAMES]
-
-
-def compute_label_logits(concept_vec: list[int]) -> list[float]:
-    z = list(LABEL_BIAS)
-    for name, value in zip(CONCEPT_NAMES, concept_vec):
-        if value and name in LABEL_WEIGHTS:
-            w = LABEL_WEIGHTS[name]
-            z = [z[i] + w[i] for i in range(NUM_LABELS)]
-    return z
-
-
-def softmax(z: list[float]) -> list[float]:
-    m = max(z)
-    exps = [math.exp(x - m) for x in z]
-    s = sum(exps)
-    return [x / s for x in exps]
-
-
-def compute_label_probs(concept_vec: list[int]) -> list[float]:
-    return softmax(compute_label_logits(concept_vec))
-
-
-def sample_label(concept_vec: list[int], rng: random.Random) -> tuple[int, list[float]]:
-    """Sample nhãn (KHÔNG lấy argmax) từ phân phối xác suất thật.
-
-    Đây là nguồn gốc của cluster impurity: hai ảnh cùng concept vector
-    vẫn có thể ra 2 nhãn khác nhau, vì nhãn được rút mẫu ngẫu nhiên từ
-    p, không phải hàm tất định của concept.
-    """
-    probs = compute_label_probs(concept_vec)
-    r = rng.random()
-    cum = 0.0
-    for i, p in enumerate(probs):
-        cum += p
-        if r <= cum:
-            return i, probs
-    return len(probs) - 1, probs
+FULL_CV_DIM: int = _off   # NUM_CONCEPTS + NUM_LABELS = 13 + 3 = 16

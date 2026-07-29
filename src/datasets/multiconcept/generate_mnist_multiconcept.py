@@ -1,22 +1,29 @@
 """
-generate_mnist_multiconcept.py — Sinh dataset MNIST-MultiConcept
+generate_mnist_multiconcept.py — Sinh dataset MNIST-MultiConcept (v2 — Parity)
 ====================================================================
 
 Dataset trung gian giữa MNIST Math và Fitzpatrick17k — xem chi tiết thiết kế
-trong src/utils/multiconcept_concepts.py.
+trong src/utils/multiconcept_concepts.py. Nhãn = so n_odd vs n_even trong K
+chữ số (hàm ĐẾM tất định, không phải bảng trọng số) — tự-kiểm-chứng được
+bằng mắt giống hệt digit3 = digit1 − digit2 của MNIST Math.
 
 Ảnh: K chữ số MNIST ghép ngang [d1][d2]...[dK] (mặc định K=4 → 28×112,
 cùng kích thước với MNIST Math để tái dùng backbone tương thích).
 
 Mỗi sample có:
-  - concepts      [NUM_CONCEPTS]  multi-hot nhị phân (độc lập, không loại trừ nhau)
+  - concepts      [NUM_CONCEPTS]  multi-hot nhị phân: has_digit_0..9 (quyết
+                                   định nhãn) + 3 decoy (all_distinct,
+                                   has_repeated_digit, contains_closed_loop —
+                                   không ảnh hưởng nhãn)
   - concept_mask  scalar          1 nếu concept ground-truth được "công bố" cho
                                    sample này (chỉ áp dụng cho train, mô phỏng
                                    SkinCon chỉ phủ 22% ảnh Fitzpatrick — val/test
                                    luôn được công bố đầy đủ để đánh giá công bằng)
-  - label         scalar          nhãn 3 lớp, SAMPLE từ softmax (không tất định)
-  - label_probs   [3]             phân phối xác suất thật (ground-truth, chỉ để
-                                   phân tích/validate sau này — model không thấy)
+  - label         scalar          nhãn 3 lớp (even/equal/odd), TẤT ĐỊNH từ
+                                   digits — không sample xác suất nữa. Impurity
+                                   của rule-cluster xuất hiện tự nhiên từ việc
+                                   concept has_digit_X không ghi nhận số lần lặp
+                                   (xem docstring multiconcept_concepts.py)
 
 Usage:
     python -m src.scripts.multiconcept.make_dataset \\
@@ -41,12 +48,10 @@ from src.utils.multiconcept_concepts import (
     NUM_CONCEPTS,
     LABEL_NAMES,
     NUM_LABELS,
-    LABEL_BIAS,
-    LABEL_WEIGHTS,
-    INFORMATIVE_CONCEPTS,
+    DIGIT_CONCEPTS,
     DECOY_CONCEPTS,
     compute_concept_vector,
-    sample_label,
+    label_of,
 )
 
 
@@ -91,7 +96,6 @@ def generate_split(
     concepts_l   = []
     concept_mask = []
     labels_l     = []
-    label_probs  = []
     digits_l     = []
 
     for _ in tqdm(range(split_size), desc=f"Generating {split_name}"):
@@ -106,13 +110,9 @@ def generate_split(
         )
         images.append(to_tensor(img))
 
-        cvec = compute_concept_vector(digits)
-        label, probs = sample_label(cvec, rng)
-
-        concepts_l.append(cvec)
+        concepts_l.append(compute_concept_vector(digits))
         concept_mask.append(1 if rng.random() < concept_supervision_ratio else 0)
-        labels_l.append(label)
-        label_probs.append(probs)
+        labels_l.append(label_of(digits))
         digits_l.append(list(digits))
 
     return {
@@ -120,7 +120,6 @@ def generate_split(
         "concepts":     torch.tensor(concepts_l,   dtype=torch.float32),
         "concept_mask": torch.tensor(concept_mask, dtype=torch.float32),
         "label":        torch.tensor(labels_l,      dtype=torch.long),
-        "label_probs":  torch.tensor(label_probs,   dtype=torch.float32),
         "digits":       torch.tensor(digits_l,       dtype=torch.long),
     }
 
@@ -187,22 +186,34 @@ def generate_mnist_multiconcept_dataset(config: dict[str, Any]) -> None:
 
     meta = {
         "name": dataset_cfg.get("name", "mnist_multiconcept_v1"),
-        "task": "K MNIST digits -> multi-label concept vector -> probabilistic 3-way label",
-        "purpose": "bridge dataset between mnist_math and fitzpatrick17k "
-                   "(non-deterministic concept->label mapping, imbalanced multi-label "
-                   "concepts, partial concept supervision on train)",
+        "task": "K MNIST digits -> has_digit_0..9 concept vector -> label = "
+                "majority parity (n_odd vs n_even) among the K digits",
+        "purpose": "bridge dataset between mnist_math and fitzpatrick17k. "
+                   "label is a DETERMINISTIC, human-checkable function of the "
+                   "digits (count odd vs even) -- no weight table to look up, "
+                   "unlike v1. Cluster impurity emerges naturally because "
+                   "has_digit_X concepts record PRESENCE only, losing "
+                   "multiplicity info (e.g. (3,3,4,4) and (3,3,3,4) share the "
+                   "same concept pattern {has_digit_3,has_digit_4} but differ "
+                   "in true label). 3 decoy concepts (all_distinct, "
+                   "has_repeated_digit, contains_closed_loop) contribute "
+                   "nothing to the label.",
         "image_shape": [1, image_height, symbol_width * num_digits],
         "symbol_width": symbol_width,
         "image_height": image_height,
         "num_digits": num_digits,
+        "num_digits_note": "K is fixed for this experiment; a natural future "
+                           "extension is variable K per image (not all "
+                           "dermatology images activate the same number of "
+                           "concepts either).",
         "num_concepts": NUM_CONCEPTS,
         "concept_names": CONCEPT_NAMES,
-        "informative_concepts": INFORMATIVE_CONCEPTS,
+        "digit_concepts": DIGIT_CONCEPTS,
         "decoy_concepts": DECOY_CONCEPTS,
         "label_names": LABEL_NAMES,
         "num_labels": NUM_LABELS,
-        "label_bias": LABEL_BIAS,
-        "label_weights": LABEL_WEIGHTS,
+        "label_rule": "n_odd = count of odd digits among the K digits; "
+                      "n_odd > K/2 -> odd; n_odd < K/2 -> even; else -> equal",
         "concept_supervision_ratio_train": concept_supervision_ratio,
         "concept_supervision_ratio_val_test": 1.0,
         "seed": seed,
