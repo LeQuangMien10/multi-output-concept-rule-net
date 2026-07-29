@@ -367,6 +367,12 @@ class ICRLRuleMemory:
         """
         Inference: match concept_vecs → best rule indices.
 
+        Dùng _cluster_sim (tôn trọng cluster_dims) chứ không phải _cosine thô —
+        phải nhất quán với process_batch/prune (Stage 2), nếu không rule được
+        gộp theo cluster_dims giới hạn lúc build nhưng lại match theo toàn bộ
+        vector lúc infer, gây lệch: ảnh có thể bị match sang rule khác chỉ vì
+        khác nhau ở phần bị loại khỏi cluster_dims (vd. slot nhãn S1 tự đoán).
+
         Returns
         -------
         best_rule_ids : LongTensor[B]
@@ -377,7 +383,7 @@ class ICRLRuleMemory:
 
         concept_vecs = concept_vecs.to(self.device)
         centroids    = self.get_centroids()           # [R, D]
-        sims         = self._cosine(concept_vecs, centroids)  # [B, R]
+        sims         = self._cluster_sim(concept_vecs, centroids)  # [B, R]
         best_ids     = sims.argmax(dim=1)             # [B]
 
         return best_ids, (sims if return_scores else None)

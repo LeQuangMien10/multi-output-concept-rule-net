@@ -3,20 +3,34 @@ train_icrl_multiconcept.py — ICRL Stage 2/3 cho MNIST-MultiConcept
 ======================================================================
 
 Giống train_icrl.py (MNIST Math), và NHÃN LÀ MỘT CONCEPT giống hệt digit3:
-  - S1 (MultiConceptSystem1) dự đoán 16 concept nhị phân ĐỘC LẬP (sigmoid)
-    + 1 label 3-way (softmax) -> concept vector FULL 19 chiều
-    (16 concept + 3 label), nối đúng thứ tự FULL_CONCEPT_OFFSETS trong
-    multiconcept_concepts.py. cluster_dims=None dùng toàn bộ 19 chiều để
-    match/cluster — giống hệt digit3 nằm trong concept vector 40-dim của
-    MNIST Math.
-  - nhãn đích (3 lớp non_neoplastic/benign/malignant) được sample từ softmax
-    lúc sinh dataset -> cluster có thể KHÔNG thuần khiết 100% (khác MNIST
-    Math nơi digit3 tất định từ d1/op/d2).
+  - S1 (MultiConceptSystem1) dự đoán 13 concept nhị phân ĐỘC LẬP (sigmoid)
+    + 1 label 3-way (softmax) -> concept vector FULL 16 chiều (13 concept +
+    3 label), nối đúng thứ tự FULL_CONCEPT_OFFSETS trong
+    multiconcept_concepts.py. Centroid VẪN lưu đủ 16 chiều (dùng cho
+    export_rules/so sánh s1_label_guess, Stage 3 head).
+
+  - cluster_dims = (0, NUM_CONCEPTS) — CHỈ 13 concept thị giác tham gia
+    MATCH/CREATE/MERGE, KHÔNG bao gồm slot label. Lý do (phát hiện qua kiểm
+    chứng thực nghiệm — xem hội thoại thiết kế): nếu để label tham gia
+    similarity, CÙNG một concept pattern has_digit_X có thể bị TÁCH thành
+    nhiều rule khác nhau, vì S1 vẫn "nhìn" ảnh gốc nên dự đoán label khác
+    nhau tuỳ digit nào bị lặp lại dù pattern concept giống hệt — đo được
+    35% pattern bị phân mảnh khi cluster_dims=None. Giới hạn về 13 chiều
+    concept đưa fraction "rule sai" (so với nhãn thật tính trực tiếp từ
+    digits) từ ~19% mẫu xuống còn ~1%. Đánh đổi: accuracy cuối giảm (do
+    head mất tín hiệu tinh của S1 để phân biệt sub-case) nhưng đổi lại mỗi
+    rule ứng với ĐÚNG MỘT concept pattern — ưu tiên diễn giải được đúng như
+    mục tiêu ban đầu của S2, không phải tối đa accuracy (S1 alone đã ~98%).
+
+  - nhãn đích (3 lớp even/equal/odd) TẤT ĐỊNH từ digits (đếm chẵn/lẻ) —
+    impurity của cluster đến từ việc concept has_digit_X không ghi nhận số
+    lần lặp, không phải sample xác suất.
+
   - Stage 3 dùng đúng fix đã verify trên MNIST Math: train head trực tiếp
     trên R centroids với rule_labels = memory.get_labels() (majority-vote
     ground-truth NGOÀI concept vector), weight_decay=0, đủ step để đạt
     separable fit. QUAN TRỌNG: dù label đã là 1 slot trong concept vector
-    (dùng để match/cluster), Stage 3 vẫn KHÔNG được đọc trực tiếp slot đó
+    (lưu trong centroid), Stage 3 vẫn KHÔNG được đọc trực tiếp slot đó
     làm nhãn train — slot mang nhiễu của S1, memory.get_labels() mới là
     sự thật. Đây chính là bài học đã fix ở MNIST Math, áp dụng lại ở đây.
 
@@ -25,7 +39,7 @@ Usage (Kaggle mặc định, override --data_dir/--system1_ckpt nếu chạy loc
         --data_dir /kaggle/input/mnist-multiconcept \\
         --system1_ckpt /kaggle/working/outputs/multiconcept_system1/best_model.pt \\
         --output_dir /kaggle/working/outputs/multiconcept_icrl \\
-        --theta 0.85 --theta_merge 0.95 --n_min 5 --conf_min 0.1 \\
+        --theta 0.93 --theta_merge 0.97 --n_min 5 --conf_min 0.1 \\
         --epochs 3 --head_epochs 20
 """
 from __future__ import annotations
@@ -65,8 +79,10 @@ def parse_args():
     p.add_argument("--system1_ckpt", type=str, default="/kaggle/working/outputs/multiconcept_system1/best_model.pt")
     p.add_argument("--output_dir",   type=str, default="/kaggle/working/outputs/multiconcept_icrl")
 
-    p.add_argument("--theta",        type=float, default=0.85)
-    p.add_argument("--theta_merge",  type=float, default=0.95)
+    p.add_argument("--theta",        type=float, default=0.93,
+                    help="Đã tăng từ 0.85 (copy từ MNIST Math) — verify thực nghiệm cho thấy "
+                         "0.85 gây gộp nhầm pattern khác nhau (cos({2,3,4},{2,3,4,5})=0.866 > 0.85).")
+    p.add_argument("--theta_merge",  type=float, default=0.97)
     p.add_argument("--n_min",        type=int,   default=5)
     p.add_argument("--conf_min",     type=float, default=0.1)
 
@@ -344,12 +360,22 @@ def main():
     print(f"[INFO] System1 loaded (frozen): {args.system1_ckpt}")
 
     memory = ICRLRuleMemory(
-        concept_dim  = FULL_CV_DIM,   # 16 concept + 3 label-slot (nối như digit3 ở MNIST Math)
+        concept_dim  = FULL_CV_DIM,   # 13 concept + 3 label-slot (nối như digit3 ở MNIST Math)
         theta        = args.theta,
         theta_merge  = args.theta_merge,
         n_min        = args.n_min,
         conf_min     = args.conf_min,
-        cluster_dims = None,   # toàn bộ 19 chiều, bao gồm cả label slot
+        # cluster_dims chỉ dùng 13 concept đầu (KHÔNG gồm s1_label_pred) cho
+        # MATCH/CREATE/MERGE. Lý do: nếu để label_pred tham gia similarity,
+        # cùng 1 presence-pattern has_digit_X (vd. {2,3,4}) có thể bị TÁCH
+        # thành 2+ rule khác nhau tuỳ digit nào bị lặp lại — S1 vẫn "nhìn"
+        # được ảnh gốc nên dự đoán label khác nhau dù concept pattern giống
+        # hệt nhau, kéo các ảnh cùng pattern rẽ sang rule khác nhau (đã đo
+        # thực nghiệm: 132/377 pattern bị phân mảnh khi để None). label_pred
+        # vẫn được lưu trong centroid (dùng để hiển thị/so sánh trong
+        # export_rules, Stage 3 head vẫn nhận đủ FULL_CV_DIM) — chỉ loại
+        # khỏi phép so khớp để giữ đúng 1 rule cho mỗi presence-pattern.
+        cluster_dims = (0, NUM_CONCEPTS),
         device       = str(device),
     )
 

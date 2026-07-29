@@ -52,6 +52,14 @@ def parse_args():
     p.add_argument("--epochs",       type=int,   default=40)
     p.add_argument("--batch_size",   type=int,   default=128)
     p.add_argument("--lr",           type=float, default=1e-3)
+    p.add_argument("--label_lr_scale", type=float, default=0.2,
+                    help="LR của label_head = lr * label_lr_scale. label_head hội tụ "
+                         "nhanh hơn concept_head nhiều (task dễ hơn) nên cùng LR dễ "
+                         "overshoot gây val_label_acc sập định kỳ (quan sát thực nghiệm: "
+                         "val_loss vọt lên 3-5x giữa các epoch dù concept vẫn cải thiện đều).")
+    p.add_argument("--grad_clip_norm", type=float, default=1.0,
+                    help="Gradient clipping (max L2 norm) — chặn spike gradient hiếm gặp "
+                         "làm hỏng vài batch huấn luyện, cùng nguyên nhân bất ổn ở trên.")
     p.add_argument("--weight_decay", type=float, default=1e-4)
     p.add_argument("--num_workers",  type=int,   default=2)
     p.add_argument("--seed",         type=int,   default=42)
@@ -119,7 +127,7 @@ def compute_concept_metrics(all_logits: torch.Tensor, all_targets: torch.Tensor)
     }
 
 
-def train_one_epoch(model, loader, optimizer, device):
+def train_one_epoch(model, loader, optimizer, device, grad_clip_norm):
     model.train()
     total_loss, total_n = 0.0, 0
 
@@ -134,7 +142,11 @@ def train_one_epoch(model, loader, optimizer, device):
         label_loss   = F.cross_entropy(out["label"], target_label)   # full supervision
         loss = concept_loss + label_loss
 
-        optimizer.zero_grad(); loss.backward(); optimizer.step()
+        optimizer.zero_grad()
+        loss.backward()
+        if grad_clip_norm > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+        optimizer.step()
 
         total_loss += loss.item() * images.size(0)
         total_n    += images.size(0)
@@ -198,7 +210,16 @@ def main():
         num_labels=args.num_labels,
     ).to(device)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    label_head_params = list(model.label_head.parameters())
+    other_params = [p for p in model.parameters()
+                    if not any(p is q for q in label_head_params)]
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": other_params,      "lr": args.lr},
+            {"params": label_head_params, "lr": args.lr * args.label_lr_scale},
+        ],
+        weight_decay=args.weight_decay,
+    )
 
     best_val_metric = -1.0
     history = []
@@ -206,7 +227,7 @@ def main():
     for epoch in range(1, args.epochs + 1):
         print(f"\nEpoch {epoch}/{args.epochs}")
 
-        train_metrics = train_one_epoch(model, train_loader, optimizer, device)
+        train_metrics = train_one_epoch(model, train_loader, optimizer, device, args.grad_clip_norm)
         val_metrics   = evaluate(model, val_loader, device, split_name="Val")
 
         row = {
