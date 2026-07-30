@@ -39,7 +39,7 @@ Usage (Kaggle mac dinh, override neu chay local):
         --img_dir /kaggle/input/datasets/lquangmin/fitzpatrick17k/data/finalfitz17k \\
         --system1_ckpt /kaggle/working/outputs/fitzpatrick_system1/best_model.pt \\
         --output_dir /kaggle/working/outputs/fitzpatrick_icrl \\
-        --theta 0.886 --theta_merge 0.93 --n_min 5 --conf_min 0.1 \\
+        --theta 0.886 --theta_merge 0.93 --n_min 15 --conf_min 0.5 \\
         --epochs 3 --head_epochs 20
 """
 from __future__ import annotations
@@ -86,7 +86,10 @@ def parse_args():
                     help="Tang tu 5 -> 15 sau khi phan tich lan chay dau: 12/61 rule co n nho "
                          "(rieng biet ma khong on dinh -- live-majority label khac nhan da luu). "
                          "n_min cao hon loc bot duoi rule nho ngay tu Stage 2.")
-    p.add_argument("--conf_min", type=float, default=0.1)
+    p.add_argument("--conf_min", type=float, default=0.5,
+                    help="Tang tu 0.1 -> 0.5 sau khi accuracy tro nen y nghia (xem update_accuracy "
+                         "fix): 0.1 qua de, khong loc duoc rule gan-ngau-nhien (vd accuracy 30-50%%, "
+                         "confidence ~0.28-0.47). 0.5 loai rule co accuracy <~0.6-0.7 tuy coherence.")
 
     p.add_argument("--epochs", type=int, default=3,
                     help="So lan pass qua training set de build rule memory (Stage 2).")
