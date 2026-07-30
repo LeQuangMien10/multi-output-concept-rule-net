@@ -19,10 +19,11 @@ MUC TIEU DOI CHIEU: ~62.4% accuracy 3 lop (baseline paper goc Groh et al. 2021,
 VGG-16/ResNet-18 pretrained). Dat gan muc do la dau hieu pipeline dung, KHONG
 ky vong cao hon nhieu o lan chay dau.
 
-Usage (Kaggle mac dinh, override --data_dir/--img_dir neu chay local):
+Usage (Kaggle mac dinh, override --data_dir/--img_dir neu chay local hoac
+username/dataset slug khac):
     python -m src.scripts.fitzpatrick.train_system1_baseline \\
-        --data_dir /kaggle/input/fitzpatrick17k-prepared \\
-        --img_dir /kaggle/input/fitzpatrick17k/data/finalfitz17k \\
+        --data_dir /kaggle/input/datasets/lquangmin/fitzpatrick17k-prepared \\
+        --img_dir /kaggle/input/datasets/lquangmin/fitzpatrick17k/data/finalfitz17k \\
         --output_dir /kaggle/working/outputs/fitzpatrick_system1 \\
         --epochs 30
 """
@@ -46,9 +47,9 @@ from src.utils.seed import set_seed
 def parse_args():
     p = argparse.ArgumentParser(description="Train FitzpatrickSystem1 (S1) baseline.")
 
-    p.add_argument("--data_dir", type=str, default="/kaggle/input/fitzpatrick17k-prepared",
+    p.add_argument("--data_dir", type=str, default="/kaggle/input/datasets/lquangmin/fitzpatrick17k-prepared",
                     help="Thu muc chua train.csv/val.csv/test.csv/meta.json (output cua prepare_dataset.py).")
-    p.add_argument("--img_dir", type=str, default="/kaggle/input/fitzpatrick17k/data/finalfitz17k",
+    p.add_argument("--img_dir", type=str, default="/kaggle/input/datasets/lquangmin/fitzpatrick17k/data/finalfitz17k",
                     help="Thu muc chua *.jpg goc (ten file = md5hash.jpg).")
     p.add_argument("--output_dir", type=str, default="/kaggle/working/outputs/fitzpatrick_system1")
 
