@@ -261,7 +261,7 @@ class ICRLRuleMemory:
         stats["final_count"] = self.num_rules
 
         if verbose:
-            print(f"  [Prune] {initial} → {self.num_rules} rules | "
+            print(f"  [Prune] {initial} -> {self.num_rules} rules | "
                   f"weak={stats['removed_weak']} merged={stats['merged']}")
 
         return stats
