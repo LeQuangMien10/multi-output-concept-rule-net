@@ -82,7 +82,10 @@ def parse_args():
                          "rule contradiction/purity sau khi chay de xac nhan gia tri nay con hop ly "
                          "tren concept vector S1 THAT DU DOAN (co the khac ground-truth).")
     p.add_argument("--theta_merge", type=float, default=0.93)
-    p.add_argument("--n_min", type=int, default=5)
+    p.add_argument("--n_min", type=int, default=15,
+                    help="Tang tu 5 -> 15 sau khi phan tich lan chay dau: 12/61 rule co n nho "
+                         "(rieng biet ma khong on dinh -- live-majority label khac nhan da luu). "
+                         "n_min cao hon loc bot duoi rule nho ngay tu Stage 2.")
     p.add_argument("--conf_min", type=float, default=0.1)
 
     p.add_argument("--epochs", type=int, default=3,
@@ -216,6 +219,28 @@ def train_head(system1, memory, val_loader, num_classes, epochs, lr, device,
         head.load_state_dict(best_state)
     print(f"  Best val_acc = {best_val:.4f}")
     return head
+
+
+@torch.no_grad()
+def record_rule_accuracy(system1, head, memory, loader, device, use_hard=False):
+    """Goi memory.update_accuracy() -- buoc nay BI THIEU trong ban dau (ca
+    MultiConcept lan Fitzpatrick), khien field 'accuracy' trong icrl_rules.json
+    luon = 0.5 (gia tri trung lap mac dinh khi total_pred=0) va 'confidence'
+    xuat ra chi con la coherence*0.5, khong phan biet duoc rule tot/xau.
+
+    Dung val_loader (khong dung train) de danh gia rule co du doan dung tren
+    du lieu KHONG dung de build no hay khong -- trung thuc hon so voi do
+    tren chinh du lieu da dung de tao rule."""
+    centroids = memory.get_centroids().to(device)
+    for images, labels in tqdm(loader, desc="  Record rule accuracy", leave=False):
+        images = images.to(device)
+        s1_out = system1(images)
+        cv = hard_concept_vector(s1_out) if use_hard else soft_concept_vector(s1_out)
+        y = labels["label"].to(device)
+        rule_ids, _ = memory.match(cv)
+        rule_cvs = centroids[rule_ids]
+        preds = head(rule_cvs).argmax(dim=1)
+        memory.update_accuracy(cv, y, preds)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -352,6 +377,17 @@ def main():
         steps_per_epoch=args.head_steps_per_epoch,
     )
     torch.save(head.state_dict(), output_dir / "prediction_head.pt")
+
+    print("\n[Stage 3.5] Recording rule accuracy on val split "
+          "(fixes update_accuracy() previously never being called)")
+    record_rule_accuracy(system1, head, memory, val_loader, device, args.use_hard_cv)
+
+    print(f"\n[INFO] Final prune using real accuracy signal (conf_min={args.conf_min})")
+    memory.prune(verbose=True)   # khong override -- dung conf_min that, gio da co accuracy y nghia
+    print(f"  After final prune: {memory.num_rules} rules")
+
+    memory.save(memory_path)   # ghi de, phan anh dung trang thai cuoi cung (sau final prune)
+    print(f"[INFO] Rule memory re-saved after final prune: {memory_path}  ({memory.num_rules} rules)")
 
     print("\n[INFO] Evaluating...")
     test_metrics = evaluate(system1, head, test_loader, device, memory, "test", args.use_hard_cv)
