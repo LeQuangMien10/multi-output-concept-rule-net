@@ -19,12 +19,19 @@ MUC TIEU DOI CHIEU: ~62.4% accuracy 3 lop (baseline paper goc Groh et al. 2021,
 VGG-16/ResNet-18 pretrained). Dat gan muc do la dau hieu pipeline dung, KHONG
 ky vong cao hon nhieu o lan chay dau.
 
+BUOC 1 (sau khi phan tich lan train 30-epoch dau tien co dau hieu overfit ro
+va so sanh voi paper CRL MICCAI 2025 -- cung dataset Fitzpatrick17k+SkinCon):
+mac dinh gio dung cosine LR decay ve 0 (--lr_schedule cosine) + weight_decay
+cao hon (0.01, tang tu 1e-4). Giu nguyen 30 epoch de co lap dung 1 cau hoi:
+"chi rieng lich trinh LR + regularization tot hon co giup khong, voi cung
+ngan sach epoch hien tai?" -- dung --lr_schedule none de tai hien ket qua cu.
+
 Usage (Kaggle mac dinh, override --data_dir/--img_dir neu chay local hoac
 username/dataset slug khac):
     python -m src.scripts.fitzpatrick.train_system1_baseline \\
         --data_dir /kaggle/input/datasets/lquangmin/fitzpatrick17k-prepared \\
         --img_dir /kaggle/input/datasets/lquangmin/fitzpatrick17k/data/finalfitz17k \\
-        --output_dir /kaggle/working/outputs/fitzpatrick_system1 \\
+        --output_dir /kaggle/working/outputs/fitzpatrick_system1_v2 \\
         --epochs 30
 """
 from __future__ import annotations
@@ -69,7 +76,15 @@ def parse_args():
                          "can LR thap hon nhieu de khong pha vo dac trung da hoc; "
                          "head moi khoi tao can LR binh thuong de hoc nhanh.")
     p.add_argument("--grad_clip_norm", type=float, default=1.0)
-    p.add_argument("--weight_decay", type=float, default=1e-4)
+    p.add_argument("--weight_decay", type=float, default=0.01,
+                    help="Tang tu 1e-4 -> 0.01 (Buoc 1, theo paper CRL MICCAI 2025 -- cung dataset "
+                         "Fitzpatrick17k+SkinCon, ResNet pretrained). Ly do: lan train 30-epoch truoc "
+                         "co dau hieu overfit ro (val_loss cham day epoch 14 roi tang lien tuc trong "
+                         "khi train_loss van giam, du val_concept_macro_f1/val_label_acc van tang).")
+    p.add_argument("--lr_schedule", type=str, default="cosine", choices=["none", "cosine"],
+                    help="Buoc 1: 'cosine' (mac dinh) decay LR ve 0 theo cosine qua --epochs, "
+                         "giup chan dung overfit thay vi chi dua vao chon best-checkpoint. "
+                         "'none' = LR hang so nhu lan chay dau (de doi chieu/tai hien ket qua cu).")
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--seed", type=int, default=42)
 
@@ -240,6 +255,13 @@ def main():
         weight_decay=args.weight_decay,
     )
 
+    scheduler = None
+    if args.lr_schedule == "cosine":
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=0.0)
+        print(f"[INFO] LR schedule: cosine decay -> 0 over {args.epochs} epochs")
+    else:
+        print("[INFO] LR schedule: none (constant LR, nhu lan chay dau)")
+
     best_val_metric = -1.0
     history = []
 
@@ -248,6 +270,10 @@ def main():
 
         train_metrics = train_one_epoch(model, train_loader, optimizer, device, args.grad_clip_norm)
         val_metrics = evaluate(model, val_loader, device, split_name="Val")
+
+        if scheduler is not None:
+            scheduler.step()
+            print(f"  lr(backbone)={optimizer.param_groups[0]['lr']:.2e}  lr(head)={optimizer.param_groups[1]['lr']:.2e}")
 
         row = {
             "epoch": epoch,
