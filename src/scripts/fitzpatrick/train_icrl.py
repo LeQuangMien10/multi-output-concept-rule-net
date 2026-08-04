@@ -59,7 +59,7 @@ from src.models.fitzpatrick.system1 import FitzpatrickSystem1, soft_concept_vect
 from src.models.icrl_rule_memory import ICRLRuleMemory
 from src.utils.seed import set_seed
 from src.utils.fitzpatrick_concepts import (
-    LABEL_NAMES, NUM_LABELS,
+    LABEL_NAMES, NUM_LABELS, NUM_CONCEPTS,
     FULL_CONCEPT_KEYS, FULL_CONCEPT_OFFSETS, FULL_CONCEPT_DIMS, FULL_CV_DIM,
     S1_LABEL_CONCEPT_KEY,
 )
@@ -93,7 +93,19 @@ def parse_args():
 
     p.add_argument("--epochs", type=int, default=3,
                     help="So lan pass qua training set de build rule memory (Stage 2).")
-    p.add_argument("--use_hard_cv", action="store_true")
+    p.add_argument("--use_hard_cv", action="store_true",
+                    help="Buoc 0 (concept leakage, xem paper CRL MICCAI 2025): dung hard "
+                         "(nhi phan, threshold 0.5) concept vector thay vi soft (sigmoid/softmax "
+                         "probs) cho MATCH/CREATE/MERGE. Concept lien tuc co the 'leak' thong tin "
+                         "ngoai y concept vao rule, lam giam generalization (bang chung thuc "
+                         "nghiem cua paper tren chinh Fitzpatrick17k+SkinCon).")
+    p.add_argument("--exclude_label_slot", action="store_true",
+                    help="Buoc 0: bo s1_label_pred (nhan S1 tu du doan) khoi vector dung de "
+                         "MATCH/CREATE/MERGE (cluster_dims=(0,NUM_CONCEPTS) thay vi None). "
+                         "Kiem tra xem slot nay co dang 'leak' quyet dinh cua S1 vao rule khong "
+                         "-- CHU Y: MultiConcept da thu huong nay va BAC BO (mat ~13 diem accuracy "
+                         "khong co loi ich ro rang). Chay de xac nhan co nhat quan voi ket qua do "
+                         "khong, khong ky vong se ap dung mac dinh neu accuracy giam tuong tu.")
 
     p.add_argument("--head_epochs", type=int, default=20)
     p.add_argument("--head_lr", type=float, default=1e-3)
@@ -340,13 +352,16 @@ def main():
     )
     print(f"[INFO] Data: {args.data_dir}")
 
+    cluster_dims = (0, NUM_CONCEPTS) if args.exclude_label_slot else None
+    print(f"[INFO] cluster_dims={cluster_dims} (exclude_label_slot={args.exclude_label_slot})")
+
     memory = ICRLRuleMemory(
         concept_dim=FULL_CV_DIM,
         theta=args.theta,
         theta_merge=args.theta_merge,
         n_min=args.n_min,
         conf_min=args.conf_min,
-        cluster_dims=None,   # toan bo vector -- xem docstring dau file
+        cluster_dims=cluster_dims,   # None = toan bo vector; xem --exclude_label_slot help
         device=str(device),
     )
 
