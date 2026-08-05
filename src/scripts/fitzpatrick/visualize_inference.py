@@ -349,8 +349,15 @@ def main():
             pool = [i for i, c in enumerate(cats) if c == args.filter]
         if not pool:
             raise RuntimeError(f"Không tìm thấy ảnh nào khớp filter='{args.filter}' trong {args.split}.")
-        rng.shuffle(pool)
-        chosen = pool[:args.n_examples]
+        # Uu tien anh CO nhan concept that (concept_mask=1) -- de con thay
+        # mau xanh/do that su (dung/sai) thay vi toan xam "?" khong doi chieu
+        # duoc. Chi lay anh khong co nhan neu khong du so luong yeu cau.
+        labeled = [i for i in pool if rows[i]["concept_mask"] == "1"]
+        unlabeled = [i for i in pool if rows[i]["concept_mask"] != "1"]
+        rng.shuffle(labeled)
+        rng.shuffle(unlabeled)
+        print(f"[INFO] {len(labeled)}/{len(pool)} images in pool have real concept GT -- prioritized first.")
+        chosen = (labeled + unlabeled)[:args.n_examples]
 
     print(f"[INFO] Drawing {len(chosen)} images: {chosen}")
 
