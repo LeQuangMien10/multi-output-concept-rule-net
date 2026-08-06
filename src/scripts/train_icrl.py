@@ -273,9 +273,9 @@ def train_head(
     centroids   = memory.get_centroids().to(device)                              # [R, D] — frozen
     rule_labels = torch.tensor(memory.get_labels(), dtype=torch.long, device=device)  # [R]
 
-    print(f"\n[Stage 3] Train prediction head trực tiếp trên {memory.num_rules} rule centroids "
+    print(f"\n[Stage 3] Train prediction head truc tiep tren {memory.num_rules} rule centroids "
           f"({epochs} epochs x {steps_per_epoch} steps)")
-    print(f"  Nhãn: memory.get_labels() (majority-vote ground-truth mỗi rule)")
+    print(f"  Nhan: memory.get_labels() (majority-vote ground-truth moi rule)")
     print(f"  Inference: head(centroid[match(cv)]) — rule corrects S1 noise")
 
     for epoch in range(1, epochs + 1):
@@ -394,7 +394,7 @@ def export_rules(
     # Print top rules
     print(f"\n[INFO] Top {min(n_show, len(rules_data))} rules (sorted by confidence):")
     for r in rules_data[:n_show]:
-        bar = "█" * int(r["confidence"] * 20)
+        bar = "#" * int(r["confidence"] * 20)
         print(f"  [{r['confidence']:.3f}] {r['rule_string']:20s}  "
               f"n={r['n']:4d}  coh={r['coherence']:.3f}  acc={r['accuracy']:.3f}  {bar}")
 
@@ -404,7 +404,7 @@ def export_rules(
     print(f"\n  Confidence distribution ({len(rules_data)} rules):")
     for lo, hi in bins:
         n = sum(1 for c in confs if lo <= c < hi)
-        print(f"    [{lo:.1f},{hi:.1f}): {n:3d}  {'█'*n}")
+        print(f"    [{lo:.1f},{hi:.1f}): {n:3d}  {'#'*n}")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -423,7 +423,7 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"[INFO] Device: {device}")
-    print(f"[INFO] ICRL params: θ={args.theta}  θ_merge={args.theta_merge}  "
+    print(f"[INFO] ICRL params: theta={args.theta}  theta_merge={args.theta_merge}  "
           f"n_min={args.n_min}  conf_min={args.conf_min}")
 
     # ── Data ────────────────────────────────────────────────
@@ -447,7 +447,7 @@ def main():
         _end   = CONCEPT_OFFSETS["digit2"] + CONCEPT_DIMS["digit2"]  # 25
         cluster_dims = (_start, _end)
         print(f"[INFO] cluster_input_only: sim dims={cluster_dims} "
-              f"(digit1+op1+digit2, bỏ op2 và digit3)")
+              f"(digit1+op1+digit2, bo op2 va digit3)")
     else:
         cluster_dims = None
         print(f"[INFO] cluster_dims: full vector ({CONCEPT_TOTAL_DIM} dims)")
@@ -509,6 +509,23 @@ def main():
 
     # Save head
     torch.save(head.state_dict(), output_dir / "prediction_head.pt")
+
+    # ── Stage 3.5: Record rule accuracy (fixes update_rule_accuracy() ─────
+    # previously being defined but never called — same bug found & fixed in
+    # MultiConcept/Fitzpatrick's train_icrl.py. Without this, 'accuracy'
+    # stays at its neutral default (0.5) for every rule, so 'confidence'
+    # (coherence * accuracy) never actually distinguishes reliable rules
+    # from noisy ones. Use val (not train) to score honestly.
+    print("\n[Stage 3.5] Recording rule accuracy on val split "
+          "(fixes update_rule_accuracy() previously being defined but never called)")
+    update_rule_accuracy(system1, head, val_loader, memory, device, args.use_hard_cv)
+
+    print(f"\n[INFO] Final prune using real accuracy signal (conf_min={args.conf_min})")
+    memory.prune(verbose=True)
+    print(f"  After final prune: {memory.num_rules} rules")
+
+    memory.save(memory_path)   # re-save, reflects final post-prune state
+    print(f"[INFO] Rule memory re-saved after final prune: {memory_path}  ({memory.num_rules} rules)")
 
     # ── Evaluate ────────────────────────────────────────────
     print("\n[INFO] Evaluating...")

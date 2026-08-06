@@ -216,9 +216,9 @@ def train_head(
     centroids   = memory.get_centroids().to(device)
     rule_labels = torch.tensor(memory.get_labels(), dtype=torch.long, device=device)
 
-    print(f"\n[Stage 3] Train prediction head trực tiếp trên {memory.num_rules} rule centroids "
+    print(f"\n[Stage 3] Train prediction head truc tiep tren {memory.num_rules} rule centroids "
           f"({epochs} epochs x {steps_per_epoch} steps)")
-    print(f"  Nhãn: memory.get_labels() (majority-vote ground-truth mỗi rule)")
+    print(f"  Nhan: memory.get_labels() (majority-vote ground-truth moi rule)")
 
     for epoch in range(1, epochs + 1):
         head.train()
@@ -253,6 +253,29 @@ def train_head(
         head.load_state_dict(best_state)
     print(f"  Best val_acc = {best_val:.4f}")
     return head
+
+
+@torch.no_grad()
+def record_rule_accuracy(system1, head, memory, loader, device, use_hard=False):
+    """Goi memory.update_accuracy() -- buoc nay BI THIEU tu dau (fix da ap
+    dung ben train_icrl.py cua Fitzpatrick, ap dung lai o day cho dong bo):
+    thieu buoc nay khien field 'accuracy' trong icrl_rules.json luon = 0.5
+    (gia tri trung lap mac dinh khi total_pred=0), va 'confidence' xuat ra
+    chi con la coherence*0.5, khong phan biet duoc rule tot/xau.
+
+    Dung val_loader (khong dung train) de danh gia rule co du doan dung tren
+    du lieu KHONG dung de build no hay khong -- trung thuc hon so voi do
+    tren chinh du lieu da dung de tao rule."""
+    centroids = memory.get_centroids().to(device)
+    for images, labels in tqdm(loader, desc="  Record rule accuracy", leave=False):
+        images = images.to(device)
+        s1_out = system1(images)
+        cv = hard_concept_vector(s1_out) if use_hard else soft_concept_vector(s1_out)
+        y = labels["label"].to(device)
+        rule_ids, _ = memory.match(cv)
+        rule_cvs = centroids[rule_ids]
+        preds = head(rule_cvs).argmax(dim=1)
+        memory.update_accuracy(cv, y, preds)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -352,7 +375,7 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"[INFO] Device: {device}")
-    print(f"[INFO] ICRL params: θ={args.theta}  θ_merge={args.theta_merge}  "
+    print(f"[INFO] ICRL params: theta={args.theta}  theta_merge={args.theta_merge}  "
           f"n_min={args.n_min}  conf_min={args.conf_min}")
 
     data_dir = Path(args.data_dir)
@@ -419,6 +442,17 @@ def main():
         steps_per_epoch=args.head_steps_per_epoch,
     )
     torch.save(head.state_dict(), output_dir / "prediction_head.pt")
+
+    print("\n[Stage 3.5] Recording rule accuracy on val split "
+          "(fixes update_accuracy() previously never being called)")
+    record_rule_accuracy(system1, head, memory, val_loader, device, args.use_hard_cv)
+
+    print(f"\n[INFO] Final prune using real accuracy signal (conf_min={args.conf_min})")
+    memory.prune(verbose=True)
+    print(f"  After final prune: {memory.num_rules} rules")
+
+    memory.save(memory_path)   # ghi de, phan anh dung trang thai cuoi cung (sau final prune)
+    print(f"[INFO] Rule memory re-saved after final prune: {memory_path}  ({memory.num_rules} rules)")
 
     print("\n[INFO] Evaluating...")
     test_metrics = evaluate(system1, head, test_loader, device, memory, "test", args.use_hard_cv)
