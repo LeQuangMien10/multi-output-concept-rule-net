@@ -59,10 +59,24 @@ from src.models.fitzpatrick.system1 import FitzpatrickSystem1, soft_concept_vect
 from src.models.icrl_rule_memory import ICRLRuleMemory
 from src.utils.seed import set_seed
 from src.utils.fitzpatrick_concepts import (
-    LABEL_NAMES, NUM_LABELS, NUM_CONCEPTS,
-    FULL_CONCEPT_KEYS, FULL_CONCEPT_OFFSETS, FULL_CONCEPT_DIMS, FULL_CV_DIM,
-    S1_LABEL_CONCEPT_KEY,
+    LABEL_NAMES as DEFAULT_LABEL_NAMES, S1_LABEL_CONCEPT_KEY,
 )
+
+
+def build_full_concept_layout(concept_names: list[str], label_names: list[str]):
+    """FULL concept vector layout (concepts + s1_label_pred slot), derived at
+    runtime from whatever concept_names/label_names this run actually uses --
+    NOT a fixed 35-concept/3-class constant, so this works unchanged for
+    alternate data preparations (e.g. the 48-concept/2-class CRL-matched
+    variant, see prepare_dataset_crl_matched.py)."""
+    full_keys = list(concept_names) + [S1_LABEL_CONCEPT_KEY]
+    dims = {name: 1 for name in concept_names}
+    dims[S1_LABEL_CONCEPT_KEY] = len(label_names)
+    offsets, off = {}, 0
+    for name in full_keys:
+        offsets[name] = off
+        off += dims[name]
+    return full_keys, offsets, dims, off
 
 
 # ─────────────────────────────────────────────────────────────
@@ -110,7 +124,11 @@ def parse_args():
     p.add_argument("--head_epochs", type=int, default=20)
     p.add_argument("--head_lr", type=float, default=1e-3)
     p.add_argument("--head_steps_per_epoch", type=int, default=250)
-    p.add_argument("--num_classes", type=int, default=NUM_LABELS)
+    p.add_argument("--label_names", type=str, default=",".join(DEFAULT_LABEL_NAMES),
+                    help="Comma-separated class names, in label_idx order. Override for "
+                         "alternate preparations, e.g. 'benign,malignant' for the CRL-matched "
+                         "2-class variant (default: the 3-class benign/malignant/non-neoplastic "
+                         "setup in src/utils/fitzpatrick_concepts.py).")
 
     p.add_argument("--batch_size", type=int, default=64)
     p.add_argument("--num_workers", type=int, default=4)
@@ -131,7 +149,7 @@ def load_system1(ckpt_path: Path, device: torch.device) -> FitzpatrickSystem1:
         backbone_name=saved_args.get("backbone", "resnet50"),
         pretrained=False,   # trong so se duoc load tu checkpoint ngay ben duoi
         num_concepts=saved_args.get("num_concepts"),
-        num_labels=saved_args.get("num_labels", NUM_LABELS),
+        num_labels=saved_args.get("num_labels", len(DEFAULT_LABEL_NAMES)),
     )
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval().to(device)
@@ -189,7 +207,7 @@ def train_head(system1, memory, val_loader, num_classes, epochs, lr, device,
     """Nhan train head = memory.get_labels() (majority-vote ground-truth moi
     rule) -- KHONG doc slot s1_label_pred trong centroid lam nhan, dung bai
     hoc da fix o MNIST Math/MultiConcept."""
-    head = nn.Linear(FULL_CV_DIM, num_classes).to(device)
+    head = nn.Linear(memory.concept_dim, num_classes).to(device)
     opt = torch.optim.AdamW(head.parameters(), lr=lr, weight_decay=0.0)
 
     best_val = 0.0
@@ -282,14 +300,16 @@ def evaluate(system1, head, loader, device, memory, split="test", use_hard=False
     return {"accuracy": correct / total, "correct": correct, "total": total}
 
 
-def export_rules(memory, output_dir, n_show=20):
+def export_rules(memory, output_dir, full_concept_keys, full_concept_offsets,
+                  full_concept_dims, label_names, n_show=20):
+    num_labels = len(label_names)
     rules_data = []
     for r in range(memory.num_rules):
         decoded = memory.decode_rule(
             rule_id=r,
-            concept_keys=FULL_CONCEPT_KEYS,
-            concept_offsets=FULL_CONCEPT_OFFSETS,
-            concept_dims=FULL_CONCEPT_DIMS,
+            concept_keys=full_concept_keys,
+            concept_offsets=full_concept_offsets,
+            concept_dims=full_concept_dims,
             id_to_symbol=None,
         )
         present = [k for k, v in decoded["slots"].items()
@@ -298,10 +318,10 @@ def export_rules(memory, output_dir, n_show=20):
         s1_label_idx = int(decoded["slots"][S1_LABEL_CONCEPT_KEY]["value"])
         s1_label_conf = decoded["slots"][S1_LABEL_CONCEPT_KEY]["confidence"]
 
-        decoded["label_name"] = LABEL_NAMES[decoded["label"]] if 0 <= decoded["label"] < NUM_LABELS else "?"
-        decoded["s1_label_guess_name"] = LABEL_NAMES[s1_label_idx]
+        decoded["label_name"] = label_names[decoded["label"]] if 0 <= decoded["label"] < num_labels else "?"
+        decoded["s1_label_guess_name"] = label_names[s1_label_idx]
         decoded["s1_label_guess_confidence"] = s1_label_conf
-        decoded["s1_label_agrees_with_truth"] = (LABEL_NAMES[s1_label_idx] == decoded["label_name"])
+        decoded["s1_label_agrees_with_truth"] = (label_names[s1_label_idx] == decoded["label_name"])
         decoded["present_concepts"] = present
         rules_data.append(decoded)
 
@@ -352,11 +372,19 @@ def main():
     )
     print(f"[INFO] Data: {args.data_dir}")
 
-    cluster_dims = (0, NUM_CONCEPTS) if args.exclude_label_slot else None
+    label_names = args.label_names.split(",")
+    concept_names = train_loader.dataset.concept_names
+    num_concepts = len(concept_names)
+    full_concept_keys, full_concept_offsets, full_concept_dims, full_cv_dim = \
+        build_full_concept_layout(concept_names, label_names)
+    print(f"[INFO] {num_concepts} concepts, {len(label_names)} classes ({label_names}), "
+          f"full_cv_dim={full_cv_dim}")
+
+    cluster_dims = (0, num_concepts) if args.exclude_label_slot else None
     print(f"[INFO] cluster_dims={cluster_dims} (exclude_label_slot={args.exclude_label_slot})")
 
     memory = ICRLRuleMemory(
-        concept_dim=FULL_CV_DIM,
+        concept_dim=full_cv_dim,
         theta=args.theta,
         theta_merge=args.theta_merge,
         n_min=args.n_min,
@@ -387,7 +415,7 @@ def main():
 
     head = train_head(
         system1, memory, val_loader,
-        num_classes=args.num_classes,
+        num_classes=len(label_names),
         epochs=args.head_epochs,
         lr=args.head_lr,
         device=device,
@@ -415,7 +443,8 @@ def main():
     print(f"  val_accuracy  = {val_metrics['accuracy']:.4f}")
     print(f"  test_accuracy = {test_metrics['accuracy']:.4f}")
 
-    export_rules(memory, output_dir)
+    export_rules(memory, output_dir, full_concept_keys, full_concept_offsets,
+                 full_concept_dims, label_names)
 
     metrics = {
         "val_accuracy": val_metrics["accuracy"],

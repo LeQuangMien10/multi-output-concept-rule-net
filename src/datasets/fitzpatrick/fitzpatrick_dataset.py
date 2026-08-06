@@ -59,13 +59,25 @@ class FitzpatrickDataset(Dataset):
         labels_dict["label"]        scalar long (0/1/2, xem LABEL_TO_IDX)
     """
 
-    def __init__(self, index_csv: str | Path, img_dir: str | Path, transform=None):
+    _NON_CONCEPT_COLUMNS = {"md5hash", "filename", "label", "label_idx", "concept_mask"}
+
+    def __init__(self, index_csv: str | Path, img_dir: str | Path, transform=None,
+                 concept_names: list[str] | None = None):
         self.index_csv = Path(index_csv)
         self.img_dir = Path(img_dir)
         self.transform = transform
 
         with open(self.index_csv, encoding="utf-8") as f:
-            self.rows = list(csv.DictReader(f))
+            reader = csv.DictReader(f)
+            self.rows = list(reader)
+            # Self-describing: any prepared variant (35-concept/3-class,
+            # 48-concept/2-class CRL-matched, ...) just works, no import of a
+            # fixed constant needed -- derive concept columns from whatever
+            # this CSV actually has, in file order.
+            csv_columns = reader.fieldnames or []
+        self.concept_names = concept_names if concept_names is not None else [
+            c for c in csv_columns if c not in self._NON_CONCEPT_COLUMNS
+        ]
 
     def __len__(self) -> int:
         return len(self.rows)
@@ -76,7 +88,7 @@ class FitzpatrickDataset(Dataset):
         if self.transform is not None:
             img = self.transform(img)
 
-        concepts = torch.tensor([float(row[c]) for c in CONCEPT_NAMES], dtype=torch.float32)
+        concepts = torch.tensor([float(row[c]) for c in self.concept_names], dtype=torch.float32)
         labels = {
             "concepts": concepts,
             "concept_mask": torch.tensor(float(row["concept_mask"])),
