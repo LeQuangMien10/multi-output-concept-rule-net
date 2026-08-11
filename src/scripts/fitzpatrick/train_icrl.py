@@ -579,12 +579,29 @@ def main():
     print(f"[INFO] cluster_dims={cluster_dims} (exclude_label_slot={args.exclude_label_slot})")
 
     if args.theta == "auto":
+        # Always measure on CONCEPT-ONLY dims (drop s1_label_pred), even when
+        # cluster_dims=None (Stage 2 clusters on the full vector). The label
+        # slot's softmax values dominate cosine similarity over the sparse
+        # concept sigmoid dims -- the same mechanism already identified as the
+        # root cause of circular rules -- which saturates the percentile-99.9
+        # measurement at its 0.999 safety cap for EVERY dataset, making "auto"
+        # measure nothing data-specific. This matches how the historical fixed
+        # default (0.886) was itself calibrated: on 35-dim concept-only GT
+        # vectors, never including the label slot.
         print("\n[INFO] --theta auto: measuring theta on this run's actual S1-predicted "
-              "concept vectors (train split, cluster_dims-aware)...")
-        train_cv = collect_concept_vectors(system1, train_loader, device, args.use_hard_cv, cluster_dims)
+              "CONCEPT-ONLY vectors (train split; s1_label_pred slot excluded from the "
+              "measurement regardless of cluster_dims)...")
+        concept_only_dims = (0, num_concepts)
+        train_cv = collect_concept_vectors(system1, train_loader, device, args.use_hard_cv, concept_only_dims)
         theta = measure_theta(train_cv)
         theta_merge = min(theta + 0.04, 0.999)
         print(f"[INFO] Measured theta={theta:.4f}  theta_merge={theta_merge:.4f} (theta+0.04)")
+        if cluster_dims is None:
+            print("[WARN] cluster_dims=None (Stage 2 clusters on the FULL vector incl. "
+                  "s1_label_pred) but theta was measured concept-only -- the label slot adds "
+                  "extra correlated similarity on top of this, so effective matching may be "
+                  "looser than theta implies. Consider --exclude_label_slot to keep measurement "
+                  "and clustering consistent (also reduces circular rules, see earlier findings).")
     else:
         theta = float(args.theta)
         theta_merge = args.theta_merge
