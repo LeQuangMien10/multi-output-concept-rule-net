@@ -57,6 +57,7 @@ from tqdm import tqdm
 from src.datasets.fitzpatrick.fitzpatrick_dataset import FitzpatrickDataset, build_transforms
 from src.models.fitzpatrick.system1 import FitzpatrickSystem1, soft_concept_vector, hard_concept_vector
 from src.models.icrl_rule_memory import ICRLRuleMemory
+from src.scripts.fitzpatrick.train_icrl_gt_ablation import measure_theta
 from src.utils.seed import set_seed
 from src.utils.fitzpatrick_concepts import (
     LABEL_NAMES as DEFAULT_LABEL_NAMES, S1_LABEL_CONCEPT_KEY,
@@ -91,15 +92,29 @@ def parse_args():
     p.add_argument("--system1_ckpt", type=str, default="/kaggle/working/outputs/fitzpatrick_system1/best_model.pt")
     p.add_argument("--output_dir", type=str, default="/kaggle/working/outputs/fitzpatrick_icrl")
 
-    p.add_argument("--theta", type=float, default=0.886,
-                    help="Do tren concept vector ground-truth (measure_theta.py). Kiem tra lai "
-                         "rule contradiction/purity sau khi chay de xac nhan gia tri nay con hop ly "
-                         "tren concept vector S1 THAT DU DOAN (co the khac ground-truth).")
+    p.add_argument("--theta", type=str, default="0.886",
+                    help="Float, hoac 'auto' de tu do truoc Stage 2 tren dung concept vector S1 "
+                         "THAT du doan (tren train split, ton trong cluster_dims/use_hard_cv) -- "
+                         "percentile-99.9 cosine giua cac pattern KHAC nhau + bien an toan 0.02. "
+                         "Gia tri float mac dinh (0.886) do tren concept vector GROUND-TRUTH 35-dim "
+                         "cua dataset goc -- KHONG con dung neu doi so concept/them label-slot "
+                         "(vd. scope CRL-matched 48-concept): dung 'auto' cho cac scope khac nhau.")
     p.add_argument("--theta_merge", type=float, default=0.93)
     p.add_argument("--n_min", type=int, default=15,
                     help="Tang tu 5 -> 15 sau khi phan tich lan chay dau: 12/61 rule co n nho "
                          "(rieng biet ma khong on dinh -- live-majority label khac nhan da luu). "
-                         "n_min cao hon loc bot duoi rule nho ngay tu Stage 2.")
+                         "n_min cao hon loc bot duoi rule nho ngay tu Stage 2. Gia tri nay copy tu "
+                         "lan calibrate dau tien (16.577 anh) -- KHONG tu dong phu hop voi scope "
+                         "nho hon (vd. 636-3.227 anh); dung --n_min_sweep de tim gia tri phu hop.")
+    p.add_argument("--n_min_sweep", type=str, default=None,
+                    help="Danh sach n_min cach nhau boi dau phay, vd '5,10,15,20,30'. Neu duoc set, "
+                         "Stage 2 chi build MOT LAN (memory 'goc' khong prune theo n_min), sau do "
+                         "moi gia tri trong danh sach duoc prune+train head+danh gia RIENG (khong can "
+                         "build lai) -- rat re vi Stage 2 (anh + S1 forward) la phan ton thoi gian "
+                         "nhat. Ket qua tung gia tri luu vao output_dir/n_min_<N>/, kem 1 bang so sanh "
+                         "+ 1 de xuat tu dong (uu tien so rule khong-circular cao nhat trong so cac "
+                         "gia tri co val_accuracy trong pham vi 2 diem %% cua gia tri tot nhat) duoc "
+                         "copy len output_dir/ (top-level) de tuong thich nguoc voi cac script khac.")
     p.add_argument("--conf_min", type=float, default=0.5,
                     help="Tang tu 0.1 -> 0.5 sau khi accuracy tro nen y nghia (xem update_accuracy "
                          "fix): 0.1 qua de, khong loc duoc rule gan-ngau-nhien (vd accuracy 30-50%%, "
@@ -168,6 +183,23 @@ def make_loaders(data_dir: Path, img_dir: Path, image_size: int, batch_size: int
                            num_workers=num_workers, pin_memory=True)
 
     return _loader("train", True), _loader("val", False), _loader("test", False)
+
+
+@torch.no_grad()
+def collect_concept_vectors(system1, loader, device, use_hard=False, cluster_dims=None) -> torch.Tensor:
+    """One pass over `loader`, stacking the exact concept vector Stage 2 will
+    cluster on (post cluster_dims slicing) -- used by --theta auto so theta is
+    measured on the real S1-predicted vectors for THIS run's concept/label
+    schema, not a value borrowed from a different concept count / dataset."""
+    vecs = []
+    for images, _ in tqdm(loader, desc="  Collecting concept vectors (for --theta auto)", leave=False):
+        images = images.to(device)
+        s1_out = system1(images)
+        cv = hard_concept_vector(s1_out) if use_hard else soft_concept_vector(s1_out)
+        if cluster_dims is not None:
+            cv = cv[:, cluster_dims[0]:cluster_dims[1]]
+        vecs.append(cv.cpu())
+    return torch.cat(vecs, dim=0)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -302,49 +334,32 @@ def evaluate(system1, head, loader, device, memory, split="test", use_hard=False
 
 def summarize_rules(rules_data: list[dict], concept_names: list[str], label_names: list[str]) -> dict:
     """
-    Build a compact, scannable summary alongside the verbose per-concept
+    Build a minimal, scannable summary alongside the verbose per-concept
     icrl_rules.json (which lists EVERY concept's present/absent/confidence
-    per rule -- unreadable at a glance with 35-48 concepts). Modeled after
-    the official CRL repo's rules.txt format: one line per rule with a
-    human rule_string, support/confidence, and predicted class.
+    per rule -- unreadable at a glance with 35-48 concepts). Just the rule
+    itself (present concepts only, AND-joined) + predicted label + whether
+    it's "circular" (see below) -- everything else (confidence, coherence,
+    n, s1_label_pred, ...) lives in icrl_rules.json, cross-referenced by
+    rule_id, so it isn't duplicated here.
 
-    Two fixes baked in here (previously only available as a manual
-    post-processing step via reexport_rules_with_not.py):
-      1. "Informative" NOT: a concept only appears as "NOT X" in a rule
-         string if X is 'present' in >=1 rule anywhere in this set --
-         excludes S1's dead/never-learned concepts from cluttering every
-         rule with meaningless absences.
-      2. s1_label_pred is shown explicitly per rule, and rules sharing the
-         exact same visible (present + informative-NOT) pattern but a
-         different majority label are flagged "circular" -- separated only
-         by S1's own label guess, not by concept evidence a reader can see.
+    "circular": rules sharing the exact same visible present-concept
+    pattern but a different majority label -- concept evidence alone
+    doesn't explain the split (it's actually the hidden s1_label_pred slot
+    doing the separating, see icrl_rules.json's "slots" field for that rule
+    if you need to confirm why).
     """
-    informative = set()
-    for r in rules_data:
-        informative.update(r["present_concepts"])
-
     entries = []
     pattern_groups: dict[tuple, list[int]] = {}
     for r in rules_data:
         present = r["present_concepts"]
-        absent_informative = [
-            c for c in concept_names
-            if c not in present and c in informative
-        ]
-        rule_string = " AND ".join(present + [f"NOT {c}" for c in absent_informative])
-        key = (tuple(present), tuple(absent_informative))
-        pattern_groups.setdefault(key, []).append(len(entries))
+        rule_string = " AND ".join(present) if present else "(no concept -- default/catch-all rule)"
+        pattern_groups.setdefault(tuple(present), []).append(len(entries))
         entries.append({
             "rule_id": r["rule_id"],
             "label": r["label_name"],
-            "confidence": round(r["confidence"], 4),
-            "coherence": round(r["coherence"], 4),
-            "n": r["n"],
-            "s1_label_pred": r["s1_label_guess_name"],
-            "s1_label_pred_confidence": round(r["s1_label_guess_confidence"], 4),
-            "rule_string": rule_string or "(no informative concept -- default/catch-all rule)",
-            "num_conditions": len(present) + len(absent_informative),
-            "circular_group": None,  # filled below
+            "rule": rule_string,
+            "circular": False,  # filled below
+            "_confidence": r["confidence"],  # sort key only, stripped before output
         })
 
     n_circular = 0
@@ -354,23 +369,17 @@ def summarize_rules(rules_data: list[dict], concept_names: list[str], label_name
         labels_here = set(entries[i]["label"] for i in idx_list)
         if len(labels_here) > 1:
             for i in idx_list:
-                entries[i]["circular_group"] = [entries[j]["rule_id"] for j in idx_list if j != i]
+                entries[i]["circular"] = True
             n_circular += len(idx_list)
 
-    entries.sort(key=lambda x: -x["confidence"])
+    entries.sort(key=lambda x: -x["_confidence"])
+    for e in entries:
+        del e["_confidence"]
 
-    confs = [r["confidence"] for r in rules_data] or [0.0]
-    ns = [r["n"] for r in rules_data] or [0]
     return {
         "num_rules": len(rules_data),
         "num_effective_rules": len(rules_data) - n_circular,
-        "circular_rules": n_circular,
         "circular_rate": round(n_circular / len(rules_data), 4) if rules_data else 0.0,
-        "num_informative_concepts": len(informative),
-        "informative_concepts": sorted(informative),
-        "labels": label_names,
-        "confidence_stats": {"mean": round(sum(confs) / len(confs), 4), "min": round(min(confs), 4), "max": round(max(confs), 4)},
-        "n_stats": {"mean": round(sum(ns) / len(ns), 1), "min": min(ns), "max": max(ns)},
         "rules": entries,
     }
 
@@ -427,6 +436,70 @@ def export_rules(memory, output_dir, full_concept_keys, full_concept_offsets,
         print(f"  [{r['confidence']:.3f}] {r['label_name']:15s} (S1 {agree} {r['s1_label_guess_name']:15s})  "
               f"n={r['n']:4d}  coh={r['coherence']:.3f}  {concepts_str[:50]:50s}  {bar}")
 
+    return summary
+
+
+# ─────────────────────────────────────────────────────────────
+# Stage 3 onward: head train -> record accuracy -> final prune -> eval -> export
+# Factored out so --n_min_sweep can run this once per candidate n_min without
+# re-doing Stage 2 (the expensive image + S1 forward-pass part) each time.
+# ─────────────────────────────────────────────────────────────
+
+def run_stage3_onward(memory, system1, val_loader, test_loader, label_names,
+                       full_concept_keys, full_concept_offsets, full_concept_dims,
+                       output_dir: Path, args, conf_min: float | None = None) -> dict:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    conf_min = args.conf_min if conf_min is None else conf_min
+    device = torch.device(memory.device)
+
+    head = train_head(
+        system1, memory, val_loader,
+        num_classes=len(label_names),
+        epochs=args.head_epochs,
+        lr=args.head_lr,
+        device=device,
+        use_hard=args.use_hard_cv,
+        steps_per_epoch=args.head_steps_per_epoch,
+    )
+    torch.save(head.state_dict(), output_dir / "prediction_head.pt")
+
+    print(f"\n[Stage 3.5] Recording rule accuracy on val split (n_min={memory.n_min})")
+    record_rule_accuracy(system1, head, memory, val_loader, device, args.use_hard_cv)
+
+    print(f"\n[INFO] Final prune using real accuracy signal (conf_min={conf_min})")
+    memory.conf_min = conf_min
+    memory.prune(verbose=True)
+    print(f"  After final prune: {memory.num_rules} rules")
+
+    memory_path = output_dir / "icrl_rule_memory.pt"
+    memory.save(memory_path)
+
+    print("\n[INFO] Evaluating...")
+    test_metrics = evaluate(system1, head, test_loader, device, memory, "test", args.use_hard_cv)
+    val_metrics = evaluate(system1, head, val_loader, device, memory, "val", args.use_hard_cv)
+    print(f"  val_accuracy  = {val_metrics['accuracy']:.4f}")
+    print(f"  test_accuracy = {test_metrics['accuracy']:.4f}")
+
+    rule_summary = export_rules(memory, output_dir, full_concept_keys, full_concept_offsets,
+                                 full_concept_dims, label_names)
+
+    result = {
+        "n_min": memory.n_min,
+        "val_accuracy": val_metrics["accuracy"],
+        "test_accuracy": test_metrics["accuracy"],
+        "num_rules": memory.num_rules,
+        "num_effective_rules": rule_summary["num_effective_rules"],
+        "circular_rate": rule_summary["circular_rate"],
+        "rule_confidence_stats": {
+            "mean": sum(memory.get_confidences()) / max(1, memory.num_rules),
+            "min": min(memory.get_confidences()) if memory.num_rules else 0,
+            "max": max(memory.get_confidences()) if memory.num_rules else 0,
+        },
+    }
+    with open(output_dir / "metrics.json", "w") as f:
+        json.dump({**result, "args": vars(args)}, f, indent=2)
+    return result
+
 
 # ─────────────────────────────────────────────────────────────
 # Main
@@ -443,9 +516,11 @@ def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    sweep_values = [int(v) for v in args.n_min_sweep.split(",")] if args.n_min_sweep else None
+
     print(f"[INFO] Device: {device}")
     print(f"[INFO] ICRL params: theta={args.theta}  theta_merge={args.theta_merge}  "
-          f"n_min={args.n_min}  conf_min={args.conf_min}")
+          f"n_min={args.n_min if sweep_values is None else sweep_values}  conf_min={args.conf_min}")
 
     system1, image_size = load_system1(Path(args.system1_ckpt), device)
     print(f"[INFO] System1 loaded (frozen): {args.system1_ckpt}  image_size={image_size}")
@@ -466,11 +541,27 @@ def main():
     cluster_dims = (0, num_concepts) if args.exclude_label_slot else None
     print(f"[INFO] cluster_dims={cluster_dims} (exclude_label_slot={args.exclude_label_slot})")
 
+    if args.theta == "auto":
+        print("\n[INFO] --theta auto: measuring theta on this run's actual S1-predicted "
+              "concept vectors (train split, cluster_dims-aware)...")
+        train_cv = collect_concept_vectors(system1, train_loader, device, args.use_hard_cv, cluster_dims)
+        theta = measure_theta(train_cv)
+        theta_merge = min(theta + 0.04, 0.999)
+        print(f"[INFO] Measured theta={theta:.4f}  theta_merge={theta_merge:.4f} (theta+0.04)")
+    else:
+        theta = float(args.theta)
+        theta_merge = args.theta_merge
+
+    # Build n_min=1 during Stage 2 so nothing is discarded prematurely when
+    # sweeping -- the REAL n_min filtering happens per-candidate afterward,
+    # on saved copies, without re-running Stage 2 (the expensive part).
+    build_n_min = 1 if sweep_values is not None else args.n_min
+
     memory = ICRLRuleMemory(
         concept_dim=full_cv_dim,
-        theta=args.theta,
-        theta_merge=args.theta_merge,
-        n_min=args.n_min,
+        theta=theta,
+        theta_merge=theta_merge,
+        n_min=build_n_min,
         conf_min=args.conf_min,
         cluster_dims=cluster_dims,   # None = toan bo vector; xem --exclude_label_slot help
         device=str(device),
@@ -492,58 +583,70 @@ def main():
         print(f"  Coherence: mean={sum(cohs)/max(1,len(cohs)):.3f}  "
               f"min={min(cohs) if cohs else 0:.3f}  max={max(cohs) if cohs else 0:.3f}")
 
-    memory_path = output_dir / "icrl_rule_memory.pt"
-    memory.save(memory_path)
-    print(f"\n[INFO] Rule memory saved: {memory_path}  ({memory.num_rules} rules)")
+    base_memory_path = output_dir / ("icrl_rule_memory_base.pt" if sweep_values is not None
+                                      else "icrl_rule_memory.pt")
+    memory.save(base_memory_path)
+    print(f"\n[INFO] Rule memory saved: {base_memory_path}  ({memory.num_rules} rules, "
+          f"n_min={build_n_min} at build time)")
 
-    head = train_head(
-        system1, memory, val_loader,
-        num_classes=len(label_names),
-        epochs=args.head_epochs,
-        lr=args.head_lr,
-        device=device,
-        use_hard=args.use_hard_cv,
-        steps_per_epoch=args.head_steps_per_epoch,
-    )
-    torch.save(head.state_dict(), output_dir / "prediction_head.pt")
+    if sweep_values is None:
+        run_stage3_onward(memory, system1, val_loader, test_loader, label_names,
+                           full_concept_keys, full_concept_offsets, full_concept_dims,
+                           output_dir, args)
+        print(f"\n[INFO] Results saved to {output_dir}/metrics.json")
+        return
 
-    print("\n[Stage 3.5] Recording rule accuracy on val split "
-          "(fixes update_accuracy() previously never being called)")
-    record_rule_accuracy(system1, head, memory, val_loader, device, args.use_hard_cv)
+    # ── n_min sweep: reload the base memory once per candidate, prune to
+    # that n_min, run Stage 3 onward into its own subdir ──────────────────
+    print(f"\n[Stage 2.5] n_min sweep: {sweep_values}")
+    sweep_results = []
+    for n_min in sweep_values:
+        print(f"\n{'='*60}\n[Sweep] n_min={n_min}\n{'='*60}")
+        candidate = ICRLRuleMemory.load(base_memory_path, device=str(device))
+        candidate.n_min = n_min
+        candidate.conf_min = 0.0  # accuracy not measured yet; real conf_min applied in run_stage3_onward
+        candidate.prune(verbose=True)
+        sub_dir = output_dir / f"n_min_{n_min}"
+        result = run_stage3_onward(candidate, system1, val_loader, test_loader, label_names,
+                                    full_concept_keys, full_concept_offsets, full_concept_dims,
+                                    sub_dir, args, conf_min=args.conf_min)
+        sweep_results.append(result)
 
-    print(f"\n[INFO] Final prune using real accuracy signal (conf_min={args.conf_min})")
-    memory.prune(verbose=True)   # khong override -- dung conf_min that, gio da co accuracy y nghia
-    print(f"  After final prune: {memory.num_rules} rules")
+    print(f"\n{'='*60}\n[Sweep] Summary\n{'='*60}")
+    print(f"{'n_min':>6} {'rules':>6} {'effective':>10} {'circular%':>10} {'val_acc':>8} {'test_acc':>9}")
+    for r in sweep_results:
+        print(f"{r['n_min']:>6} {r['num_rules']:>6} {r['num_effective_rules']:>10} "
+              f"{r['circular_rate']*100:>9.1f}% {r['val_accuracy']:>8.4f} {r['test_accuracy']:>9.4f}")
 
-    memory.save(memory_path)   # ghi de, phan anh dung trang thai cuoi cung (sau final prune)
-    print(f"[INFO] Rule memory re-saved after final prune: {memory_path}  ({memory.num_rules} rules)")
+    # Recommend: highest num_effective_rules among candidates whose val_accuracy
+    # is within 2 points of the best val_accuracy in the sweep.
+    best_val = max(r["val_accuracy"] for r in sweep_results)
+    in_range = [r for r in sweep_results if r["val_accuracy"] >= best_val - 0.02]
+    recommended = max(in_range, key=lambda r: r["num_effective_rules"])
+    print(f"\n[RECOMMENDED] n_min={recommended['n_min']} "
+          f"(val_accuracy={recommended['val_accuracy']:.4f}, within 2pp of best {best_val:.4f}; "
+          f"{recommended['num_effective_rules']} effective rules, "
+          f"circular_rate={recommended['circular_rate']:.2%})")
 
-    print("\n[INFO] Evaluating...")
-    test_metrics = evaluate(system1, head, test_loader, device, memory, "test", args.use_hard_cv)
-    val_metrics = evaluate(system1, head, val_loader, device, memory, "val", args.use_hard_cv)
+    with open(output_dir / "n_min_sweep_summary.json", "w", encoding="utf-8") as f:
+        json.dump({
+            "sweep_values": sweep_values,
+            "results": sweep_results,
+            "recommended_n_min": recommended["n_min"],
+            "recommendation_rule": "max num_effective_rules among candidates with "
+                                    "val_accuracy >= best_val_accuracy - 0.02",
+        }, f, indent=2)
 
-    print(f"\n[DONE] Results:")
-    print(f"  val_accuracy  = {val_metrics['accuracy']:.4f}")
-    print(f"  test_accuracy = {test_metrics['accuracy']:.4f}")
-
-    export_rules(memory, output_dir, full_concept_keys, full_concept_offsets,
-                 full_concept_dims, label_names)
-
-    metrics = {
-        "val_accuracy": val_metrics["accuracy"],
-        "test_accuracy": test_metrics["accuracy"],
-        "num_rules": memory.num_rules,
-        "args": vars(args),
-        "rule_confidence_stats": {
-            "mean": sum(memory.get_confidences()) / max(1, memory.num_rules),
-            "min": min(memory.get_confidences()) if memory.num_rules else 0,
-            "max": max(memory.get_confidences()) if memory.num_rules else 0,
-        }
-    }
-    with open(output_dir / "metrics.json", "w") as f:
-        json.dump(metrics, f, indent=2)
-
-    print(f"\n[INFO] Results saved to {output_dir}/metrics.json")
+    # Copy the recommended candidate's outputs up to output_dir/ (top-level)
+    # so consumers that expect output_dir/icrl_rules.json etc. keep working.
+    import shutil
+    rec_dir = output_dir / f"n_min_{recommended['n_min']}"
+    for fname in ("icrl_rules.json", "icrl_rules_summary.json", "icrl_rule_memory.pt",
+                  "prediction_head.pt", "metrics.json"):
+        src = rec_dir / fname
+        if src.exists():
+            shutil.copy2(src, output_dir / fname)
+    print(f"\n[INFO] Recommended candidate (n_min={recommended['n_min']}) copied to {output_dir}/")
 
 
 if __name__ == "__main__":
