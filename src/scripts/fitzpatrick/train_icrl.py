@@ -579,23 +579,39 @@ def main():
     print(f"[INFO] cluster_dims={cluster_dims} (exclude_label_slot={args.exclude_label_slot})")
 
     if args.theta == "auto":
-        # Always measure on CONCEPT-ONLY dims (drop s1_label_pred), even when
-        # cluster_dims=None (Stage 2 clusters on the full vector). The label
-        # slot's softmax values dominate cosine similarity over the sparse
-        # concept sigmoid dims -- the same mechanism already identified as the
-        # root cause of circular rules -- which saturates the percentile-99.9
-        # measurement at its 0.999 safety cap for EVERY dataset, making "auto"
-        # measure nothing data-specific. This matches how the historical fixed
-        # default (0.886) was itself calibrated: on 35-dim concept-only GT
-        # vectors, never including the label slot.
+        # Always measure on CONCEPT-ONLY (drop s1_label_pred) HARD/BINARIZED
+        # (threshold 0.5) vectors, regardless of cluster_dims/--use_hard_cv.
+        #
+        # Excluding the label slot alone was NOT enough (verified empirically:
+        # theta still saturated at the 0.999 cap after dropping it). The real
+        # culprit is measuring on CONTINUOUS sigmoid probabilities: S1's concept
+        # head is comparatively weak (concept macro F1 ~0.09-0.24 throughout
+        # this project), so its raw probability vectors are only mildly
+        # discriminative between genuinely different images -- nearly every
+        # pair of images ends up with high cosine similarity in continuous
+        # space, saturating percentile-99.9 at the cap for every dataset,
+        # regardless of scope. Binarizing first restores genuine discreteness
+        # (distinct presence/absence patterns get genuinely separated cosine
+        # values) -- this is exactly the methodology already proven to work in
+        # train_icrl_gt_ablation.py's measure_theta usage (hard 0/1 GT
+        # concepts), and how the historical fixed default (0.886) was itself
+        # calibrated.
         print("\n[INFO] --theta auto: measuring theta on this run's actual S1-predicted "
-              "CONCEPT-ONLY vectors (train split; s1_label_pred slot excluded from the "
-              "measurement regardless of cluster_dims)...")
+              "CONCEPT-ONLY, HARD-BINARIZED vectors (train split; s1_label_pred slot excluded, "
+              "sigmoid probabilities thresholded at 0.5 regardless of cluster_dims/--use_hard_cv)...")
         concept_only_dims = (0, num_concepts)
-        train_cv = collect_concept_vectors(system1, train_loader, device, args.use_hard_cv, concept_only_dims)
+        train_cv = collect_concept_vectors(system1, train_loader, device, use_hard=True, cluster_dims=concept_only_dims)
         theta = measure_theta(train_cv)
         theta_merge = min(theta + 0.04, 0.999)
         print(f"[INFO] Measured theta={theta:.4f}  theta_merge={theta_merge:.4f} (theta+0.04)")
+        if not args.use_hard_cv:
+            print("[WARN] --use_hard_cv is NOT set: Stage 2 will cluster on CONTINUOUS soft "
+                  "vectors while theta was calibrated on binarized ones -- soft cosine "
+                  "similarities trend systematically higher than hard ones (shared near-zero "
+                  "baseline across mostly-absent concepts), so this theta may end up stricter "
+                  "than intended for soft matching. Pass --use_hard_cv together with --theta auto "
+                  "for a fully consistent calibration (also matches the real CRL/RRL paper's own "
+                  "Step 0 binarization).")
         if cluster_dims is None:
             print("[WARN] cluster_dims=None (Stage 2 clusters on the FULL vector incl. "
                   "s1_label_pred) but theta was measured concept-only -- the label slot adds "
