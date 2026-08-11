@@ -445,12 +445,43 @@ def export_rules(memory, output_dir, full_concept_keys, full_concept_offsets,
 # re-doing Stage 2 (the expensive image + S1 forward-pass part) each time.
 # ─────────────────────────────────────────────────────────────
 
+def _collapsed_result(memory, output_dir, full_concept_keys, full_concept_offsets,
+                       full_concept_dims, label_names, args) -> dict:
+    """0 rules survived pruning -- there is nothing left to match concept
+    vectors against, so head-training/evaluation is meaningless (not just
+    slow to skip). Still write the same file set (empty rules list, zeroed
+    metrics) so sweep summaries and the recommended-candidate copy step
+    don't need to special-case this outcome."""
+    memory.save(output_dir / "icrl_rule_memory.pt")
+    rule_summary = export_rules(memory, output_dir, full_concept_keys, full_concept_offsets,
+                                 full_concept_dims, label_names)
+    result = {
+        "n_min": memory.n_min,
+        "val_accuracy": 0.0,
+        "test_accuracy": 0.0,
+        "num_rules": 0,
+        "num_effective_rules": rule_summary["num_effective_rules"],
+        "circular_rate": rule_summary["circular_rate"],
+        "rule_confidence_stats": {"mean": 0.0, "min": 0.0, "max": 0.0},
+        "collapsed": True,
+    }
+    with open(output_dir / "metrics.json", "w") as f:
+        json.dump({**result, "args": vars(args)}, f, indent=2)
+    return result
+
+
 def run_stage3_onward(memory, system1, val_loader, test_loader, label_names,
                        full_concept_keys, full_concept_offsets, full_concept_dims,
                        output_dir: Path, args, conf_min: float | None = None) -> dict:
     output_dir.mkdir(parents=True, exist_ok=True)
     conf_min = args.conf_min if conf_min is None else conf_min
     device = torch.device(memory.device)
+
+    if memory.num_rules == 0:
+        print(f"\n[WARN] Rule memory is empty going into Stage 3 (n_min={memory.n_min} pruned "
+              f"away every rule) -- skipping head training/eval, recording as a collapsed candidate.")
+        return _collapsed_result(memory, output_dir, full_concept_keys, full_concept_offsets,
+                                  full_concept_dims, label_names, args)
 
     head = train_head(
         system1, memory, val_loader,
@@ -473,6 +504,12 @@ def run_stage3_onward(memory, system1, val_loader, test_loader, label_names,
 
     memory_path = output_dir / "icrl_rule_memory.pt"
     memory.save(memory_path)
+
+    if memory.num_rules == 0:
+        print(f"\n[WARN] Final accuracy-based prune (conf_min={conf_min}) removed every remaining "
+              f"rule -- skipping evaluation, recording as a collapsed candidate.")
+        return _collapsed_result(memory, output_dir, full_concept_keys, full_concept_offsets,
+                                  full_concept_dims, label_names, args)
 
     print("\n[INFO] Evaluating...")
     test_metrics = evaluate(system1, head, test_loader, device, memory, "test", args.use_hard_cv)
