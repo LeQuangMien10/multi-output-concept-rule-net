@@ -556,7 +556,8 @@ def main():
     sweep_values = [int(v) for v in args.n_min_sweep.split(",")] if args.n_min_sweep else None
 
     print(f"[INFO] Device: {device}")
-    print(f"[INFO] ICRL params: theta={args.theta}  theta_merge={args.theta_merge}  "
+    theta_merge_display = "auto (recomputed after theta measurement)" if args.theta == "auto" else args.theta_merge
+    print(f"[INFO] ICRL params: theta={args.theta}  theta_merge={theta_merge_display}  "
           f"n_min={args.n_min if sweep_values is None else sweep_values}  conf_min={args.conf_min}")
 
     system1, image_size = load_system1(Path(args.system1_ckpt), device)
