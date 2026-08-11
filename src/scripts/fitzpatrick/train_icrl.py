@@ -502,6 +502,15 @@ def run_stage3_onward(memory, system1, val_loader, test_loader, label_names,
     memory.prune(verbose=True)
     print(f"  After final prune: {memory.num_rules} rules")
 
+    print(f"\n[INFO] Dedupe by decoded display pattern (drop circular, merge exact "
+          f"duplicates -- theta_merge misses these since it compares raw continuous "
+          f"vectors, not the human-readable pattern)")
+    dedupe_stats = memory.dedupe_by_decoded_pattern(
+        full_concept_keys, full_concept_offsets, full_concept_dims,
+        exclude_keys={S1_LABEL_CONCEPT_KEY}, verbose=True,
+    )
+    print(f"  After dedupe: {memory.num_rules} rules")
+
     memory_path = output_dir / "icrl_rule_memory.pt"
     memory.save(memory_path)
 
@@ -527,6 +536,7 @@ def run_stage3_onward(memory, system1, val_loader, test_loader, label_names,
         "num_rules": memory.num_rules,
         "num_effective_rules": rule_summary["num_effective_rules"],
         "circular_rate": rule_summary["circular_rate"],
+        "dedupe_stats": dedupe_stats,
         "rule_confidence_stats": {
             "mean": sum(memory.get_confidences()) / max(1, memory.num_rules),
             "min": min(memory.get_confidences()) if memory.num_rules else 0,

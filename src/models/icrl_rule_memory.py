@@ -266,6 +266,109 @@ class ICRLRuleMemory:
 
         return stats
 
+    def dedupe_by_decoded_pattern(
+        self,
+        concept_keys:    list[str],
+        concept_offsets: dict[str, int],
+        concept_dims:    dict[str, int],
+        exclude_keys:    Optional[set[str]] = None,
+        threshold:       float = 0.5,
+        verbose:         bool = True,
+    ) -> dict[str, int]:
+        """
+        Post-hoc cleanup theo DISPLAY pattern (present concepts, threshold
+        0.5) thay vi cosine similarity tho tren toan bo vector continuous --
+        bat duoc 2 thu ma theta_merge bo lot vi no so full vector chu khong
+        phai chuoi rule con nguoi doc:
+
+          - "circular": cung 1 pattern hien thi nhung khac majority label
+            giua cac rule_id -- mau thuan that su, KHONG the chon 1 ben
+            thang neu khong co them bang chung, nen loai bo toan bo group.
+          - "duplicate": cung pattern hien thi VA cung label, tach thanh
+            nhieu rule_id chi vi centroid continuous cua chung nam sat nhau
+            nhung chua du gan de vuot theta_merge -- MERGE thanh 1 rule duy
+            nhat (mu weighted-mean theo n, n/correct/total_pred cong don),
+            thay vi bi dem thua thanh nhieu "rule" rieng biet.
+
+        exclude_keys: cac concept key bo qua khi build pattern de group (vd.
+            slot s1_label_pred an) -- phai KHOP voi tap export_rules() dung
+            de loc "present_concepts" khi xuat icrl_rules.json, neu khong
+            group se lech voi nhung gi nguoi dung thay tren hien thi.
+        """
+        exclude_keys = exclude_keys or set()
+        if self.is_empty:
+            return {"removed_circular": 0, "merged_duplicate_groups": 0,
+                    "rules_merged_away": 0, "final_count": 0}
+
+        from collections import Counter, defaultdict
+
+        def pattern_of(r: int) -> tuple:
+            present = []
+            for key in concept_keys:
+                if key in exclude_keys:
+                    continue
+                s = concept_offsets[key]
+                e = s + concept_dims[key]
+                if self._mu[r][s:e].item() >= threshold:
+                    present.append(key)
+            return tuple(present)
+
+        def majority_label(r: int) -> int:
+            return (Counter(self._labels[r]).most_common(1)[0][0]
+                    if self._labels[r] else -1)
+
+        groups: dict[tuple, list[int]] = defaultdict(list)
+        for r in range(self.num_rules):
+            groups[pattern_of(r)].append(r)
+
+        new_mu, new_m2, new_labels = [], [], []
+        new_n, new_correct, new_total_pred = [], [], []
+        n_circular_removed = 0
+        n_merged_groups = 0
+        n_rules_merged_away = 0
+
+        for rule_ids in groups.values():
+            labels_seen = set(majority_label(r) for r in rule_ids)
+            if len(labels_seen) > 1:
+                n_circular_removed += len(rule_ids)
+                continue
+
+            if len(rule_ids) == 1:
+                r = rule_ids[0]
+                new_mu.append(self._mu[r]); new_m2.append(self._m2[r])
+                new_labels.append(self._labels[r]); new_n.append(self._n[r])
+                new_correct.append(self._correct[r])
+                new_total_pred.append(self._total_pred[r])
+                continue
+
+            n_total = sum(self._n[r] for r in rule_ids)
+            mu = sum(self._n[r] * self._mu[r] for r in rule_ids) / n_total
+            labels: list[int] = []
+            for r in rule_ids:
+                labels.extend(self._labels[r])
+            new_mu.append(mu); new_m2.append(self._m2[rule_ids[0]])
+            new_labels.append(labels); new_n.append(n_total)
+            new_correct.append(sum(self._correct[r] for r in rule_ids))
+            new_total_pred.append(sum(self._total_pred[r] for r in rule_ids))
+            n_merged_groups += 1
+            n_rules_merged_away += len(rule_ids) - 1
+
+        self._mu, self._m2 = new_mu, new_m2
+        self._labels, self._n = new_labels, new_n
+        self._correct, self._total_pred = new_correct, new_total_pred
+
+        stats = {
+            "removed_circular": n_circular_removed,
+            "merged_duplicate_groups": n_merged_groups,
+            "rules_merged_away": n_rules_merged_away,
+            "final_count": self.num_rules,
+        }
+        if verbose:
+            print(f"  [Dedupe] circular removed={n_circular_removed}  "
+                  f"duplicate groups merged={n_merged_groups} (-{n_rules_merged_away} rules)  "
+                  f"final={self.num_rules}")
+        return stats
+
     # ── Rule creation & update ───────────────────────────────
 
     def _create_rule(
