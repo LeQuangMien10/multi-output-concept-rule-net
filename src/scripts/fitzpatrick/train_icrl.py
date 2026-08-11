@@ -300,6 +300,81 @@ def evaluate(system1, head, loader, device, memory, split="test", use_hard=False
     return {"accuracy": correct / total, "correct": correct, "total": total}
 
 
+def summarize_rules(rules_data: list[dict], concept_names: list[str], label_names: list[str]) -> dict:
+    """
+    Build a compact, scannable summary alongside the verbose per-concept
+    icrl_rules.json (which lists EVERY concept's present/absent/confidence
+    per rule -- unreadable at a glance with 35-48 concepts). Modeled after
+    the official CRL repo's rules.txt format: one line per rule with a
+    human rule_string, support/confidence, and predicted class.
+
+    Two fixes baked in here (previously only available as a manual
+    post-processing step via reexport_rules_with_not.py):
+      1. "Informative" NOT: a concept only appears as "NOT X" in a rule
+         string if X is 'present' in >=1 rule anywhere in this set --
+         excludes S1's dead/never-learned concepts from cluttering every
+         rule with meaningless absences.
+      2. s1_label_pred is shown explicitly per rule, and rules sharing the
+         exact same visible (present + informative-NOT) pattern but a
+         different majority label are flagged "circular" -- separated only
+         by S1's own label guess, not by concept evidence a reader can see.
+    """
+    informative = set()
+    for r in rules_data:
+        informative.update(r["present_concepts"])
+
+    entries = []
+    pattern_groups: dict[tuple, list[int]] = {}
+    for r in rules_data:
+        present = r["present_concepts"]
+        absent_informative = [
+            c for c in concept_names
+            if c not in present and c in informative
+        ]
+        rule_string = " AND ".join(present + [f"NOT {c}" for c in absent_informative])
+        key = (tuple(present), tuple(absent_informative))
+        pattern_groups.setdefault(key, []).append(len(entries))
+        entries.append({
+            "rule_id": r["rule_id"],
+            "label": r["label_name"],
+            "confidence": round(r["confidence"], 4),
+            "coherence": round(r["coherence"], 4),
+            "n": r["n"],
+            "s1_label_pred": r["s1_label_guess_name"],
+            "s1_label_pred_confidence": round(r["s1_label_guess_confidence"], 4),
+            "rule_string": rule_string or "(no informative concept -- default/catch-all rule)",
+            "num_conditions": len(present) + len(absent_informative),
+            "circular_group": None,  # filled below
+        })
+
+    n_circular = 0
+    for idx_list in pattern_groups.values():
+        if len(idx_list) < 2:
+            continue
+        labels_here = set(entries[i]["label"] for i in idx_list)
+        if len(labels_here) > 1:
+            for i in idx_list:
+                entries[i]["circular_group"] = [entries[j]["rule_id"] for j in idx_list if j != i]
+            n_circular += len(idx_list)
+
+    entries.sort(key=lambda x: -x["confidence"])
+
+    confs = [r["confidence"] for r in rules_data] or [0.0]
+    ns = [r["n"] for r in rules_data] or [0]
+    return {
+        "num_rules": len(rules_data),
+        "num_effective_rules": len(rules_data) - n_circular,
+        "circular_rules": n_circular,
+        "circular_rate": round(n_circular / len(rules_data), 4) if rules_data else 0.0,
+        "num_informative_concepts": len(informative),
+        "informative_concepts": sorted(informative),
+        "labels": label_names,
+        "confidence_stats": {"mean": round(sum(confs) / len(confs), 4), "min": round(min(confs), 4), "max": round(max(confs), 4)},
+        "n_stats": {"mean": round(sum(ns) / len(ns), 1), "min": min(ns), "max": max(ns)},
+        "rules": entries,
+    }
+
+
 def export_rules(memory, output_dir, full_concept_keys, full_concept_offsets,
                   full_concept_dims, label_names, n_show=20):
     num_labels = len(label_names)
@@ -331,6 +406,14 @@ def export_rules(memory, output_dir, full_concept_keys, full_concept_offsets,
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(rules_data, f, indent=2, ensure_ascii=False)
     print(f"\n[INFO] {len(rules_data)} rules exported to {json_path}")
+
+    concept_names = [k for k in full_concept_keys if k != S1_LABEL_CONCEPT_KEY]
+    summary = summarize_rules(rules_data, concept_names, label_names)
+    summary_path = output_dir / "icrl_rules_summary.json"
+    with open(summary_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2, ensure_ascii=False)
+    print(f"[INFO] Compact summary ({summary['num_effective_rules']}/{summary['num_rules']} rules "
+          f"non-circular, circular_rate={summary['circular_rate']:.2%}) exported to {summary_path}")
 
     n_agree = sum(1 for r in rules_data if r["s1_label_agrees_with_truth"])
     print(f"[INFO] S1's own label guess agrees with ground-truth majority label: "
