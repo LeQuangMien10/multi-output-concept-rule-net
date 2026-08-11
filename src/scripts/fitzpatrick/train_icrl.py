@@ -579,45 +579,21 @@ def main():
     print(f"[INFO] cluster_dims={cluster_dims} (exclude_label_slot={args.exclude_label_slot})")
 
     if args.theta == "auto":
-        # Always measure on CONCEPT-ONLY (drop s1_label_pred) HARD/BINARIZED
-        # (threshold 0.5) vectors, regardless of cluster_dims/--use_hard_cv.
-        #
-        # Excluding the label slot alone was NOT enough (verified empirically:
-        # theta still saturated at the 0.999 cap after dropping it). The real
-        # culprit is measuring on CONTINUOUS sigmoid probabilities: S1's concept
-        # head is comparatively weak (concept macro F1 ~0.09-0.24 throughout
-        # this project), so its raw probability vectors are only mildly
-        # discriminative between genuinely different images -- nearly every
-        # pair of images ends up with high cosine similarity in continuous
-        # space, saturating percentile-99.9 at the cap for every dataset,
-        # regardless of scope. Binarizing first restores genuine discreteness
-        # (distinct presence/absence patterns get genuinely separated cosine
-        # values) -- this is exactly the methodology already proven to work in
-        # train_icrl_gt_ablation.py's measure_theta usage (hard 0/1 GT
-        # concepts), and how the historical fixed default (0.886) was itself
-        # calibrated.
         print("\n[INFO] --theta auto: measuring theta on this run's actual S1-predicted "
-              "CONCEPT-ONLY, HARD-BINARIZED vectors (train split; s1_label_pred slot excluded, "
-              "sigmoid probabilities thresholded at 0.5 regardless of cluster_dims/--use_hard_cv)...")
-        concept_only_dims = (0, num_concepts)
-        train_cv = collect_concept_vectors(system1, train_loader, device, use_hard=True, cluster_dims=concept_only_dims)
-        theta = measure_theta(train_cv)
+              "concept vectors (train split, respecting cluster_dims/--use_hard_cv exactly "
+              "as configured for this run)...")
+        train_cv = collect_concept_vectors(system1, train_loader, device, args.use_hard_cv, cluster_dims)
+        # percentile=99 (not measure_theta's own 99.9 default): measured locally on the
+        # CRL-matched scope with the exact soft/full-vector config above, p99.9 of the
+        # off-diagonal cosine similarity distribution was already 0.998 -- so the +0.02
+        # safety margin (tuned for train_icrl_gt_ablation.py's discrete GT vectors, where
+        # p99.9 sits far from 1.0) pushes past the 0.999 cap and saturates there regardless
+        # of dataset. p99 was 0.961 on the same data -- still a high-similarity bar, but
+        # with headroom below the cap so theta actually reflects each dataset's own
+        # concept-vector spread instead of always hitting the ceiling.
+        theta = measure_theta(train_cv, percentile=99)
         theta_merge = min(theta + 0.04, 0.999)
         print(f"[INFO] Measured theta={theta:.4f}  theta_merge={theta_merge:.4f} (theta+0.04)")
-        if not args.use_hard_cv:
-            print("[WARN] --use_hard_cv is NOT set: Stage 2 will cluster on CONTINUOUS soft "
-                  "vectors while theta was calibrated on binarized ones -- soft cosine "
-                  "similarities trend systematically higher than hard ones (shared near-zero "
-                  "baseline across mostly-absent concepts), so this theta may end up stricter "
-                  "than intended for soft matching. Pass --use_hard_cv together with --theta auto "
-                  "for a fully consistent calibration (also matches the real CRL/RRL paper's own "
-                  "Step 0 binarization).")
-        if cluster_dims is None:
-            print("[WARN] cluster_dims=None (Stage 2 clusters on the FULL vector incl. "
-                  "s1_label_pred) but theta was measured concept-only -- the label slot adds "
-                  "extra correlated similarity on top of this, so effective matching may be "
-                  "looser than theta implies. Consider --exclude_label_slot to keep measurement "
-                  "and clustering consistent (also reduces circular rules, see earlier findings).")
     else:
         theta = float(args.theta)
         theta_merge = args.theta_merge
