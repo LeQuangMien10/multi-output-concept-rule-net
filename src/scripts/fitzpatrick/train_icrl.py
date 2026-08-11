@@ -584,15 +584,16 @@ def main():
               "concept vectors (train split, respecting cluster_dims/--use_hard_cv exactly "
               "as configured for this run)...")
         train_cv = collect_concept_vectors(system1, train_loader, device, args.use_hard_cv, cluster_dims)
-        # percentile=99 (not measure_theta's own 99.9 default): measured locally on the
-        # CRL-matched scope with the exact soft/full-vector config above, p99.9 of the
-        # off-diagonal cosine similarity distribution was already 0.998 -- so the +0.02
-        # safety margin (tuned for train_icrl_gt_ablation.py's discrete GT vectors, where
-        # p99.9 sits far from 1.0) pushes past the 0.999 cap and saturates there regardless
-        # of dataset. p99 was 0.961 on the same data -- still a high-similarity bar, but
-        # with headroom below the cap so theta actually reflects each dataset's own
-        # concept-vector spread instead of always hitting the ceiling.
-        theta = measure_theta(train_cv, percentile=99)
+        # percentile=95 (not measure_theta's own 99.9 default): measured locally across all
+        # 3 Fitzpatrick scopes with the exact soft/full-vector config above --
+        #   p99   -> CRL-matched=0.961  concept-only=0.988  full-data=0.982  (2 of 3 still hit
+        #            the 0.999 cap after +0.02 margin -- not just a CRL-matched-specific fluke)
+        #   p95   -> CRL-matched=0.826  concept-only=0.972  full-data=0.955  (none hit the cap)
+        # The 35-concept scopes' cosine-similarity distributions sit closer to 1.0 overall than
+        # the 48-concept CRL-matched one, so even p99 wasn't low enough headroom below the 0.999
+        # cap for them. p95 keeps theta below the cap for all 3 scopes while still producing a
+        # meaningfully different, high-similarity bar per dataset.
+        theta = measure_theta(train_cv, percentile=95)
         theta_merge = min(theta + 0.04, 0.999)
         print(f"[INFO] Measured theta={theta:.4f}  theta_merge={theta_merge:.4f} (theta+0.04)")
     else:
