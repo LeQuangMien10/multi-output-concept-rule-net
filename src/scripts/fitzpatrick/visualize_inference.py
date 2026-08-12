@@ -53,7 +53,7 @@ from torchvision import transforms
 from src.datasets.fitzpatrick.fitzpatrick_dataset import FitzpatrickDataset, build_transforms
 from src.models.fitzpatrick.system1 import FitzpatrickSystem1, soft_concept_vector
 from src.models.icrl_rule_memory import ICRLRuleMemory
-from src.utils.fitzpatrick_concepts import CONCEPT_NAMES, NUM_CONCEPTS, LABEL_NAMES, NUM_LABELS, FULL_CV_DIM
+from src.utils.fitzpatrick_concepts import LABEL_NAMES as DEFAULT_LABEL_NAMES
 
 
 BG = "#f7f7f5"
@@ -62,8 +62,13 @@ INK_SOFT = "#57564e"
 GRID = "#e2e0d8"
 NO_GT = "#9a9a94"
 LABEL_COLOR = {"benign": "#1a52a0", "malignant": "#c0392b", "non-neoplastic": "#0d7a5f"}
+LABEL_COLOR_FALLBACK = ["#1a52a0", "#c0392b", "#0d7a5f", "#8e5ea8", "#c77c1f"]
 STATUS_GOOD = "#0ca30c"
 STATUS_CRIT = "#d03b3b"
+
+
+def label_color(name: str, idx: int) -> str:
+    return LABEL_COLOR.get(name, LABEL_COLOR_FALLBACK[idx % len(LABEL_COLOR_FALLBACK)])
 
 # Ten hien thi rut gon cho cac concept ten dai -- tranh y-tick label de len cot anh ben canh.
 CONCEPT_DISPLAY_NAME = {
@@ -86,6 +91,9 @@ def parse_args():
     p.add_argument("--icrl_dir", type=str, default="/kaggle/working/outputs/fitzpatrick_icrl")
     p.add_argument("--output_dir", type=str, default=None,
                     help="Mac dinh: <icrl_dir>/inference_cards")
+    p.add_argument("--label_names", type=str, default=None,
+                    help="Comma-separated, override cho scope khac 3-lop mac dinh "
+                         "(vd. --label_names benign,malignant cho CRL-matched).")
     p.add_argument("--split", type=str, default="val", choices=["train", "val", "test"])
     p.add_argument("--indices", type=int, nargs="+", default=None,
                     help="Chon dung cac dong theo index trong split. Neu set, bo qua --filter/--n_examples.")
@@ -106,8 +114,8 @@ def load_system1(ckpt_path: Path, device: torch.device):
     model = FitzpatrickSystem1(
         backbone_name=saved_args.get("backbone", "resnet50"),
         pretrained=False,
-        num_concepts=saved_args.get("num_concepts", NUM_CONCEPTS),
-        num_labels=saved_args.get("num_labels", NUM_LABELS),
+        num_concepts=saved_args["num_concepts"],
+        num_labels=saved_args["num_labels"],
     )
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval().to(device)
@@ -157,7 +165,9 @@ def load_display_image(img_dir: Path, filename: str, image_size: int) -> np.ndar
 
 
 @torch.no_grad()
-def run_one(row, img_dir, image_size, system1, memory, head, centroids, device):
+def run_one(row, img_dir, image_size, system1, memory, head, centroids, device,
+            concept_names, label_names):
+    num_concepts = len(concept_names)
     model_transform = build_transforms("val", image_size)
     pil_img = Image.open(img_dir / row["filename"]).convert("RGB")
     image = model_transform(pil_img).unsqueeze(0).to(device)
@@ -183,7 +193,7 @@ def run_one(row, img_dir, image_size, system1, memory, head, centroids, device):
     # thi khong), va bo sot concept anh nay THAT SU co manh nhung centroid
     # (bi pha loang boi cac anh khac) khong vuot 0.5. Phan ra tung chieu
     # dong gop bao nhieu vao cosine similarity moi la ly do THAT SU.
-    dim_names = list(CONCEPT_NAMES) + [f"label:{n}" for n in LABEL_NAMES]
+    dim_names = list(concept_names) + [f"label:{n}" for n in label_names]
     s, e = memory.cluster_dims if memory.cluster_dims else (0, full_cv.shape[1])
     cv_n = F.normalize(full_cv[:, s:e], dim=1)[0]
     centroid_n = F.normalize(centroids[rule_id, s:e].unsqueeze(0), dim=1)[0]
@@ -197,7 +207,7 @@ def run_one(row, img_dir, image_size, system1, memory, head, centroids, device):
 
     true_label = int(row["label_idx"])
     has_concept_gt = row["concept_mask"] == "1"
-    concept_gt = [float(row[c]) for c in CONCEPT_NAMES] if has_concept_gt else [None] * NUM_CONCEPTS
+    concept_gt = [float(row[c]) for c in concept_names] if has_concept_gt else [None] * num_concepts
 
     return {
         "filename": row["filename"],
@@ -219,7 +229,9 @@ def run_one(row, img_dir, image_size, system1, memory, head, centroids, device):
     }
 
 
-def draw_card(rec, rules_by_id, save_path):
+def draw_card(rec, rules_by_id, save_path, concept_names, label_names):
+    num_concepts = len(concept_names)
+    num_labels = len(label_names)
     cat = categorize(rec["s1_correct"], rec["s2_correct"])
     border_color = STATUS_GOOD if rec["s2_correct"] else STATUS_CRIT
 
@@ -227,9 +239,9 @@ def draw_card(rec, rules_by_id, save_path):
     gs = fig.add_gridspec(1, 4, width_ratios=[0.85, 1.65, 0.85, 1.25], wspace=0.55,
                            left=0.035, right=0.98, top=0.86, bottom=0.06)
 
-    true_name = LABEL_NAMES[rec["true_label"]]
-    s1_name = LABEL_NAMES[rec["s1_pred"]]
-    s2_name = LABEL_NAMES[rec["s2_pred"]]
+    true_name = label_names[rec["true_label"]]
+    s1_name = label_names[rec["s1_pred"]]
+    s2_name = label_names[rec["s2_pred"]]
     fig.suptitle(f"Fitzpatrick17k — Trace suy luận 1 ảnh  ·  {rec['filename']}  ·  [{cat}]",
                  fontsize=13, fontweight="bold", color=INK, x=0.035, y=0.97, ha="left")
 
@@ -246,30 +258,30 @@ def draw_card(rec, rules_by_id, save_path):
     # -- 35 concept, sap theo xac suat giam dan --
     ax_c = fig.add_subplot(gs[0, 1])
     ax_c.set_facecolor(BG)
-    order = sorted(range(NUM_CONCEPTS), key=lambda i: -rec["concept_probs"][i])
+    order = sorted(range(num_concepts), key=lambda i: -rec["concept_probs"][i])
     probs = [rec["concept_probs"][i] for i in order]
     pred = [rec["concept_pred"][i] for i in order]
     gt = [rec["concept_gt"][i] for i in order]
-    names = [display_name(CONCEPT_NAMES[i]) for i in order]
-    y = np.arange(NUM_CONCEPTS)
+    names = [display_name(concept_names[i]) for i in order]
+    y = np.arange(num_concepts)
     colors = []
-    for i in range(NUM_CONCEPTS):
+    for i in range(num_concepts):
         if gt[i] is None:
             colors.append(NO_GT)
         else:
             colors.append(STATUS_GOOD if pred[i] == gt[i] else STATUS_CRIT)
     ax_c.barh(y, probs, color=colors, height=0.65, zorder=3)
     ax_c.axvline(0.5, color=INK_SOFT, linewidth=0.8, linestyle=":", zorder=2)
-    for i in range(NUM_CONCEPTS):
+    for i in range(num_concepts):
         marker = "?" if gt[i] is None else ("●" if gt[i] == 1 else "○")
         ax_c.text(1.03, i, marker, fontsize=7.5, color=INK_SOFT, va="center")
     ax_c.set_yticks(y)
     ax_c.set_yticklabels(names, fontsize=6.3)
     ax_c.set_xlim(0, 1.12)
-    ax_c.set_ylim(-0.6, NUM_CONCEPTS - 0.4)
+    ax_c.set_ylim(-0.6, num_concepts - 0.4)
     ax_c.invert_yaxis()
     ax_c.tick_params(colors=INK_SOFT, labelsize=6.5)
-    ax_c.set_title("S1: 35 concept (xanh/đỏ = đúng/sai so GT thật,\nxám = ảnh không có GT)  ● GT có  ○ GT không",
+    ax_c.set_title(f"S1: {num_concepts} concept (xanh/đỏ = đúng/sai so GT thật,\nxám = ảnh không có GT)  ● GT có  ○ GT không",
                     fontsize=7.5, color=INK_SOFT)
     for spine in ["top", "right"]:
         ax_c.spines[spine].set_visible(False)
@@ -279,10 +291,10 @@ def draw_card(rec, rules_by_id, save_path):
     # -- S1 label distribution (= s1_label_pred, cung la 1 concept dung de cluster) --
     ax_l = fig.add_subplot(gs[0, 2])
     ax_l.set_facecolor(BG)
-    yl = np.arange(NUM_LABELS)
-    colors_l = [LABEL_COLOR[n] for n in LABEL_NAMES]
+    yl = np.arange(num_labels)
+    colors_l = [label_color(n, i) for i, n in enumerate(label_names)]
     ax_l.barh(yl, rec["label_probs"], color=colors_l, height=0.6, zorder=3)
-    ax_l.set_yticks(yl); ax_l.set_yticklabels(LABEL_NAMES, fontsize=8)
+    ax_l.set_yticks(yl); ax_l.set_yticklabels(label_names, fontsize=8)
     ax_l.set_xlim(0, 1.02)
     true_pos = rec["true_label"]
     ax_l.get_yticklabels()[true_pos].set_fontweight("bold")
@@ -352,10 +364,20 @@ def main():
               else torch.device("cpu")) if args.device == "auto" else torch.device(args.device)
     rng = random.Random(args.seed)
 
+    label_names = args.label_names.split(",") if args.label_names else list(DEFAULT_LABEL_NAMES)
+
     system1, image_size = load_system1(Path(args.system1_ckpt), device)
     icrl_dir = Path(args.icrl_dir)
     memory = ICRLRuleMemory.load(icrl_dir / "icrl_rule_memory.pt", device=str(device))
-    head = nn.Linear(FULL_CV_DIM, NUM_LABELS).to(device)
+
+    data_dir = Path(args.data_dir)
+    csv_path = data_dir / f"{args.split}.csv"
+    dataset = FitzpatrickDataset(csv_path, args.img_dir, build_transforms("val", image_size))
+    concept_names = dataset.concept_names
+    full_cv_dim = len(concept_names) + len(label_names)
+    print(f"[INFO] {len(concept_names)} concepts, {len(label_names)} labels ({label_names})", flush=True)
+
+    head = nn.Linear(full_cv_dim, len(label_names)).to(device)
     head.load_state_dict(torch.load(icrl_dir / "prediction_head.pt", map_location=device, weights_only=False))
     head.eval()
     centroids = memory.get_centroids().to(device)
@@ -363,10 +385,7 @@ def main():
     with open(icrl_dir / "icrl_rules.json", encoding="utf-8") as f:
         rules_by_id = {r["rule_id"]: r for r in json.load(f)}
 
-    data_dir = Path(args.data_dir)
-    csv_path = data_dir / f"{args.split}.csv"
-    with open(csv_path, encoding="utf-8") as f:
-        rows = list(csv.DictReader(f))
+    rows = dataset.rows
     print(f"[INFO] {args.split} set: {len(rows)} samples")
 
     if args.indices:
@@ -376,7 +395,6 @@ def main():
         if args.filter == "all":
             pool = list(range(len(rows)))
         else:
-            dataset = FitzpatrickDataset(csv_path, args.img_dir, build_transforms("val", image_size))
             loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
             cats = scan_categories(loader, system1, memory, head, centroids, device)
             pool = [i for i, c in enumerate(cats) if c == args.filter]
@@ -398,10 +416,11 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     for idx in chosen:
-        rec = run_one(rows[idx], Path(args.img_dir), image_size, system1, memory, head, centroids, device)
+        rec = run_one(rows[idx], Path(args.img_dir), image_size, system1, memory, head, centroids, device,
+                      concept_names, label_names)
         cat = categorize(rec["s1_correct"], rec["s2_correct"])
         out_path = output_dir / f"{args.split}_{idx}_{cat}.png"
-        draw_card(rec, rules_by_id, out_path)
+        draw_card(rec, rules_by_id, out_path, concept_names, label_names)
         print(f"[DONE] {idx} [{cat}] -> {out_path}")
 
 
