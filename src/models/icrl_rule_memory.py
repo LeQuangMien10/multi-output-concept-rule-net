@@ -491,6 +491,108 @@ class ICRLRuleMemory:
 
         return best_ids, (sims if return_scores else None)
 
+    @torch.no_grad()
+    def predict_weighted_activation(
+        self,
+        concept_vecs:    torch.Tensor,
+        concept_keys:    list[str],
+        concept_offsets: dict[str, int],
+        concept_dims:    dict[str, int],
+        num_classes:     int,
+        exclude_keys:    Optional[set[str]] = None,
+        threshold:       float = 0.5,
+        min_total_weight: float = 1e-6,
+        hard_gate:       bool = True,
+        gate_threshold:  Optional[float] = None,
+    ) -> dict[str, torch.Tensor]:
+        """
+        Du doan bang CACH KHAC voi match()+head(): thay vi chi 1 rule "gan
+        nhat" thang tuyet doi, MOI rule co present_concepts la tap con cua
+        cac concept dang "on" o anh nay deu duoc coi la KICH HOAT, voi
+        firing_strength = soft-AND (product t-norm, giong ConjunctionLayer
+        cua CRL/RRL that -- xem src/models/baselines/crl_rrl_components.py)
+        = tich xac suat S1 cua tung concept trong present_concepts. Nhan cuoi
+        cung = weighted vote giua cac rule kich hoat, trong so =
+        firing_strength * confidence cua rule -- khong dung head() (khong
+        can train lai gi ca, thuan tuy dua tren thong ke rule co san).
+
+        hard_gate=True (mac dinh): mot rule CHI thuc su kich hoat neu TAT CA
+        present_concepts cua no co xac suat S1 > gate_threshold o anh nay
+        (nhi phan hoa truoc, giong dung "concept co mat/khong" thay vi cho
+        moi rule mot chut firing_strength nho giot du chi 1-2 concept yeu) --
+        firing_strength van la soft-AND (product) NHUNG bi ep ve 0 cho moi
+        rule khong qua gate. Muc dich: tranh "activate tran lan" (hang chuc
+        rule cung co firing_strength > 0 dong thoi, pha loang tin hieu).
+        hard_gate=False: giu nguyen soft-AND thuan tuy (khong gate), moi
+        rule deu co firing_strength > 0 it nhieu mien present_concepts
+        khong rong.
+
+        Fallback: anh nao KHONG rule nao kich hoat dang ke (tong trong so <
+        min_total_weight) se dung match() (nearest-rule) thay the.
+
+        Returns dict: pred [B], used_fallback [B] bool, n_fired [B] so rule
+        co firing_strength > 0.01 (chi de chan doan/debug).
+        """
+        gate_threshold = threshold if gate_threshold is None else gate_threshold
+        exclude_keys = exclude_keys or set()
+        device = concept_vecs.device
+        R = self.num_rules
+        B = concept_vecs.shape[0]
+
+        from collections import Counter
+
+        # present_concepts membership mask [R, num_concept_keys] -- tinh 1
+        # lan, khong phu thuoc anh.
+        keys_used = [k for k in concept_keys if k not in exclude_keys]
+        mask = torch.zeros(R, len(keys_used), device=device)
+        rule_labels = torch.zeros(R, dtype=torch.long, device=device)
+        for r in range(R):
+            mu = self._mu[r]
+            for j, key in enumerate(keys_used):
+                s = concept_offsets[key]
+                e = s + concept_dims[key]
+                if mu[s:e].item() >= threshold:
+                    mask[r, j] = 1.0
+            rule_labels[r] = (Counter(self._labels[r]).most_common(1)[0][0]
+                               if self._labels[r] else -1)
+        confidences = torch.tensor(self.get_confidences(), device=device)  # [R]
+
+        concept_probs = torch.stack(
+            [concept_vecs[:, concept_offsets[k]:concept_offsets[k] + concept_dims[k]].squeeze(-1)
+             if concept_dims[k] == 1 else concept_vecs[:, concept_offsets[k]:concept_offsets[k] + concept_dims[k]].max(dim=1).values
+             for k in keys_used], dim=1
+        )  # [B, num_concept_keys]
+        log_probs = torch.log(concept_probs.clamp(min=1e-6))  # [B, num_concept_keys]
+        log_firing = log_probs @ mask.T                        # [B, R] -- sum of logs over masked concepts
+        firing_strength = torch.exp(log_firing)                # [B, R], empty-mask rule -> 1.0 (vacuously true)
+
+        if hard_gate:
+            concept_on = (concept_probs > gate_threshold).float()          # [B, num_concept_keys]
+            required_count = mask.sum(dim=1)                                # [R]
+            matched_count = concept_on @ mask.T                             # [B, R]
+            gate = (matched_count >= required_count.unsqueeze(0) - 1e-6)    # [B, R] bool
+            firing_strength = firing_strength * gate.float()
+
+        weight = firing_strength * confidences.unsqueeze(0)    # [B, R]
+        class_scores = torch.zeros(B, num_classes, device=device)
+        for r in range(R):
+            y = int(rule_labels[r].item())
+            if y >= 0:
+                class_scores[:, y] += weight[:, r]
+
+        total_weight = weight.sum(dim=1)                       # [B]
+        pred = class_scores.argmax(dim=1)
+        used_fallback = total_weight < min_total_weight
+        if used_fallback.any():
+            fallback_ids, _ = self.match(concept_vecs[used_fallback])
+            fallback_labels = rule_labels[fallback_ids]
+            pred[used_fallback] = fallback_labels
+
+        n_fired = (firing_strength > 0.01).sum(dim=1)
+
+        return {"pred": pred, "used_fallback": used_fallback, "n_fired": n_fired,
+                "class_scores": class_scores, "firing_strength": firing_strength}
+
     # ── Decode ──────────────────────────────────────────────
 
     def decode_rule(
