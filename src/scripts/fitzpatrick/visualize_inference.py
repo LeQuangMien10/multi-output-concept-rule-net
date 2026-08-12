@@ -176,6 +176,25 @@ def run_one(row, img_dir, image_size, system1, memory, head, centroids, device):
     s2_logits = head(rule_cv)
     s2_pred = int(s2_logits[0].argmax())
 
+    # Ly do match THAT SU cho ANH NAY -- khac voi rule["present_concepts"]
+    # (threshold 0.5 tren centroid TRUNG BINH cua ca cum, khong phai tren anh
+    # nay). "present_concepts" co the liet ke 1 concept ma chinh anh nay gan
+    # nhu khong co (centroid cao vi cac anh KHAC trong cum co, con anh nay
+    # thi khong), va bo sot concept anh nay THAT SU co manh nhung centroid
+    # (bi pha loang boi cac anh khac) khong vuot 0.5. Phan ra tung chieu
+    # dong gop bao nhieu vao cosine similarity moi la ly do THAT SU.
+    dim_names = list(CONCEPT_NAMES) + [f"label:{n}" for n in LABEL_NAMES]
+    s, e = memory.cluster_dims if memory.cluster_dims else (0, full_cv.shape[1])
+    cv_n = F.normalize(full_cv[:, s:e], dim=1)[0]
+    centroid_n = F.normalize(centroids[rule_id, s:e].unsqueeze(0), dim=1)[0]
+    contrib = cv_n * centroid_n
+    order = torch.argsort(contrib, descending=True)
+    top_contributors = [
+        {"dim": dim_names[s + i], "contrib": float(contrib[i]),
+         "pct_of_sim": float(contrib[i] / max(match_sim, 1e-9))}
+        for i in order[:5].tolist()
+    ]
+
     true_label = int(row["label_idx"])
     has_concept_gt = row["concept_mask"] == "1"
     concept_gt = [float(row[c]) for c in CONCEPT_NAMES] if has_concept_gt else [None] * NUM_CONCEPTS
@@ -192,6 +211,7 @@ def run_one(row, img_dir, image_size, system1, memory, head, centroids, device):
         "s1_correct": s1_pred == true_label,
         "rule_id": rule_id,
         "match_sim": match_sim,
+        "top_contributors": top_contributors,
         "s2_pred": s2_pred,
         "s2_correct": s2_pred == true_label,
         "true_label": true_label,
@@ -281,15 +301,28 @@ def draw_card(rec, rules_by_id, save_path):
     for spine in ax_t.spines.values():
         spine.set_visible(False)
 
+    # "present_concepts" la threshold 0.5 tren centroid TRUNG BINH ca cum --
+    # co the KHONG phai ly do anh NAY match (vd. concept present o centroid
+    # vi cac anh KHAC trong cum co, con anh nay gan nhu khong; hoac nguoc
+    # lai, concept anh nay THAT SU co manh nhung centroid bi pha loang
+    # khong vuot 0.5 nen khong duoc liet ke). top_contributors la phan ra
+    # thuc te tung chieu dong gop bao nhieu vao cosine similarity CHO CHINH
+    # ANH NAY -- moi la ly do that su khien no match vao rule nay.
+    contrib_lines = "\n".join(
+        f"  {i+1}. {c['dim']:<20s} {c['pct_of_sim']*100:3.0f}%"
+        for i, c in enumerate(rec["top_contributors"])
+    )
     ri = rules_by_id.get(rec["rule_id"])
     if ri is not None:
         present = ", ".join(ri.get("present_concepts", [])) or "(rỗng)"
         rule_txt = (f"Rule #{rec['rule_id']}  (n={ri['n']}, conf={ri['confidence']:.3f})\n"
-                    f"concept: {{{present}}}\n"
+                    f"concept rule (TB cả cụm): {{{present}}}\n"
                     f"nhãn rule: {ri['label_name']}\n"
-                    f"match sim: {rec['match_sim']:.3f}")
+                    f"match sim: {rec['match_sim']:.3f}\n"
+                    f"Vì sao match ảnh NÀY (top đóng góp):\n{contrib_lines}")
     else:
-        rule_txt = f"Rule #{rec['rule_id']}  (không có metadata)\nmatch sim: {rec['match_sim']:.3f}"
+        rule_txt = (f"Rule #{rec['rule_id']}  (không có metadata)\nmatch sim: {rec['match_sim']:.3f}\n"
+                    f"Vì sao match ảnh NÀY (top đóng góp):\n{contrib_lines}")
 
     s1_mark = "✓" if rec["s1_correct"] else "✗"
     s2_mark = "✓" if rec["s2_correct"] else "✗"
@@ -297,9 +330,9 @@ def draw_card(rec, rules_by_id, save_path):
     s2_color = STATUS_GOOD if rec["s2_correct"] else STATUS_CRIT
     change_txt = "→ KHÔNG đổi" if not rec["changed"] else "→ CÓ đổi"
 
-    ax_t.text(0.0, 0.97, rule_txt, fontsize=8.6, color=INK, va="top", ha="left",
+    ax_t.text(0.0, 0.97, rule_txt, fontsize=8.0, color=INK, va="top", ha="left",
               transform=ax_t.transAxes, family="monospace", wrap=True)
-    ax_t.text(0.0, 0.40, f"S1 tự đoán: {s1_name} {s1_mark}", fontsize=9.5, color=s1_color,
+    ax_t.text(0.0, 0.33, f"S1 tự đoán: {s1_name} {s1_mark}", fontsize=9.5, color=s1_color,
               va="top", ha="left", transform=ax_t.transAxes, fontweight="bold")
     ax_t.text(0.0, 0.28, f"S2 (qua rule): {s2_name} {s2_mark}", fontsize=9.5, color=s2_color,
               va="top", ha="left", transform=ax_t.transAxes, fontweight="bold")
