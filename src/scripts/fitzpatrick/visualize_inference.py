@@ -105,6 +105,13 @@ def parse_args():
     p.add_argument("--num_workers", type=int, default=0)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--device", type=str, default="auto")
+    p.add_argument("--gated_s1_thresh", type=float, default=None,
+                    help="Neu set (cung voi --gated_rule_conf_thresh): ve them ket luan cuoi "
+                         "cua ensemble gated-override -- mac dinh tin S1, chi doi sang S2 khi "
+                         "S1 khong tu tin (max_prob < nguong nay) VA rule S2 du tin cay.")
+    p.add_argument("--gated_rule_conf_thresh", type=float, default=None,
+                    help="Nguong confidence toi thieu cua rule S2 de duoc phep override S1 "
+                         "(chi dung khi --gated_s1_thresh cung duoc set).")
     return p.parse_args()
 
 
@@ -166,7 +173,8 @@ def load_display_image(img_dir: Path, filename: str, image_size: int) -> np.ndar
 
 @torch.no_grad()
 def run_one(row, img_dir, image_size, system1, memory, head, centroids, device,
-            concept_names, label_names):
+            concept_names, label_names, rule_confidences=None,
+            gated_s1_thresh=None, gated_rule_conf_thresh=None):
     num_concepts = len(concept_names)
     model_transform = build_transforms("val", image_size)
     pil_img = Image.open(img_dir / row["filename"]).convert("RGB")
@@ -209,6 +217,17 @@ def run_one(row, img_dir, image_size, system1, memory, head, centroids, device,
     has_concept_gt = row["concept_mask"] == "1"
     concept_gt = [float(row[c]) for c in concept_names] if has_concept_gt else [None] * num_concepts
 
+    # Ensemble gated-override (uu tien 3 -- "chi doi khi can"): mac dinh tin S1,
+    # chi doi sang S2 khi S1 khong tu tin VA rule S2 du tin cay. Chi tinh khi ca
+    # 2 nguong duoc truyen vao -- xem error_breakdown_and_match_contribution.md muc 7.
+    gated_pred = None
+    gated_override = None
+    if gated_s1_thresh is not None and gated_rule_conf_thresh is not None:
+        s1_max_prob = float(label_probs.max())
+        rule_conf = float(rule_confidences[rule_id]) if rule_confidences is not None else 0.0
+        gated_override = (s1_max_prob < gated_s1_thresh) and (rule_conf > gated_rule_conf_thresh)
+        gated_pred = s2_pred if gated_override else s1_pred
+
     return {
         "filename": row["filename"],
         "display_image": load_display_image(img_dir, row["filename"], image_size),
@@ -226,6 +245,11 @@ def run_one(row, img_dir, image_size, system1, memory, head, centroids, device,
         "s2_correct": s2_pred == true_label,
         "true_label": true_label,
         "changed": s1_pred != s2_pred,
+        "gated_pred": gated_pred,
+        "gated_override": gated_override,
+        "gated_correct": (gated_pred == true_label) if gated_pred is not None else None,
+        "gated_s1_thresh": gated_s1_thresh,
+        "gated_rule_conf_thresh": gated_rule_conf_thresh,
     }
 
 
@@ -331,10 +355,10 @@ def draw_card(rec, rules_by_id, save_path, concept_names, label_names):
                     f"concept rule (TB cả cụm): {{{present}}}\n"
                     f"nhãn rule: {ri['label_name']}\n"
                     f"match sim: {rec['match_sim']:.3f}\n"
-                    f"Vì sao match ảnh NÀY (top đóng góp):\n{contrib_lines}")
+                    f"Ensemble Concepts:\n{contrib_lines}")
     else:
         rule_txt = (f"Rule #{rec['rule_id']}  (không có metadata)\nmatch sim: {rec['match_sim']:.3f}\n"
-                    f"Vì sao match ảnh NÀY (top đóng góp):\n{contrib_lines}")
+                    f"Ensemble Concepts:\n{contrib_lines}")
 
     s1_mark = "✓" if rec["s1_correct"] else "✗"
     s2_mark = "✓" if rec["s2_correct"] else "✗"
@@ -350,7 +374,21 @@ def draw_card(rec, rules_by_id, save_path, concept_names, label_names):
               va="top", ha="left", transform=ax_t.transAxes, fontweight="bold")
     ax_t.text(0.0, 0.16, change_txt, fontsize=8.6, color=INK_SOFT, va="top", ha="left",
               transform=ax_t.transAxes)
-    ax_t.text(0.0, 0.02, f"[{cat}]", fontsize=10, color=border_color, va="top", ha="left",
+
+    cat_y = 0.02
+    if rec.get("gated_pred") is not None:
+        gated_name = label_names[rec["gated_pred"]]
+        gated_mark = "✓" if rec["gated_correct"] else "✗"
+        gated_color = STATUS_GOOD if rec["gated_correct"] else STATUS_CRIT
+        gated_note = ("→ ĐỔI sang S2 (S1 chưa chắc + rule đủ tin)" if rec["gated_override"]
+                       else "→ giữ nguyên S1 (không đổi)")
+        gated_txt = (f"Ensemble (gated, s1<{rec['gated_s1_thresh']} & rule>{rec['gated_rule_conf_thresh']}):\n"
+                     f"{gated_name} {gated_mark}\n{gated_note}")
+        ax_t.text(0.0, 0.11, gated_txt, fontsize=7.8, color=gated_color, va="top", ha="left",
+                  transform=ax_t.transAxes, fontweight="bold")
+        cat_y = -0.035
+
+    ax_t.text(0.0, cat_y, f"[{cat}]", fontsize=10, color=border_color, va="top", ha="left",
               transform=ax_t.transAxes, fontweight="bold",
               bbox=dict(boxstyle="round,pad=0.3", facecolor="white", edgecolor=border_color))
 
@@ -381,6 +419,7 @@ def main():
     head.load_state_dict(torch.load(icrl_dir / "prediction_head.pt", map_location=device, weights_only=False))
     head.eval()
     centroids = memory.get_centroids().to(device)
+    rule_confidences = torch.tensor(memory.get_confidences(), device=device)
 
     with open(icrl_dir / "icrl_rules.json", encoding="utf-8") as f:
         rules_by_id = {r["rule_id"]: r for r in json.load(f)}
@@ -417,7 +456,8 @@ def main():
 
     for idx in chosen:
         rec = run_one(rows[idx], Path(args.img_dir), image_size, system1, memory, head, centroids, device,
-                      concept_names, label_names)
+                      concept_names, label_names, rule_confidences=rule_confidences,
+                      gated_s1_thresh=args.gated_s1_thresh, gated_rule_conf_thresh=args.gated_rule_conf_thresh)
         cat = categorize(rec["s1_correct"], rec["s2_correct"])
         out_path = output_dir / f"{args.split}_{idx}_{cat}.png"
         draw_card(rec, rules_by_id, out_path, concept_names, label_names)

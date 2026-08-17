@@ -25,6 +25,9 @@ Thumbs.db
 *.log
 logs/
 
+# Reports (generated locally, not tracked)
+reports/
+
 # Data generated or downloaded
 data/
 *.csv
