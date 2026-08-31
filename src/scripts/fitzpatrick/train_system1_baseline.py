@@ -95,6 +95,14 @@ def parse_args():
                     choices=["concept_macro_f1", "concept_mean_acc", "label_acc"],
                     help="Metric dung de luu best checkpoint.")
 
+    p.add_argument("--concept_loss_weight", type=float, default=1.0,
+                    help="He so nhan voi concept_loss truoc khi cong vao label_loss. "
+                         "Dat 0.0 de train mot classifier CHI giam sat boi label "
+                         "(khong concept supervision) -- dung khi can mot black-box "
+                         "classifier thuan tuy lam input cho "
+                         "baseline_neurosymbolic_rules.py (Basci et al.), thay vi "
+                         "System~1 da co concept head giam sat truc tiep.")
+
     return p.parse_args()
 
 
@@ -155,7 +163,7 @@ def compute_concept_metrics(all_logits: torch.Tensor, all_targets: torch.Tensor,
     }
 
 
-def train_one_epoch(model, loader, optimizer, device, grad_clip_norm):
+def train_one_epoch(model, loader, optimizer, device, grad_clip_norm, concept_loss_weight=1.0):
     model.train()
     total_loss, total_n = 0.0, 0
 
@@ -168,7 +176,7 @@ def train_one_epoch(model, loader, optimizer, device, grad_clip_norm):
         out = model(images)
         concept_loss = masked_bce_loss(out["concepts"], concepts, concept_mask)
         label_loss = F.cross_entropy(out["label"], target_label)
-        loss = concept_loss + label_loss
+        loss = concept_loss_weight * concept_loss + label_loss
 
         optimizer.zero_grad()
         loss.backward()
@@ -183,7 +191,7 @@ def train_one_epoch(model, loader, optimizer, device, grad_clip_norm):
 
 
 @torch.no_grad()
-def evaluate(model, loader, device, split_name="Val"):
+def evaluate(model, loader, device, split_name="Val", concept_loss_weight=1.0):
     model.eval()
     all_concept_logits, all_concept_targets, all_concept_mask = [], [], []
     label_correct, label_total = 0, 0
@@ -198,7 +206,7 @@ def evaluate(model, loader, device, split_name="Val"):
         out = model(images)
         concept_loss = masked_bce_loss(out["concepts"], concepts, concept_mask)
         label_loss = F.cross_entropy(out["label"], target_label)
-        loss = concept_loss + label_loss
+        loss = concept_loss_weight * concept_loss + label_loss
 
         total_loss += loss.item() * images.size(0)
         total_n += images.size(0)
@@ -268,8 +276,10 @@ def main():
     for epoch in range(1, args.epochs + 1):
         print(f"\nEpoch {epoch}/{args.epochs}")
 
-        train_metrics = train_one_epoch(model, train_loader, optimizer, device, args.grad_clip_norm)
-        val_metrics = evaluate(model, val_loader, device, split_name="Val")
+        train_metrics = train_one_epoch(model, train_loader, optimizer, device, args.grad_clip_norm,
+                                         concept_loss_weight=args.concept_loss_weight)
+        val_metrics = evaluate(model, val_loader, device, split_name="Val",
+                                concept_loss_weight=args.concept_loss_weight)
 
         if scheduler is not None:
             scheduler.step()
@@ -303,7 +313,8 @@ def main():
     best_ckpt = torch.load(output_dir / "best_model.pt", map_location=device, weights_only=False)
     model.load_state_dict(best_ckpt["model_state_dict"])
 
-    test_metrics = evaluate(model, test_loader, device, split_name="Test")
+    test_metrics = evaluate(model, test_loader, device, split_name="Test",
+                             concept_loss_weight=args.concept_loss_weight)
 
     results = {
         "best_val_metric": best_val_metric,
