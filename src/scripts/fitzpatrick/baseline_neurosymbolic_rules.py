@@ -58,6 +58,10 @@ import torch
 from src.scripts.fitzpatrick.train_icrl import load_system1, make_loaders
 
 
+def _tree_max_depth_type(s: str):
+    return None if s.lower() == "none" else int(s)
+
+
 def parse_args():
     p = argparse.ArgumentParser(description="Basci et al. neuro-symbolic rule baseline, CRL-matched scope.")
     p.add_argument("--data_dir", type=str, required=True)
@@ -69,8 +73,10 @@ def parse_args():
     p.add_argument("--batch_size", type=int, default=64)
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--device", type=str, default="auto")
-    p.add_argument("--tree_max_depth", type=int, default=5,
-                    help="Do sau toi da decision tree (giu rule ngan gon/doc duoc, giong C4.5 co pruning).")
+    p.add_argument("--tree_max_depth", type=_tree_max_depth_type, default=5,
+                    help="Do sau toi da decision tree (giu rule ngan gon/doc duoc, giong C4.5 co pruning). "
+                         "Dat 'none' de khong gioi han (sklearn max_depth=None) -- dung khi can do "
+                         "trade-off accuracy-vs-interpretability.")
     p.add_argument("--output_json", type=str, required=True)
     p.add_argument("--output_tree_txt", type=str, default=None,
                     help="Neu dat, ghi rule text (sklearn export_text) ra file nay de doc thu cong.")
