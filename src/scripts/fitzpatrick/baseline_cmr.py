@@ -236,6 +236,23 @@ def make_cmr_loaders(data_dir: Path, img_dir: Path, image_size: int, num_labels:
     return train_loader, val_loader, test_loader
 
 
+class _DeviceLoader:
+    """Boc 1 DataLoader, chuyen tung batch sang device truoc khi yield --
+    can cho aggregate_rules() (ham port nguyen ban tu CMR, tu goi self(batch)
+    ma khong tu chuyen device, xem cmr_reasoner.py)."""
+
+    def __init__(self, loader, device):
+        self.loader = loader
+        self.device = device
+
+    def __iter__(self):
+        for batch in self.loader:
+            yield tuple(t.to(self.device) for t in batch)
+
+    def __len__(self):
+        return len(self.loader)
+
+
 def main():
     import lightning.pytorch as pl
     from lightning.pytorch.callbacks import ModelCheckpoint
@@ -335,7 +352,7 @@ def main():
 
     if args.output_rules_txt:
         with torch.no_grad():
-            task_to_rules, _ = model.aggregate_rules(train_loader, type="most_likely")
+            task_to_rules, _ = model.aggregate_rules(_DeviceLoader(train_loader, device), type="most_likely")
         lines = []
         for task in range(num_labels):
             lines.append(f"=== Task {label_names[task]} = True ===")
