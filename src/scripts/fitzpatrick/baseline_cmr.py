@@ -351,13 +351,36 @@ def main():
         json.dump(result, f, indent=2)
 
     if args.output_rules_txt:
+        # Tu viet dinh dang dump thay vi dung get_rules_sym() cua ban goc: ham
+        # do CHI hien pos+irrelevant (mac dinh) hoac pos+neg (can
+        # orig_rule_sym_to_name khac None), khong bao gio hien ca 3 loai cung
+        # luc -- rule "0 pos, chi co neg" se hien nhu rong dua tren mac dinh,
+        # gay hieu lam ("degenerate rule") du van mang thong tin that qua cac
+        # concept "bat buoc khong co". Dump truc tiep tu get_all_rule_vars()
+        # de hien du ca required-present/required-absent cho tung rule.
         with torch.no_grad():
-            task_to_rules, _ = model.aggregate_rules(_DeviceLoader(train_loader, device), type="most_likely")
+            rule_vars = model.get_all_rule_vars()  # [n_tasks, n_rules, n_concepts, 3] pos/neg/irr
+            try:
+                _, task_to_rule_idx = model.aggregate_rules(_DeviceLoader(train_loader, device), type="most_likely")
+            except Exception as e:
+                print(f"[WARN] aggregate_rules (tan suat rule duoc chon) loi, bo qua: {e}")
+                task_to_rule_idx = None
+
         lines = []
         for task in range(num_labels):
-            lines.append(f"=== Task {label_names[task]} = True ===")
-            for rule, support in task_to_rules[task].items():
-                lines.append(f"  {rule}  (support={support})")
+            used_idx = task_to_rule_idx[task] if task_to_rule_idx is not None else None
+            lines.append(f"=== Task {label_names[task]} ==="
+                         + (f"  (rule duoc chon tren train: {sorted(used_idx)})" if used_idx else ""))
+            for rule_idx in range(args.n_rules):
+                c_type = torch.argmax(rule_vars[task, rule_idx], dim=-1)  # 0=pos,1=neg,2=irr moi concept
+                pos = [concept_names[k] for k in range(len(c_type)) if c_type[k] == 0]
+                neg = [concept_names[k] for k in range(len(c_type)) if c_type[k] == 1]
+                n_irr = num_concepts - len(pos) - len(neg)
+                lines.append(f"  rule {rule_idx}: {len(pos)} required-present, {len(neg)} required-absent, {n_irr} irrelevant")
+                if pos:
+                    lines.append(f"    required present: {', '.join(pos)}")
+                if neg:
+                    lines.append(f"    required absent:  {', '.join(neg)}")
         Path(args.output_rules_txt).parent.mkdir(parents=True, exist_ok=True)
         with open(args.output_rules_txt, "w", encoding="utf-8") as f:
             f.write("\n".join(lines))
