@@ -277,8 +277,13 @@ def main():
 
     checkpoint_cb = ModelCheckpoint(dirpath=str(output_dir), save_top_k=1, monitor="val_loss", mode="min")
     best_cb = SaveBestModelCallbackVal()
+    # devices=1 co dinh: Kaggle GPU x2 mac dinh se bat DDP neu de "auto", lam
+    # trainer.model.state_dict() (dung trong SaveBestModelCallbackVal) co tien
+    # to "module." va lam model.load_state_dict() ben duoi bao loi key-mismatch
+    # ngay truoc buoc ghi JSON -- da xac nhan qua 1 lan chay that tren Kaggle.
+    # 636 anh train qua nho de can toi 2 GPU, khong danh doi rui ro nay lay toc do.
     trainer = pl.Trainer(max_epochs=args.max_epochs, callbacks=[best_cb, checkpoint_cb],
-                          accelerator="auto", logger=False, enable_progress_bar=True)
+                          accelerator="auto", devices=1, logger=False, enable_progress_bar=True)
     trainer.fit(model=model, train_dataloaders=train_loader, val_dataloaders=val_loader)
 
     if best_cb.best_state_dict is not None:
