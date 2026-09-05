@@ -26,6 +26,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 from pathlib import Path
 
 import torch
@@ -152,6 +153,31 @@ def main():
     pred_test3[override_test] = s2_test.argmax(1)[override_test]
     print(f"  best (s1_thresh={s1_thresh}, rule_conf_thresh={rule_conf_thresh}) tren VAL: val_acc={best_val_acc3:.4f}")
     print(f"  => test_acc={acc(pred_test3, y_test):.4f}  (override {override_test.float().mean()*100:.1f}% anh test)")
+
+    print(f"\n--- Confusion categories: S1 alone vs Ensemble (gated-override, s1_thresh={s1_thresh}, "
+          f"rule_conf_thresh={rule_conf_thresh}) -- so voi eval_confusion_categories.py (S1 vs S2 rule don le) ---")
+    print("  TP: S1 dung, Ensemble dung (giu nguyen dung)")
+    print("  TN: S1 sai,  Ensemble dung (Ensemble SUA duoc loi S1)")
+    print("  FP: S1 dung, Ensemble sai  (Ensemble LAM HONG)")
+    print("  FN: ca hai sai (Ensemble khong cuu duoc)")
+    s1_pred_test = s1_test.argmax(1)
+    counts = Counter()
+    for i in range(len(y_test)):
+        s1_ok = bool(s1_pred_test[i] == y_test[i])
+        ens_ok = bool(pred_test3[i] == y_test[i])
+        if s1_ok and ens_ok:
+            counts["TP"] += 1
+        elif not s1_ok and ens_ok:
+            counts["TN"] += 1
+        elif s1_ok and not ens_ok:
+            counts["FP"] += 1
+        else:
+            counts["FN"] += 1
+    total = len(y_test)
+    print(f"  TP={counts['TP']}  TN={counts['TN']}  FP={counts['FP']}  FN={counts['FN']}  (total={total})")
+    print(f"  S1 error rate (TN+FN)/{total} = {(counts['TN']+counts['FN'])/total*100:.2f}%")
+    print(f"  Ensemble error rate (FP+FN)/{total} = {(counts['FP']+counts['FN'])/total*100:.2f}%")
+    print(f"  Net corrections (TN-FP) = {counts['TN']-counts['FP']}")
 
 
 if __name__ == "__main__":

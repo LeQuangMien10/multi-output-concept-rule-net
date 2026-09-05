@@ -83,6 +83,51 @@ def display_name(concept: str) -> str:
     return CONCEPT_DISPLAY_NAME.get(concept, concept)
 
 
+# Chuoi hien thi tren card -- 2 ngon ngu (vi=mac dinh cho phan tich noi bo,
+# en=dung cho figure trong paper). Khong dich "Ensemble Concepts" (da la
+# tieng Anh o ca 2 ban theo yeu cau truoc).
+STRINGS = {
+    "vi": {
+        "suptitle": "Fitzpatrick17k — Trace suy luận 1 ảnh  ·  {filename}  ·  [{cat}]",
+        "true_label": "nhãn thật: {name}{gt_note}",
+        "no_concept_gt": "\n(ảnh không có nhãn concept thật)",
+        "concept_panel_title": "S1: {n} concept (xanh/đỏ = đúng/sai so GT thật,\nxám = ảnh không có GT)  ● GT có  ○ GT không",
+        "label_panel_title": "S1: s1_label_pred\n(viền đen = nhãn thật)",
+        "rule_concepts": "concept rule (TB cả cụm)",
+        "rule_label": "nhãn rule",
+        "match_sim": "match sim",
+        "empty": "(rỗng)",
+        "no_metadata": "(không có metadata)",
+        "s1_pred": "S1 tự đoán: {name} {mark}",
+        "s2_pred": "S2 (qua rule): {name} {mark}",
+        "changed_yes": "→ CÓ đổi",
+        "changed_no": "→ KHÔNG đổi",
+        "gated_header": "Ensemble (gated, s1<{t1} & rule>{t2}):",
+        "gated_switch": "→ ĐỔI sang S2 (S1 chưa chắc + rule đủ tin)",
+        "gated_keep": "→ giữ nguyên S1 (không đổi)",
+    },
+    "en": {
+        "suptitle": "Fitzpatrick17k — Single-Image Inference Trace  ·  {filename}  ·  [{cat}]",
+        "true_label": "true label: {name}{gt_note}",
+        "no_concept_gt": "\n(no ground-truth concept labels for this image)",
+        "concept_panel_title": "S1: {n} concepts (green/red = correct/wrong vs. true GT,\ngray = no GT available)  ● GT present  ○ GT absent",
+        "label_panel_title": "S1: s1_label_pred\n(black outline = true label)",
+        "rule_concepts": "rule concepts (cluster average)",
+        "rule_label": "rule label",
+        "match_sim": "match similarity",
+        "empty": "(empty)",
+        "no_metadata": "(no metadata)",
+        "s1_pred": "S1 prediction: {name} {mark}",
+        "s2_pred": "S2 (via rule): {name} {mark}",
+        "changed_yes": "→ changed",
+        "changed_no": "→ unchanged",
+        "gated_header": "Ensemble (gated-override, s1<{t1} & rule>{t2}):",
+        "gated_switch": "→ switched to S2 (S1 unsure + rule confident)",
+        "gated_keep": "→ kept S1 (unchanged)",
+    },
+}
+
+
 def parse_args():
     p = argparse.ArgumentParser(description="Ve trace suy luan S1->S2 cho tung anh cu the (Fitzpatrick17k).")
     p.add_argument("--data_dir", type=str, default="/kaggle/input/datasets/lquangmin/fitzpatrick17k-prepared")
@@ -112,6 +157,8 @@ def parse_args():
     p.add_argument("--gated_rule_conf_thresh", type=float, default=None,
                     help="Nguong confidence toi thieu cua rule S2 de duoc phep override S1 "
                          "(chi dung khi --gated_s1_thresh cung duoc set).")
+    p.add_argument("--lang", type=str, default="vi", choices=["vi", "en"],
+                    help="Ngon ngu chu tren card -- 'en' dung khi xuat figure cho paper.")
     return p.parse_args()
 
 
@@ -253,7 +300,8 @@ def run_one(row, img_dir, image_size, system1, memory, head, centroids, device,
     }
 
 
-def draw_card(rec, rules_by_id, save_path, concept_names, label_names):
+def draw_card(rec, rules_by_id, save_path, concept_names, label_names, lang="vi"):
+    S = STRINGS[lang]
     num_concepts = len(concept_names)
     num_labels = len(label_names)
     cat = categorize(rec["s1_correct"], rec["s2_correct"])
@@ -266,7 +314,7 @@ def draw_card(rec, rules_by_id, save_path, concept_names, label_names):
     true_name = label_names[rec["true_label"]]
     s1_name = label_names[rec["s1_pred"]]
     s2_name = label_names[rec["s2_pred"]]
-    fig.suptitle(f"Fitzpatrick17k — Trace suy luận 1 ảnh  ·  {rec['filename']}  ·  [{cat}]",
+    fig.suptitle(S["suptitle"].format(filename=rec['filename'], cat=cat),
                  fontsize=13, fontweight="bold", color=INK, x=0.035, y=0.97, ha="left")
 
     # -- anh + ground-truth --
@@ -276,8 +324,8 @@ def draw_card(rec, rules_by_id, save_path, concept_names, label_names):
     ax_img.set_xticks([]); ax_img.set_yticks([])
     for spine in ax_img.spines.values():
         spine.set_edgecolor(border_color); spine.set_linewidth(3)
-    gt_note = "" if rec["has_concept_gt"] else "\n(ảnh không có nhãn concept thật)"
-    ax_img.set_title(f"nhãn thật: {true_name}{gt_note}", fontsize=9, color=INK)
+    gt_note = "" if rec["has_concept_gt"] else S["no_concept_gt"]
+    ax_img.set_title(S["true_label"].format(name=true_name, gt_note=gt_note), fontsize=9, color=INK)
 
     # -- 35 concept, sap theo xac suat giam dan --
     ax_c = fig.add_subplot(gs[0, 1])
@@ -305,7 +353,7 @@ def draw_card(rec, rules_by_id, save_path, concept_names, label_names):
     ax_c.set_ylim(-0.6, num_concepts - 0.4)
     ax_c.invert_yaxis()
     ax_c.tick_params(colors=INK_SOFT, labelsize=6.5)
-    ax_c.set_title(f"S1: {num_concepts} concept (xanh/đỏ = đúng/sai so GT thật,\nxám = ảnh không có GT)  ● GT có  ○ GT không",
+    ax_c.set_title(S["concept_panel_title"].format(n=num_concepts),
                     fontsize=7.5, color=INK_SOFT)
     for spine in ["top", "right"]:
         ax_c.spines[spine].set_visible(False)
@@ -328,7 +376,7 @@ def draw_card(rec, rules_by_id, save_path, concept_names, label_names):
     for spine in ["left", "bottom"]:
         ax_l.spines[spine].set_color(GRID)
     ax_l.tick_params(colors=INK_SOFT, labelsize=7)
-    ax_l.set_title("S1: s1_label_pred\n(viền đen = nhãn thật)", fontsize=8, color=INK_SOFT)
+    ax_l.set_title(S["label_panel_title"], fontsize=8, color=INK_SOFT)
 
     # -- rule + verdict --
     ax_t = fig.add_subplot(gs[0, 3])
@@ -350,27 +398,27 @@ def draw_card(rec, rules_by_id, save_path, concept_names, label_names):
     )
     ri = rules_by_id.get(rec["rule_id"])
     if ri is not None:
-        present = ", ".join(ri.get("present_concepts", [])) or "(rỗng)"
+        present = ", ".join(ri.get("present_concepts", [])) or S["empty"]
         rule_txt = (f"Rule #{rec['rule_id']}  (n={ri['n']}, conf={ri['confidence']:.3f})\n"
-                    f"concept rule (TB cả cụm): {{{present}}}\n"
-                    f"nhãn rule: {ri['label_name']}\n"
-                    f"match sim: {rec['match_sim']:.3f}\n"
+                    f"{S['rule_concepts']}: {{{present}}}\n"
+                    f"{S['rule_label']}: {ri['label_name']}\n"
+                    f"{S['match_sim']}: {rec['match_sim']:.3f}\n"
                     f"Ensemble Concepts:\n{contrib_lines}")
     else:
-        rule_txt = (f"Rule #{rec['rule_id']}  (không có metadata)\nmatch sim: {rec['match_sim']:.3f}\n"
+        rule_txt = (f"Rule #{rec['rule_id']}  {S['no_metadata']}\n{S['match_sim']}: {rec['match_sim']:.3f}\n"
                     f"Ensemble Concepts:\n{contrib_lines}")
 
     s1_mark = "✓" if rec["s1_correct"] else "✗"
     s2_mark = "✓" if rec["s2_correct"] else "✗"
     s1_color = STATUS_GOOD if rec["s1_correct"] else STATUS_CRIT
     s2_color = STATUS_GOOD if rec["s2_correct"] else STATUS_CRIT
-    change_txt = "→ KHÔNG đổi" if not rec["changed"] else "→ CÓ đổi"
+    change_txt = S["changed_no"] if not rec["changed"] else S["changed_yes"]
 
     ax_t.text(0.0, 0.97, rule_txt, fontsize=8.0, color=INK, va="top", ha="left",
               transform=ax_t.transAxes, family="monospace", wrap=True)
-    ax_t.text(0.0, 0.33, f"S1 tự đoán: {s1_name} {s1_mark}", fontsize=9.5, color=s1_color,
+    ax_t.text(0.0, 0.33, S["s1_pred"].format(name=s1_name, mark=s1_mark), fontsize=9.5, color=s1_color,
               va="top", ha="left", transform=ax_t.transAxes, fontweight="bold")
-    ax_t.text(0.0, 0.28, f"S2 (qua rule): {s2_name} {s2_mark}", fontsize=9.5, color=s2_color,
+    ax_t.text(0.0, 0.28, S["s2_pred"].format(name=s2_name, mark=s2_mark), fontsize=9.5, color=s2_color,
               va="top", ha="left", transform=ax_t.transAxes, fontweight="bold")
     ax_t.text(0.0, 0.16, change_txt, fontsize=8.6, color=INK_SOFT, va="top", ha="left",
               transform=ax_t.transAxes)
@@ -380,10 +428,9 @@ def draw_card(rec, rules_by_id, save_path, concept_names, label_names):
         gated_name = label_names[rec["gated_pred"]]
         gated_mark = "✓" if rec["gated_correct"] else "✗"
         gated_color = STATUS_GOOD if rec["gated_correct"] else STATUS_CRIT
-        gated_note = ("→ ĐỔI sang S2 (S1 chưa chắc + rule đủ tin)" if rec["gated_override"]
-                       else "→ giữ nguyên S1 (không đổi)")
-        gated_txt = (f"Ensemble (gated, s1<{rec['gated_s1_thresh']} & rule>{rec['gated_rule_conf_thresh']}):\n"
-                     f"{gated_name} {gated_mark}\n{gated_note}")
+        gated_note = S["gated_switch"] if rec["gated_override"] else S["gated_keep"]
+        gated_txt = (S["gated_header"].format(t1=rec['gated_s1_thresh'], t2=rec['gated_rule_conf_thresh']) +
+                     f"\n{gated_name} {gated_mark}\n{gated_note}")
         ax_t.text(0.0, 0.11, gated_txt, fontsize=7.8, color=gated_color, va="top", ha="left",
                   transform=ax_t.transAxes, fontweight="bold")
         cat_y = -0.035
@@ -460,7 +507,7 @@ def main():
                       gated_s1_thresh=args.gated_s1_thresh, gated_rule_conf_thresh=args.gated_rule_conf_thresh)
         cat = categorize(rec["s1_correct"], rec["s2_correct"])
         out_path = output_dir / f"{args.split}_{idx}_{cat}.png"
-        draw_card(rec, rules_by_id, out_path, concept_names, label_names)
+        draw_card(rec, rules_by_id, out_path, concept_names, label_names, lang=args.lang)
         print(f"[DONE] {idx} [{cat}] -> {out_path}")
 
 

@@ -28,6 +28,9 @@ logs/
 # Reports (generated locally, not tracked)
 reports/
 
+# Papers
+paper/
+
 # Data generated or downloaded
 data/
 *.csv
@@ -60,3 +63,12 @@ htmlcov/
 build/
 dist/
 *.egg-info/
+
+# LaTeX build artifacts (paper/main.tex is the source of truth; PDF is
+# reproducible locally via tectonic or by uploading to Overleaf)
+paper/*.pdf
+paper/*.aux
+paper/*.bbl
+paper/*.blg
+paper/*.out
+paper/*.log
