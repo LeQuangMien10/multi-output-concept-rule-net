@@ -85,6 +85,12 @@ def parse_args():
                          "vector S1 THAT du doan cho dataset nay -- khong co hang so tien-do "
                          "san nhu Fitzpatrick (0.886 do rieng tren ground-truth 35-concept cua "
                          "dataset do, khong ap dung duoc o day).")
+    p.add_argument("--theta_percentile", type=float, default=95.0,
+                    help="Percentile dung khi --theta auto (measure_theta). Mac dinh 95, ke thua "
+                         "tu Fitzpatrick, CHUA re-validate rieng cho scope 6-concept/6-lop nay -- "
+                         "thu percentile khac (vd 90, 99) neu nghi ngo theta hien tai qua cao/thap "
+                         "khien rule memory khong phu du 6 lop (xem outputs/pad_ufes20_icrl: chi "
+                         "3/6 lop co rule).")
     p.add_argument("--theta_merge", type=float, default=0.93)
     p.add_argument("--n_min", type=int, default=15,
                     help="Gia tri copy tu Fitzpatrick full-data (16,577 anh) -- CHUA calibrate "
@@ -524,7 +530,7 @@ def main():
               "concept vectors (train split, respecting cluster_dims/--use_hard_cv exactly "
               "as configured for this run)...")
         train_cv = collect_concept_vectors(system1, train_loader, device, args.use_hard_cv, cluster_dims)
-        theta = measure_theta(train_cv, percentile=95)
+        theta = measure_theta(train_cv, percentile=args.theta_percentile)
         theta_merge = min(theta + 0.04, 0.999)
         print(f"[INFO] Measured theta={theta:.4f}  theta_merge={theta_merge:.4f} (theta+0.04)")
     else:
