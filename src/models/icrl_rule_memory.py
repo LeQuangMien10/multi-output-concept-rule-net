@@ -23,6 +23,7 @@ General: hoạt động với bất kỳ D-dim concept vector nào
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 from typing import Optional
 
@@ -450,14 +451,29 @@ class ICRLRuleMemory:
         # mean squared distance proxy from Welford M2
         variance_per_dim = self._m2[r] / max(n - 1, 1)
         mean_dist = variance_per_dim.mean().item() ** 0.5
-        import math
         return math.exp(-mean_dist)
 
-    def _compute_accuracy(self, r: int) -> float:
+    def _compute_accuracy(self, r: int, z: float = 1.96) -> float:
+        """
+        Wilson score interval lower bound thay vì correct/total thô.
+
+        correct/total thô không có small-sample penalty: rule đo trên 1
+        validation sample (1/1 = 100%) được tin ngang hoặc hơn rule đo trên
+        60 samples (50/60 = 83%). Wilson lower bound kéo ước lượng về gần
+        0.5 khi total_pred nhỏ, hội tụ về correct/total khi total_pred lớn
+        (z=1.96 ~ khoảng tin cậy 95%). total=0 vẫn trả về 0.5 (giữ nguyên
+        hành vi "chưa có dự đoán nào → neutral" cũ).
+        """
         total = self._total_pred[r]
         if total == 0:
-            return 0.5   # no prediction yet → neutral
-        return self._correct[r] / total
+            return 0.5
+        correct = self._correct[r]
+        phat = correct / total
+        z2 = z * z
+        denom = 1.0 + z2 / total
+        center = (phat + z2 / (2 * total)) / denom
+        margin = (z * math.sqrt(phat * (1 - phat) / total + z2 / (4 * total * total))) / denom
+        return max(0.0, center - margin)
 
     # ── Inference ───────────────────────────────────────────
 
