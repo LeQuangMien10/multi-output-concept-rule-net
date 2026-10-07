@@ -56,6 +56,8 @@ def parse_args():
     p.add_argument("--num_concepts", type=int, default=48)
     p.add_argument("--num_labels", type=int, default=2)
     p.add_argument("--monitor", type=str, default="label_acc")
+    p.add_argument("--min_concept_diversity", type=float, default=0.06,
+                    help="Chi dung khi --monitor label_acc_gated; xem train_system1_baseline.py.")
     p.add_argument("--seed", type=int, default=42,
                     help="Training seed, reused identically for every fold (matches CRL's "
                          "protocol of one seed per fold, varying only the data).")
@@ -105,7 +107,8 @@ def main():
              "--weight_decay", str(args.weight_decay),
              "--lr_schedule", args.lr_schedule, "--batch_size", str(args.batch_size),
              "--num_concepts", str(args.num_concepts), "--num_labels", str(args.num_labels),
-             "--monitor", args.monitor, "--seed", str(args.seed)])
+             "--monitor", args.monitor, "--min_concept_diversity", str(args.min_concept_diversity),
+             "--seed", str(args.seed)])
 
         run([py, "-m", "src.scripts.fitzpatrick.train_icrl",
              "--data_dir", str(fold_data_dir), "--img_dir", args.img_dir,

@@ -92,8 +92,14 @@ def parse_args():
     p.add_argument("--num_labels", type=int, default=NUM_LABELS)
 
     p.add_argument("--monitor", type=str, default="concept_macro_f1",
-                    choices=["concept_macro_f1", "concept_mean_acc", "label_acc"],
-                    help="Metric dung de luu best checkpoint.")
+                    choices=["concept_macro_f1", "concept_mean_acc", "label_acc", "label_acc_gated"],
+                    help="Metric dung de luu best checkpoint. label_acc_gated: chi xet cac epoch "
+                         "co val_concept_diversity >= --min_concept_diversity, roi chon label_acc "
+                         "cao nhat trong so do (tranh chon checkpoint bi lazy collapse).")
+    p.add_argument("--min_concept_diversity", type=float, default=0.06,
+                    help="Nguong do da dang concept (std trung binh theo chieu cua sigmoid concept "
+                         "tren val) cho monitor label_acc_gated. Do tren 5 checkpoint hien tai: "
+                         "collapse fold_2=0.039, fold_4=0.050; fold_0=0.089, fold_1=0.080, fold_3=0.100.")
 
     p.add_argument("--concept_loss_weight", type=float, default=1.0,
                     help="He so nhan voi concept_loss truoc khi cong vao label_loss. "
@@ -223,6 +229,10 @@ def evaluate(model, loader, device, split_name="Val", concept_loss_weight=1.0):
     )
     metrics["label_acc"] = label_correct / label_total
     metrics["loss"] = total_loss / total_n
+    # Do da dang concept: std theo tung anh cua xac suat concept, lay trung binh
+    # theo cac concept. Gan 0 nghia la moi anh du doan gan nhu giong nhau (lazy collapse).
+    concept_probs = torch.sigmoid(torch.cat(all_concept_logits))
+    metrics["concept_diversity"] = concept_probs.std(dim=0).mean().item()
     return metrics
 
 
@@ -271,6 +281,7 @@ def main():
         print("[INFO] LR schedule: none (constant LR, nhu lan chay dau)")
 
     best_val_metric = -1.0
+    best_key = None
     history = []
 
     for epoch in range(1, args.epochs + 1):
@@ -297,8 +308,16 @@ def main():
               f"val_concept_mean_acc={row['val_concept_mean_acc']:.4f} | "
               f"val_label_acc={row['val_label_acc']:.4f}")
 
-        monitored = val_metrics[args.monitor]
-        if monitored > best_val_metric:
+        monitored = val_metrics["label_acc" if args.monitor == "label_acc_gated" else args.monitor]
+        if args.monitor == "label_acc_gated":
+            # Tuple so sanh: epoch dat nguong diversity luon thang epoch khong dat;
+            # trong cung nhom, dat nguong thi so label_acc, khong dat thi so diversity.
+            eligible = val_metrics["concept_diversity"] >= args.min_concept_diversity
+            key = (1, monitored) if eligible else (0, val_metrics["concept_diversity"])
+        else:
+            key = (1, monitored)
+        if best_key is None or key > best_key:
+            best_key = key
             best_val_metric = monitored
             ckpt_path = output_dir / "best_model.pt"
             torch.save({
@@ -307,8 +326,10 @@ def main():
                 "best_val_metric": best_val_metric,
                 "monitor": args.monitor,
                 "epoch": epoch,
+                "val_concept_diversity": val_metrics["concept_diversity"],
             }, ckpt_path)
-            print(f"[INFO] Saved best checkpoint ({args.monitor}={best_val_metric:.4f})")
+            print(f"[INFO] Saved best checkpoint ({args.monitor}={best_val_metric:.4f}, "
+                  f"val_concept_diversity={val_metrics['concept_diversity']:.4f})")
 
     best_ckpt = torch.load(output_dir / "best_model.pt", map_location=device, weights_only=False)
     model.load_state_dict(best_ckpt["model_state_dict"])
