@@ -256,6 +256,11 @@ def run_fold(k, cv_root, system1_root, data_root, img_dir, label_names, batch_si
         "entropy_gated_combo": combo_eg,
         "baseline_combo": combo_baseline,
         "strategies": results,
+        # Du doan theo TUNG MAU tren test -- de bootstrap-resample dung cach
+        # (cung mot bo chi so resample ap cho MOI chien luoc trong 1 lan lap).
+        "y_test": y_test.numpy().tolist(),
+        "pred_test": {name: pred.numpy().tolist() for name, pred in
+                      [("baseline", pred_baseline)] + list(strategies.items())},
     }
     return fold_summary
 
