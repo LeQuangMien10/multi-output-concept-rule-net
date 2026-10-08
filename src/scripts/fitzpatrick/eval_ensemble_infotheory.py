@@ -52,6 +52,8 @@ from src.models.ensemble_strategies import (
     fit_temperature, apply_temperature, entropy_confidence,
     log_linear_pool, fit_log_linear_weights,
     fit_confusion_likelihood, fit_class_prior, naive_bayes_fusion,
+    rule_conf_override, fit_rule_conf_override_thresh,
+    rc_weighted_pool, fit_rc_weighted_scale,
     bidirectional_correction_counts,
 )
 
@@ -226,6 +228,15 @@ def run_fold(k, cv_root, system1_root, data_root, img_dir, label_names, batch_si
     post = naive_bayes_fusion(pred1, pred2, prior, L1, L2)
     strategies["naive_bayes"] = post.argmax(1)
 
+    # ---- rule_conf_override: suy ra tu pattern (s1 confidence nguoc huong,
+    # chi rule_conf dung huong) -- bo han dieu kien "S1 khong tu tin" ----
+    rc_thresh = fit_rule_conf_override_thresh(p1_val, p2_val, rc_val, y_val)
+    strategies["rule_conf_override"] = rule_conf_override(p1_test, p2_test, rc_test, rc_thresh)
+
+    # ---- rc_weighted_pool: trong so S2 theo TUNG MAU, ti le voi rule_conf ----
+    rc_scale = fit_rc_weighted_scale(p1_val, p2_val, rc_val, y_val)
+    strategies["rc_weighted_pool"] = rc_weighted_pool(p1_test, p2_test, rc_test, rc_scale).argmax(1)
+
     results = {}
     for name, pred in [("baseline", pred_baseline)] + list(strategies.items()):
         acc = accuracy_score(y_test, pred)
@@ -239,6 +250,8 @@ def run_fold(k, cv_root, system1_root, data_root, img_dir, label_names, batch_si
         "ece_s2_before": ece_s2_before, "ece_s2_after": ece_s2_after,
         "weighted_avg_alpha": float(best_alpha),
         "log_linear_w1": float(w1),
+        "rule_conf_override_thresh": float(rc_thresh),
+        "rc_weighted_scale": float(rc_scale),
         "gated_override_combo": combo_go,
         "entropy_gated_combo": combo_eg,
         "baseline_combo": combo_baseline,

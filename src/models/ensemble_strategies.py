@@ -130,6 +130,61 @@ def naive_bayes_fusion(pred1: torch.Tensor, pred2: torch.Tensor, prior: torch.Te
 
 
 # ─────────────────────────────────────────────────────────────
+# 5. Rule-confidence-only override / rule-confidence-weighted pooling
+# -- suy ra tu phan tich pattern (analyze_disagreement_patterns.py):
+# confidence cua S1 KHONG phai tin hieu tot de biet khi nao nen doi sang S2
+# (AUROC~0.40 -- S1 thuong tu tin HON chinh o cac ca S1 sai), chi rule_conf
+# (Wilson) co tin hieu dung huong, du yeu (AUROC~0.55). Vi vay bo dieu kien
+# "S1 khong tu tin" ra khoi quyet dinh, chi dung rule_conf.
+# ─────────────────────────────────────────────────────────────
+
+def rule_conf_override(p1: torch.Tensor, p2: torch.Tensor, rc: torch.Tensor,
+                        thresh: float) -> torch.Tensor:
+    """Doi sang S2 chi can rc > thresh -- KHONG xet confidence cua S1 (khac
+    gated_override, bo han dieu kien da chung minh la nguoc huong)."""
+    override = rc > thresh
+    pred = p1.argmax(dim=-1).clone()
+    pred[override] = p2.argmax(dim=-1)[override]
+    return pred
+
+
+def fit_rule_conf_override_thresh(p1_val, p2_val, rc_val, y_val, n_grid: int = 25) -> float:
+    lo, hi = float(rc_val.min()), float(rc_val.max())
+    grid = torch.linspace(lo, hi, n_grid)
+    best_t, best_acc = float(grid[0]), -1.0
+    for t in grid:
+        pred = rule_conf_override(p1_val, p2_val, rc_val, float(t))
+        a = (pred == y_val).float().mean().item()
+        if a > best_acc:
+            best_acc, best_t = a, float(t)
+    return best_t
+
+
+def rc_weighted_pool(p1: torch.Tensor, p2: torch.Tensor, rc: torch.Tensor,
+                      scale: float, eps: float = 1e-8) -> torch.Tensor:
+    """Log-linear pooling nhung trong so cua S2 la MOI MAU (w2 = rc*scale,
+    kep trong [0,1]), khong phai 1 trong so chung cho toan bo fold -- tan
+    dung tin hieu yeu nhung dung huong cua rule_conf thay vi 1 gia tri alpha
+    co dinh."""
+    w2 = (rc * scale).clamp(0.0, 1.0).unsqueeze(-1)
+    w1 = 1.0 - w2
+    log_p = w1 * p1.clamp(min=eps).log() + w2 * p2.clamp(min=eps).log()
+    return F.softmax(log_p, dim=-1)
+
+
+def fit_rc_weighted_scale(p1_val, p2_val, rc_val, y_val, grid: list[float] | None = None) -> float:
+    if grid is None:
+        grid = [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0]
+    best_scale, best_acc = 1.0, -1.0
+    for scale in grid:
+        pred = rc_weighted_pool(p1_val, p2_val, rc_val, scale).argmax(dim=-1)
+        a = (pred == y_val).float().mean().item()
+        if a > best_acc:
+            best_acc, best_scale = a, scale
+    return best_scale
+
+
+# ─────────────────────────────────────────────────────────────
 # Bidirectional correction accounting (dung chung cho MOI chien luoc,
 # ca 3 chien luoc cu va 3 chien luoc moi, de so sanh dong bo)
 # ─────────────────────────────────────────────────────────────
