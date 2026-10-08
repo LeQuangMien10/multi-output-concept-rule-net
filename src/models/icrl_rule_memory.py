@@ -347,7 +347,9 @@ class ICRLRuleMemory:
             labels: list[int] = []
             for r in rule_ids:
                 labels.extend(self._labels[r])
-            new_mu.append(mu); new_m2.append(self._m2[rule_ids[0]])
+            m2 = self._combine_m2([self._mu[r] for r in rule_ids], [self._n[r] for r in rule_ids],
+                                   [self._m2[r] for r in rule_ids], mu)
+            new_mu.append(mu); new_m2.append(m2)
             new_labels.append(labels); new_n.append(n_total)
             new_correct.append(sum(self._correct[r] for r in rule_ids))
             new_total_pred.append(sum(self._total_pred[r] for r in rule_ids))
@@ -395,12 +397,27 @@ class ICRLRuleMemory:
         self._n[r]  = n_new
         self._labels[r].append(y)
 
+    @staticmethod
+    def _combine_m2(mus: list[torch.Tensor], ns: list[int], m2s: list[torch.Tensor],
+                     combined_mu: torch.Tensor) -> torch.Tensor:
+        """Cong thuc parallel-variance (Chan et al.) de gop M2 cua nhieu
+        cluster thanh M2 cua cluster hop nhat -- khac voi chi lay M2 cua 1
+        thanh vien hoac giu nguyen M2 cua survivor (bug cu: lam coherence bi
+        thoi phong vi chia M2 cu cho n moi, lon hon). Voi k=2 rut gon dung
+        ve cong thuc pairwise chuan: M2_ab = M2_a+M2_b+n_a*n_b/(n_a+n_b)*(mu_a-mu_b)^2."""
+        total = torch.zeros_like(combined_mu)
+        for mu_i, n_i, m2_i in zip(mus, ns, m2s):
+            total = total + m2_i + n_i * (mu_i - combined_mu) ** 2
+        return total
+
     def _merge_rules(self, survivor: int, victim: int) -> None:
         """Merge victim into survivor (weighted mean by count)."""
-        n_s = self._n[survivor]
-        n_v = self._n[victim]
+        n_s, n_v = self._n[survivor], self._n[victim]
+        mu_s, mu_v = self._mu[survivor], self._mu[victim]
         total = n_s + n_v
-        self._mu[survivor] = (n_s * self._mu[survivor] + n_v * self._mu[victim]) / total
+        new_mu = (n_s * mu_s + n_v * mu_v) / total
+        self._m2[survivor] = self._combine_m2([mu_s, mu_v], [n_s, n_v], [self._m2[survivor], self._m2[victim]], new_mu)
+        self._mu[survivor] = new_mu
         self._n[survivor]  = total
         self._labels[survivor].extend(self._labels[victim])
         self._correct[survivor]    += self._correct[victim]

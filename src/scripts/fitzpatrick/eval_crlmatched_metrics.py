@@ -81,6 +81,13 @@ def concept_metrics(pred, gt, concept_names):
             continue
         accs.append(accuracy_score(true_vars, pred_vars))
         f1s.append(f1_macro_2class(true_vars, pred_vars))
+    if not accs:
+        # Tat ca concept trong batch concept-masked deu GT toan 0 -- kha thi
+        # tren fold nho (~20% anh co concept GT that). Tra ve 0.0 thay vi
+        # crash ZeroDivisionError, giong hanh vi "chua co du lieu -> trung lap"
+        # da dung o ICRLRuleMemory._compute_accuracy.
+        print("[WARN] concept_metrics: khong co concept nao co GT != 0 trong split nay.")
+        return 0.0, 0.0
     return float(sum(accs) / len(accs)), float(sum(f1s) / len(f1s))
 
 
