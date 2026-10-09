@@ -42,6 +42,10 @@ from src.models.icrl_rule_memory import ICRLRuleMemory
 def parse_args():
     p = argparse.ArgumentParser(description="Calibration audit cho S1, S2 va rule confidence tren 5-fold.")
     p.add_argument("--cv_root", type=str, required=True, help="Thu muc chua fold_0..fold_{k-1}.")
+    p.add_argument("--system1_root", type=str, default=None,
+                    help="Thu muc chua fold_k/system1/ -- mac dinh = --cv_root. Truyen rieng khi "
+                         "icrl duoc tai-ap dung conf_min khac (xem apply_conf_min_cv.py) va khong "
+                         "copy lai system1.")
     p.add_argument("--data_root", type=str, required=True, help="Thu muc chua fold_0..fold_{k-1} CSV.")
     p.add_argument("--img_dir", type=str, required=True)
     p.add_argument("--num_folds", type=int, default=5)
@@ -130,11 +134,12 @@ def main():
     device = (torch.device("cuda") if torch.cuda.is_available()
               else torch.device("cpu")) if args.device == "auto" else torch.device(args.device)
     cv_root, data_root = Path(args.cv_root), Path(args.data_root)
+    system1_root = Path(args.system1_root) if args.system1_root else cv_root
 
     results = {}
     for k in range(args.num_folds):
         fold_dir = cv_root / f"fold_{k}"
-        system1, image_size = load_system1(fold_dir / "system1" / "best_model.pt", device)
+        system1, image_size = load_system1(system1_root / f"fold_{k}" / "system1" / "best_model.pt", device)
         _, val_loader, test_loader = make_loaders(
             data_root / f"fold_{k}", args.img_dir, image_size, args.batch_size, args.num_workers,
         )
