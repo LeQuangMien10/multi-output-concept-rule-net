@@ -65,19 +65,49 @@ def decode_pattern_from_vec(cv: torch.Tensor, concept_keys, concept_offsets, con
     return tuple(present)
 
 
-def find_circular_patterns(memory_base, concept_keys, concept_offsets, concept_dims, exclude_keys):
+def find_circular_patterns(memory, concept_keys, concept_offsets, concept_dims, exclude_keys):
     """Non-destructive (chi doc, khong goi dedupe_by_decoded_pattern() nen
-    khong mutate memory_base): group cac rule TRUOC dedupe theo pattern hien
-    thi (dung decode_rule() -- API cong khai), tra ve tap pattern nao co >= 2
-    majority label khac nhau (= dung group se bi dedupe xoa vi circular)."""
+    khong mutate memory): group cac rule theo pattern hien thi (dung
+    decode_rule() -- API cong khai), tra ve tap pattern nao co >= 2 majority
+    label khac nhau (= dung group se bi dedupe xoa vi circular).
+
+    QUAN TRONG: `memory` phai la trang thai NGAY TRUOC dedupe_by_decoded_pattern()
+    se duoc goi trong pipeline that -- nghia la DA prune qua n_min roi conf_min
+    (xem get_pre_dedupe_memory() ben duoi), KHONG phai icrl_rule_memory_base.pt
+    tho (hang tram micro-rule chua prune) -- dung base tho se dem thua rat
+    nhieu "circular" gia (2 rule n=1 trung pattern tinh co, nhung se bi n_min
+    loai truoc khi dedupe thay trong pipeline that)."""
     groups = defaultdict(set)
-    for r in range(memory_base.num_rules):
-        d = memory_base.decode_rule(r, concept_keys, concept_offsets, concept_dims)
+    for r in range(memory.num_rules):
+        d = memory.decode_rule(r, concept_keys, concept_offsets, concept_dims)
         present = tuple(k for k in concept_keys if k not in exclude_keys
                          and d["slots"][k]["value"] == "present")
         groups[present].add(d["label"])
     circular = {pattern for pattern, labels in groups.items() if len(labels) > 1}
     return circular
+
+
+def get_pre_dedupe_memory(base_path, n_min, conf_min, system1, head, val_loader, device,
+                           record_rule_accuracy):
+    """Replay dung cac buoc pipeline that lam TRUOC khi goi dedupe_by_decoded_pattern()
+    (xem train_icrl.py::run_stage3_onward / apply_conf_min_cv.py::main): load
+    base tho -> prune theo n_min (bo qua accuracy signal) -> record_rule_accuracy
+    tren val -> prune theo conf_min thuc. KHONG goi dedupe, KHONG save -- chi
+    de co dung trang thai memory ma dedupe se nhin thay, phuc vu
+    find_circular_patterns() o tren.
+
+    `record_rule_accuracy` duoc truyen vao (khong import cung) vi fitzpatrick/
+    pad_ufes20 co 2 ban train_icrl.py rieng -- goi dung ban khop voi module
+    dang dung o moi scope."""
+    from src.models.icrl_rule_memory import ICRLRuleMemory
+
+    memory = ICRLRuleMemory.load(base_path, device=str(device))
+    memory.n_min = n_min
+    memory.prune(verbose=False, conf_min_override=0.0)
+    record_rule_accuracy(system1, head, memory, val_loader, device)
+    memory.conf_min = conf_min
+    memory.prune(verbose=False)
+    return memory
 
 
 @torch.no_grad()
@@ -126,12 +156,12 @@ def run_single_split_scope(name, module, data_dir, img_dir, system1_ckpt, icrl_d
                             num_labels, batch_size, num_workers, device, caveat):
     if module == "fitzpatrick":
         from src.scripts.fitzpatrick.train_icrl import (
-            load_system1, make_loaders, build_full_concept_layout,
+            load_system1, make_loaders, build_full_concept_layout, record_rule_accuracy,
         )
         from src.utils.fitzpatrick_concepts import S1_LABEL_CONCEPT_KEY
     else:
         from src.scripts.pad_ufes20.train_icrl import (
-            load_system1, make_loaders, build_full_concept_layout,
+            load_system1, make_loaders, build_full_concept_layout, record_rule_accuracy,
         )
         from src.utils.pad_ufes20_concepts import S1_LABEL_CONCEPT_KEY
 
@@ -155,14 +185,25 @@ def run_single_split_scope(name, module, data_dir, img_dir, system1_ckpt, icrl_d
     head.eval()
     centroids = memory.get_centroids().to(device)
 
+    # circular-pattern check PHAI chay tren trang thai memory NGAY TRUOC dedupe
+    # (da prune qua n_min roi conf_min), khong phai icrl_rule_memory_base.pt tho
+    # -- xem docstring get_pre_dedupe_memory(). n_min/conf_min doc tu metrics.json
+    # da luu (dung dung gia tri pipeline that da dung, khong doan lai).
     base_path = Path(icrl_dir) / "icrl_rule_memory_base.pt"
-    if base_path.exists():
-        memory_base = ICRLRuleMemory.load(base_path, device=str(device))
-        circular_patterns = find_circular_patterns(memory_base, concept_keys, concept_offsets,
+    metrics_path = Path(icrl_dir) / "metrics.json"
+    if base_path.exists() and metrics_path.exists():
+        saved_metrics = json.load(open(metrics_path))
+        rec_n_min = saved_metrics["n_min"]
+        rec_conf_min = saved_metrics["args"]["conf_min"]
+        pre_dedupe_memory = get_pre_dedupe_memory(base_path, rec_n_min, rec_conf_min,
+                                                   system1, head, val_loader, device,
+                                                   record_rule_accuracy)
+        circular_patterns = find_circular_patterns(pre_dedupe_memory, concept_keys, concept_offsets,
                                                      concept_dims, exclude_keys)
     else:
         circular_patterns = set()
-        print(f"[WARN] {name}: khong co icrl_rule_memory_base.pt, bo qua circular-pattern check.")
+        print(f"[WARN] {name}: thieu icrl_rule_memory_base.pt hoac metrics.json, "
+              f"bo qua circular-pattern check.")
 
     results = {}
     for split_name, loader in [("val", val_loader), ("test", test_loader)]:
@@ -190,7 +231,7 @@ def run_single_split_scope(name, module, data_dir, img_dir, system1_ckpt, icrl_d
 def run_crlmatched_cv_scope(cv_root, system1_root, data_root, num_folds,
                              batch_size, num_workers, device, caveat):
     from src.scripts.fitzpatrick.train_icrl import (
-        load_system1, make_loaders, build_full_concept_layout,
+        load_system1, make_loaders, build_full_concept_layout, record_rule_accuracy,
     )
     from src.utils.fitzpatrick_concepts import S1_LABEL_CONCEPT_KEY
     from src.models.icrl_rule_memory import ICRLRuleMemory
@@ -198,7 +239,7 @@ def run_crlmatched_cv_scope(cv_root, system1_root, data_root, num_folds,
     cv_root, system1_root, data_root = Path(cv_root), Path(system1_root), Path(data_root)
     exclude_keys = {S1_LABEL_CONCEPT_KEY}
 
-    pooled_test = {"y": [], "s1p": [], "s2p": [], "patterns": [], "circular_patterns": set()}
+    pooled_test = {"y": [], "s1p": [], "s2p": []}
     per_fold = {}
 
     for k in range(num_folds):
@@ -219,13 +260,28 @@ def run_crlmatched_cv_scope(cv_root, system1_root, data_root, num_folds,
         head.eval()
         centroids = memory.get_centroids().to(device)
 
+        # icrl_rule_memory_base.pt co the KHONG nam trong cv_root (vd.
+        # apply_conf_min_cv.py chi doc base tu system1_root/cv_root GOC, khong
+        # copy lai vao output_root moi vi re-tune conf_min khong doi clustering)
+        # -- fallback sang system1_root truoc khi bo qua han. Dung memory.n_min/
+        # memory.conf_min DA LUU trong icrl_rule_memory.pt (final) de replay dung
+        # chinh xac recipe pipeline that dung, khong doan lai tu file khac --
+        # xem get_pre_dedupe_memory()/find_circular_patterns() ve ly do phai
+        # prune truoc moi kiem tra circular (khong dung base tho).
         base_path = fold_dir / "icrl" / "icrl_rule_memory_base.pt"
+        if not base_path.exists():
+            base_path = system1_root / f"fold_{k}" / "icrl" / "icrl_rule_memory_base.pt"
         if base_path.exists():
-            memory_base = ICRLRuleMemory.load(base_path, device=str(device))
-            circular_patterns = find_circular_patterns(memory_base, concept_keys, concept_offsets,
+            pre_dedupe_memory = get_pre_dedupe_memory(base_path, memory.n_min, memory.conf_min,
+                                                       system1, head, val_loader, device,
+                                                       record_rule_accuracy)
+            circular_patterns = find_circular_patterns(pre_dedupe_memory, concept_keys, concept_offsets,
                                                          concept_dims, exclude_keys)
         else:
             circular_patterns = set()
+            print(f"[WARN] fold_{k}: khong tim thay icrl_rule_memory_base.pt o ca "
+                  f"{fold_dir / 'icrl'} va {system1_root / f'fold_{k}' / 'icrl'} -- "
+                  f"bo qua circular-pattern check cho fold nay.")
 
         y, s1p, s2p, patterns = collect_split(test_loader, system1, memory, head, centroids,
                                                 device, concept_keys,
@@ -237,14 +293,22 @@ def run_crlmatched_cv_scope(cv_root, system1_root, data_root, num_folds,
         pooled_test["y"].append(y)
         pooled_test["s1p"].append(s1p)
         pooled_test["s2p"].append(s2p)
-        pooled_test["patterns"].extend(patterns)
-        pooled_test["circular_patterns"] |= circular_patterns
+
+    # QUAN TRONG: "circular" la khai niem GAN VOI RULE MEMORY RIENG CUA TUNG
+    # FOLD (moi fold tu train/dedupe rieng) -- khong the pool bang cach check
+    # tat ca anh pool lai voi UNION cac circular_pattern cua moi fold (se bi
+    # "leak": anh fold_3 trung ngau nhien 1 pattern tung circular o fold_1,
+    # trong khi memory CUA FOLD_3 chua bao gio flag pattern do la circular,
+    # dem thua). Phai cong truc tiep so circular-image DA DEM DUNG tung fold.
+    n_circular_pooled = sum(per_fold[f"fold_{k}"]["n_circular_pattern_images"] for k in range(num_folds))
 
     import numpy as np
     y_all = np.concatenate(pooled_test["y"])
     s1p_all = np.concatenate(pooled_test["s1p"])
     s2p_all = np.concatenate(pooled_test["s2p"])
-    pooled = contingency(y_all, s1p_all, s2p_all, pooled_test["circular_patterns"], pooled_test["patterns"])
+    pooled = contingency(y_all, s1p_all, s2p_all, set(), [])
+    pooled["n_circular_pattern_images"] = n_circular_pooled
+    pooled["pct_circular_pattern_images"] = n_circular_pooled / pooled["n"] if pooled["n"] else 0.0
 
     out = {"scope": "crlmatched", "kind": "5fold_cv", "caveat": caveat,
            "per_fold": per_fold, "pooled_test": pooled}
