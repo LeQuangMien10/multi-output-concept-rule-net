@@ -25,6 +25,9 @@ thu, giu moi thu khac nguyen).
 Chay "lan luot" tung scope (--scope, khong phai --scopes) -- moi lenh ung
 voi 1 Kaggle session rieng, theo thu tu de nghi: pad_ufes20 (nho nhat,
 ~1.6k anh train) -> concept_only (~3.2k) -> fulldata (~16.6k, lau nhat).
+Output luon nam duoi <output_root>/<scope>/{system1,icrl} (co them 1 cap
+thu muc theo TEN SCOPE) -- dung CHUNG 1 --output_root cho ca 3 lan chay la
+AN TOAN, khong con ghi de len nhau nhu truoc (da sua bug nay).
 
 Usage (Kaggle):
     python -m src.scripts.run_scope_rebuild --scope pad_ufes20 \\
@@ -130,7 +133,10 @@ def main():
     cfg = SCOPE_CONFIGS[args.scope]
     data_dir = args.data_dir or cfg["data_dir"]
     img_dir = args.img_dir or cfg["img_dir"]
-    output_root = Path(args.output_root)
+    # Thu muc con PHAI theo ten scope -- neu khong, 3 lan chay voi cung
+    # --output_root se ghi de len nhau (vd chay fulldata sau khi da chay
+    # concept_only se xoa mat ket qua concept_only).
+    output_root = Path(args.output_root) / args.scope
     s1_dir = output_root / "system1"
     icrl_dir = output_root / "icrl"
     py = sys.executable
