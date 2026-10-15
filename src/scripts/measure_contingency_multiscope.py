@@ -194,7 +194,10 @@ def run_single_split_scope(name, module, data_dir, img_dir, system1_ckpt, icrl_d
     if base_path.exists() and metrics_path.exists():
         saved_metrics = json.load(open(metrics_path))
         rec_n_min = saved_metrics["n_min"]
-        rec_conf_min = saved_metrics["args"]["conf_min"]
+        # 2 format metrics.json khac nhau tung ton tai: train_icrl.py tu ghi
+        # (conf_min nam trong "args"), apply_conf_min_scope.py ghi (conf_min
+        # o top-level, giong apply_conf_min_cv.py) -- thu top-level truoc.
+        rec_conf_min = saved_metrics.get("conf_min", saved_metrics.get("args", {}).get("conf_min"))
         pre_dedupe_memory = get_pre_dedupe_memory(base_path, rec_n_min, rec_conf_min,
                                                    system1, head, val_loader, device,
                                                    record_rule_accuracy)
