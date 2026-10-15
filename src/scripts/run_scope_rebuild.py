@@ -37,6 +37,18 @@ Usage (Kaggle):
     python -m src.scripts.run_scope_rebuild --scope fulldata \\
         --output_root /kaggle/working/outputs/scope_rebuild
 
+--exclude_label_slot: build THEM bien the "no label-slot" (xem memory
+project_s1s2_coupling_plan.md muc "Bug #6") -- day la bien the CHINH THUC
+paper dung lam System~2 cho ensemble, KHONG phai bien the mac dinh o tren
+(dung de so sanh trong paper's tab:concept-metrics, khong deploy). Dung
+--skip_s1 de tai dung S1 da train (buoc 1, --output_root phai TRUNG voi
+lan chay truoc), chi build lai ICRL -- vd sau khi da chay lenh mac dinh
+phia tren roi moi nhan ra can them bien the nay:
+    python -m src.scripts.run_scope_rebuild --scope fulldata --skip_s1 \\
+        --exclude_label_slot --output_root /kaggle/working/outputs/scope_rebuild
+    python -m src.scripts.run_scope_rebuild --scope concept_only --skip_s1 \\
+        --exclude_label_slot --output_root /kaggle/working/outputs/scope_rebuild
+
 Usage (local, test nhanh truoc khi len Kaggle -- --s1_epochs it de kiem tra
 script chay duoc, KHONG dung ket qua nay de ket luan gi):
     python -m src.scripts.run_scope_rebuild --scope pad_ufes20 \\
@@ -120,6 +132,16 @@ def parse_args():
     p.add_argument("--s1_epochs", type=int, default=None,
                     help="Ghi de so epoch S1 (mac dinh = gia tri goc cua scope, 30). "
                          "Chi dung de test nhanh script chay duoc, khong dung de ket luan.")
+    p.add_argument("--exclude_label_slot", action="store_true",
+                    help="Build bien the ICRL KHONG dung label-slot S1 du doan luc cluster -- "
+                         "day la bien the CHINH THUC paper dung lam System~2 cho ensemble o "
+                         "ca 3 scope (xem tab:ensemble-strategies), KHONG phai bien the "
+                         "mac dinh/--icrl_args cua SCOPE_CONFIGS (do la bien the so sanh, "
+                         "khong phai bien the deploy). ICRL se ghi vao "
+                         "<output_root>/<scope>/icrl_nolabelslot/ thay vi icrl/.")
+    p.add_argument("--skip_s1", action="store_true",
+                    help="Bo qua buoc 1 (train S1), chi build lai ICRL -- dung khi S1 hien tai "
+                         "da co san (vd da train xong tu lan chay truoc trong cung output_root).")
     return p.parse_args()
 
 
@@ -138,32 +160,35 @@ def main():
     # concept_only se xoa mat ket qua concept_only).
     output_root = Path(args.output_root) / args.scope
     s1_dir = output_root / "system1"
-    icrl_dir = output_root / "icrl"
+    icrl_dir = output_root / ("icrl_nolabelslot" if args.exclude_label_slot else "icrl")
     py = sys.executable
     module = cfg["module"]
 
     s1 = cfg["s1_args"]
     epochs = args.s1_epochs if args.s1_epochs is not None else s1["epochs"]
 
-    print(f"{'=' * 70}\n[SCOPE={args.scope}] module={module}\n"
+    print(f"{'=' * 70}\n[SCOPE={args.scope}] module={module}  exclude_label_slot={args.exclude_label_slot}\n"
           f"data_dir={data_dir}\nimg_dir={img_dir}\noutput_root={output_root}\n{'=' * 70}")
 
-    # ── Buoc 1: train lai System~1 voi fix lazy-collapse ───────────────
-    run([py, "-m", f"src.scripts.{module}.train_system1_baseline",
-         "--data_dir", data_dir, "--img_dir", img_dir,
-         "--output_dir", str(s1_dir),
-         "--backbone", s1["backbone"], "--image_size", str(s1["image_size"]),
-         "--epochs", str(epochs), "--batch_size", str(s1["batch_size"]),
-         "--lr", str(s1["lr"]), "--backbone_lr_scale", str(s1["backbone_lr_scale"]),
-         "--grad_clip_norm", str(s1["grad_clip_norm"]), "--weight_decay", str(s1["weight_decay"]),
-         "--lr_schedule", s1["lr_schedule"],
-         "--num_concepts", str(s1["num_concepts"]), "--num_labels", str(s1["num_labels"]),
-         "--monitor", "label_acc_gated", "--min_concept_diversity", str(args.min_concept_diversity),
-         "--seed", str(args.seed)])
+    # ── Buoc 1: train lai System~1 voi fix lazy-collapse (bo qua neu --skip_s1) ──
+    if not args.skip_s1:
+        run([py, "-m", f"src.scripts.{module}.train_system1_baseline",
+             "--data_dir", data_dir, "--img_dir", img_dir,
+             "--output_dir", str(s1_dir),
+             "--backbone", s1["backbone"], "--image_size", str(s1["image_size"]),
+             "--epochs", str(epochs), "--batch_size", str(s1["batch_size"]),
+             "--lr", str(s1["lr"]), "--backbone_lr_scale", str(s1["backbone_lr_scale"]),
+             "--grad_clip_norm", str(s1["grad_clip_norm"]), "--weight_decay", str(s1["weight_decay"]),
+             "--lr_schedule", s1["lr_schedule"],
+             "--num_concepts", str(s1["num_concepts"]), "--num_labels", str(s1["num_labels"]),
+             "--monitor", "label_acc_gated", "--min_concept_diversity", str(args.min_concept_diversity),
+             "--seed", str(args.seed)])
+    else:
+        print(f"[INFO] --skip_s1: tai dung S1 co san tai {s1_dir / 'best_model.pt'}")
 
     # ── Buoc 2: build lai ICRL Stage 2/3 bang code hien tai (Wilson score) ──
     icrl = cfg["icrl_args"]
-    run([py, "-m", f"src.scripts.{module}.train_icrl",
+    icrl_cmd = [py, "-m", f"src.scripts.{module}.train_icrl",
          "--data_dir", data_dir, "--img_dir", img_dir,
          "--system1_ckpt", str(s1_dir / "best_model.pt"),
          "--output_dir", str(icrl_dir),
@@ -171,7 +196,10 @@ def main():
          "--conf_min", str(icrl["conf_min"]), "--label_names", icrl["label_names"],
          "--head_epochs", str(icrl["head_epochs"]), "--head_lr", str(icrl["head_lr"]),
          "--head_steps_per_epoch", str(icrl["head_steps_per_epoch"]),
-         "--seed", str(args.seed)])
+         "--seed", str(args.seed)]
+    if args.exclude_label_slot:
+        icrl_cmd.append("--exclude_label_slot")
+    run(icrl_cmd)
 
     print(f"\n[DONE] {args.scope}: S1 -> {s1_dir}, ICRL -> {icrl_dir}")
 
