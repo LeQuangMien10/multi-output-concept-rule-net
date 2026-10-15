@@ -188,6 +188,7 @@ def run_fold(k, cv_root, system1_root, data_root, img_dir, label_names, batch_si
     ece_s2_after = ece(p2_test.max(1).values.numpy(), (pred2 == y_test).numpy().astype(float))
 
     strategies = {}
+    pred2_val = p2_val.argmax(1)
 
     # ---- weighted_avg ----
     best_alpha, best_acc = 0.5, -1.0
@@ -204,15 +205,23 @@ def run_fold(k, cv_root, system1_root, data_root, img_dir, label_names, batch_si
     strategies["confidence_pick"] = pred_cp
 
     # ---- gated_override (tren xac suat da scale) ----
+    # LUU Y: s2_val_argmax PHAI la S2's argmax tren VAL (pred2_val), khong
+    # phai pred2 (S2's argmax tren TEST) -- ban cu truyen sai `pred2, pred2`
+    # cho ca 2 cho, khong lam crash gi vi fold CRL-matched co val_size==
+    # test_size (dung protocol goc), nhung van la leak nhan S2 cua TEST vao
+    # buoc grid-search threshold tren VAL. Da sua -- cac fold cu da bao cao
+    # (report 8, memory project_infotheory_ensemble_plan.md) dung so lieu
+    # TRUOC fix nay cho 2 chien luoc nay, nen co the lech nhe; conclusion
+    # tong the (khong chien luoc nao thang baseline) can doi chieu lai.
     pred_go, combo_go = gated_override_grid(
-        p1_val, rc_val, y_val, p1_test, rc_test, y_test, pred2, pred2,
+        p1_val, rc_val, y_val, p1_test, rc_test, y_test, pred2_val, pred2,
         p1_val.max(1).values, p1_test.max(1).values)
     strategies["gated_override"] = pred_go
 
     # ---- entropy_gated ----
     ent_val, ent_test = entropy_confidence(p1_val), entropy_confidence(p1_test)
     pred_eg, combo_eg = gated_override_grid(
-        p1_val, rc_val, y_val, p1_test, rc_test, y_test, pred2, pred2,
+        p1_val, rc_val, y_val, p1_test, rc_test, y_test, pred2_val, pred2,
         ent_val, ent_test)
     strategies["entropy_gated"] = pred_eg
 
@@ -222,7 +231,7 @@ def run_fold(k, cv_root, system1_root, data_root, img_dir, label_names, batch_si
 
     # ---- naive_bayes ----
     prior = fit_class_prior(y_val, len(label_names))
-    pred1_val, pred2_val = p1_val.argmax(1), p2_val.argmax(1)
+    pred1_val = p1_val.argmax(1)
     L1 = fit_confusion_likelihood(pred1_val, y_val, len(label_names))
     L2 = fit_confusion_likelihood(pred2_val, y_val, len(label_names))
     post = naive_bayes_fusion(pred1, pred2, prior, L1, L2)

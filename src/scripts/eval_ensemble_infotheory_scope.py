@@ -168,6 +168,8 @@ def main():
 
     strategies = {}
 
+    pred2_val = p2_val.argmax(1)
+
     best_alpha, best_acc = 0.5, -1.0
     for alpha in np.linspace(0, 1, 21):
         pred = (alpha * p1_val + (1 - alpha) * p2_val).argmax(1)
@@ -179,21 +181,27 @@ def main():
     pick_s1 = p1_test.max(1).values >= p2_test.max(1).values
     strategies["confidence_pick"] = torch.where(pick_s1, pred1, pred2)
 
+    # LUU Y: s2_val_argmax PHAI la S2's argmax tren VAL (pred2_val), khong
+    # phai pred2 (la S2's argmax tren TEST) -- ban cu (eval_ensemble_infotheory.py,
+    # dung cho CRL-matched) truyen sai `pred2, pred2` cho ca 2 cho (val VA
+    # test), khong crash chi vi CRL-matched co val_size==test_size theo dung
+    # protocol goc (nen 2 tensor khac noi dung nhung cung shape) -- van la
+    # loi leak du lieu test vao buoc grid-search tren val. Sua dung o day.
     pred_go, combo_go = gated_override_grid(
-        p1_val, rc_val, y_val, p1_test, rc_test, y_test, pred2, pred2,
+        p1_val, rc_val, y_val, p1_test, rc_test, y_test, pred2_val, pred2,
         p1_val.max(1).values, p1_test.max(1).values)
     strategies["gated_override"] = pred_go
 
     ent_val, ent_test = entropy_confidence(p1_val), entropy_confidence(p1_test)
     pred_eg, combo_eg = gated_override_grid(
-        p1_val, rc_val, y_val, p1_test, rc_test, y_test, pred2, pred2, ent_val, ent_test)
+        p1_val, rc_val, y_val, p1_test, rc_test, y_test, pred2_val, pred2, ent_val, ent_test)
     strategies["entropy_gated"] = pred_eg
 
     w1, w2 = fit_log_linear_weights(p1_val, p2_val, y_val)
     strategies["log_linear"] = log_linear_pool(p1_test, p2_test, w1, w2).argmax(1)
 
     prior = fit_class_prior(y_val, num_classes)
-    pred1_val, pred2_val = p1_val.argmax(1), p2_val.argmax(1)
+    pred1_val = p1_val.argmax(1)
     L1 = fit_confusion_likelihood(pred1_val, y_val, num_classes)
     L2 = fit_confusion_likelihood(pred2_val, y_val, num_classes)
     post = naive_bayes_fusion(pred1, pred2, prior, L1, L2)
