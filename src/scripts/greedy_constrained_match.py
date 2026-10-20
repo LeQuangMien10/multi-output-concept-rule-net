@@ -130,8 +130,16 @@ def evaluate_scope(name, module, data_dir, img_dir, system1_ckpt, icrl_dir,
     total_flips_when_needed = 0
     n_y_correct_current_match = 0
     n_y_correct_repair = 0
-    hamming_current_match = 0
-    hamming_repair = 0
+    # Hamming va accuracy CHI tinh tren cac ca repair THANH CONG (0-flip hoac
+    # repaired-trong-budget) -- ca that bai bi loai khoi so sanh nay vi
+    # repaired_pattern luc do la 1 diem KHONG hop le sau khi bi ep lat du
+    # max_flips lan, so no voi match hien tai (luon hop le) la khong cong
+    # bang (se thoi phong Hamming/sai lech cua repair 1 cach gia tao).
+    n_success = 0
+    hamming_current_match_success = 0
+    hamming_repair_success = 0
+    n_y_correct_current_match_success = 0
+    n_y_correct_repair_success = 0
 
     for images, labels in test_loader:
         images = images.to(device)
@@ -156,25 +164,28 @@ def evaluate_scope(name, module, data_dir, img_dir, system1_ckpt, icrl_dir,
             else:
                 n_failed += 1
 
-            # Hamming distance cua pattern MATCH hien tai (centroid cua rule
-            # da khop) toi pattern GOC cua S1 -- vs Hamming cua pattern sau
-            # repair toi pattern goc (theo dinh nghia, <= max_flips).
             matched_rule_decoded = memory.decode_rule(rule_ids[i].item(), concept_keys,
                                                         concept_offsets, concept_dims)
             matched_rule_pattern = tuple(k for k in keys
                                           if matched_rule_decoded["slots"][k]["value"] == "present")
-            hamming_current_match += len(set(s1_pattern) ^ set(matched_rule_pattern))
-            hamming_repair += len(set(s1_pattern) ^ set(repaired_pattern))
-
-            if int(s2_pred_current[i].item()) == int(y[i].item()):
+            current_correct = int(s2_pred_current[i].item()) == int(y[i].item())
+            if current_correct:
                 n_y_correct_current_match += 1
 
             if repaired_pattern in pattern_to_label:
                 repair_label = pattern_to_label[repaired_pattern]
             else:
                 repair_label = int(s2_pred_current[i].item())  # fallback: giu cach match hien tai
-            if repair_label == int(y[i].item()):
+            repair_correct = repair_label == int(y[i].item())
+            if repair_correct:
                 n_y_correct_repair += 1
+
+            if n_flips == 0 or success:
+                n_success += 1
+                hamming_current_match_success += len(set(s1_pattern) ^ set(matched_rule_pattern))
+                hamming_repair_success += len(set(s1_pattern) ^ set(repaired_pattern))
+                n_y_correct_current_match_success += int(current_correct)
+                n_y_correct_repair_success += int(repair_correct)
 
     result = {
         "n": n,
@@ -184,19 +195,26 @@ def evaluate_scope(name, module, data_dir, img_dir, system1_ckpt, icrl_dir,
         "pct_repaired_within_budget": n_repaired / n,
         "pct_failed_exceed_budget": n_failed / n,
         "avg_flips_when_repair_needed": total_flips_when_needed / max(1, n_repaired),
-        "avg_hamming_current_match_to_s1": hamming_current_match / n,
-        "avg_hamming_repair_to_s1": hamming_repair / n,
         "s2_acc_current_match": n_y_correct_current_match / n,
         "s2_acc_after_repair": n_y_correct_repair / n,
+        # So sanh CONG BANG, chi tren n_success ca repair thanh cong that su:
+        "n_success": n_success,
+        "avg_hamming_current_match_to_s1_success_only": hamming_current_match_success / max(1, n_success),
+        "avg_hamming_repair_to_s1_success_only": hamming_repair_success / max(1, n_success),
+        "s2_acc_current_match_success_only": n_y_correct_current_match_success / max(1, n_success),
+        "s2_acc_repair_success_only": n_y_correct_repair_success / max(1, n_success),
     }
     print(f"[{name}] n={n}  0-flip(Satisfactory)={result['pct_zero_flip_already_valid']*100:.1f}%  "
           f"repaired={result['pct_repaired_within_budget']*100:.1f}%  "
           f"failed={result['pct_failed_exceed_budget']*100:.1f}%  "
           f"avg_flips={result['avg_flips_when_repair_needed']:.2f}")
-    print(f"  Hamming toi pattern goc S1: match_hien_tai={result['avg_hamming_current_match_to_s1']:.3f}  "
-          f"repair={result['avg_hamming_repair_to_s1']:.3f}")
-    print(f"  S2 acc: match_hien_tai={result['s2_acc_current_match']*100:.2f}%  "
+    print(f"  [toan bo n={n}] S2 acc: match_hien_tai={result['s2_acc_current_match']*100:.2f}%  "
           f"sau_repair={result['s2_acc_after_repair']*100:.2f}%")
+    print(f"  [chi n_success={n_success}, cong bang] Hamming: match_hien_tai="
+          f"{result['avg_hamming_current_match_to_s1_success_only']:.3f}  "
+          f"repair={result['avg_hamming_repair_to_s1_success_only']:.3f}  |  "
+          f"S2 acc: match_hien_tai={result['s2_acc_current_match_success_only']*100:.2f}%  "
+          f"repair={result['s2_acc_repair_success_only']*100:.2f}%")
     return result
 
 
