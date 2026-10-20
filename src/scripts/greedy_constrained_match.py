@@ -90,6 +90,99 @@ def greedy_repair(cv_row, valid_patterns, keys, concept_offsets, concept_dims,
     return pattern(), n_flips, False
 
 
+def _new_counts():
+    return dict(n=0, n_zero_flip=0, n_repaired=0, n_failed=0, total_flips_when_needed=0,
+                n_y_correct_current_match=0, n_y_correct_repair=0, n_success=0,
+                hamming_current_match_success=0, hamming_repair_success=0,
+                n_y_correct_current_match_success=0, n_y_correct_repair_success=0)
+
+
+@torch.no_grad()
+def accumulate_loader(counts, loader, system1, memory, head, centroids, valid_patterns,
+                       pattern_to_label, concept_keys, concept_offsets, concept_dims,
+                       exclude_keys, keys, max_flips, device):
+    """Cong don 1 loader (1 fold hoac 1-split) vao `counts` (dict raw count,
+    xem _new_counts()) -- dung chung cho ca scope 1-split va crlmatched
+    5-fold (goi nhieu lan, moi lan 1 fold co rule memory rieng)."""
+    for images, labels in loader:
+        images = images.to(device)
+        out = system1(images)
+        cv = soft_concept_vector(out)
+        y = labels["label"].to(device)
+        rule_ids, _ = memory.match(cv)
+        s2_pred_current = head(centroids[rule_ids]).argmax(dim=-1)
+
+        for i in range(cv.shape[0]):
+            counts["n"] += 1
+            s1_pattern = decode_pattern_from_vec(cv[i], concept_keys, concept_offsets,
+                                                  concept_dims, exclude_keys)
+            repaired_pattern, n_flips, success = greedy_repair(
+                cv[i], valid_patterns, keys, concept_offsets, concept_dims, max_flips)
+
+            if n_flips == 0:
+                counts["n_zero_flip"] += 1
+            elif success:
+                counts["n_repaired"] += 1
+                counts["total_flips_when_needed"] += n_flips
+            else:
+                counts["n_failed"] += 1
+
+            matched_rule_decoded = memory.decode_rule(rule_ids[i].item(), concept_keys,
+                                                        concept_offsets, concept_dims)
+            matched_rule_pattern = tuple(k for k in keys
+                                          if matched_rule_decoded["slots"][k]["value"] == "present")
+            current_correct = int(s2_pred_current[i].item()) == int(y[i].item())
+            if current_correct:
+                counts["n_y_correct_current_match"] += 1
+
+            if repaired_pattern in pattern_to_label:
+                repair_label = pattern_to_label[repaired_pattern]
+            else:
+                repair_label = int(s2_pred_current[i].item())  # fallback: giu cach match hien tai
+            repair_correct = repair_label == int(y[i].item())
+            if repair_correct:
+                counts["n_y_correct_repair"] += 1
+
+            if n_flips == 0 or success:
+                counts["n_success"] += 1
+                counts["hamming_current_match_success"] += len(set(s1_pattern) ^ set(matched_rule_pattern))
+                counts["hamming_repair_success"] += len(set(s1_pattern) ^ set(repaired_pattern))
+                counts["n_y_correct_current_match_success"] += int(current_correct)
+                counts["n_y_correct_repair_success"] += int(repair_correct)
+
+
+def finalize(name, counts, max_flips, num_valid_patterns):
+    n, n_success = counts["n"], counts["n_success"]
+    result = {
+        "n": n,
+        "max_flips": max_flips,
+        "num_valid_patterns": num_valid_patterns,
+        "pct_zero_flip_already_valid": counts["n_zero_flip"] / n,
+        "pct_repaired_within_budget": counts["n_repaired"] / n,
+        "pct_failed_exceed_budget": counts["n_failed"] / n,
+        "avg_flips_when_repair_needed": counts["total_flips_when_needed"] / max(1, counts["n_repaired"]),
+        "s2_acc_current_match": counts["n_y_correct_current_match"] / n,
+        "s2_acc_after_repair": counts["n_y_correct_repair"] / n,
+        "n_success": n_success,
+        "avg_hamming_current_match_to_s1_success_only": counts["hamming_current_match_success"] / max(1, n_success),
+        "avg_hamming_repair_to_s1_success_only": counts["hamming_repair_success"] / max(1, n_success),
+        "s2_acc_current_match_success_only": counts["n_y_correct_current_match_success"] / max(1, n_success),
+        "s2_acc_repair_success_only": counts["n_y_correct_repair_success"] / max(1, n_success),
+    }
+    print(f"[{name}] n={n}  0-flip(Satisfactory)={result['pct_zero_flip_already_valid']*100:.1f}%  "
+          f"repaired={result['pct_repaired_within_budget']*100:.1f}%  "
+          f"failed={result['pct_failed_exceed_budget']*100:.1f}%  "
+          f"avg_flips={result['avg_flips_when_repair_needed']:.2f}")
+    print(f"  [toan bo n={n}] S2 acc: match_hien_tai={result['s2_acc_current_match']*100:.2f}%  "
+          f"sau_repair={result['s2_acc_after_repair']*100:.2f}%")
+    print(f"  [chi n_success={n_success}, cong bang] Hamming: match_hien_tai="
+          f"{result['avg_hamming_current_match_to_s1_success_only']:.3f}  "
+          f"repair={result['avg_hamming_repair_to_s1_success_only']:.3f}  |  "
+          f"S2 acc: match_hien_tai={result['s2_acc_current_match_success_only']*100:.2f}%  "
+          f"repair={result['s2_acc_repair_success_only']*100:.2f}%")
+    return result
+
+
 @torch.no_grad()
 def evaluate_scope(name, module, data_dir, img_dir, system1_ckpt, icrl_dir,
                     num_labels, max_flips, batch_size, num_workers, device):
@@ -116,106 +209,63 @@ def evaluate_scope(name, module, data_dir, img_dir, system1_ckpt, icrl_dir,
     centroids = memory.get_centroids().to(device)
 
     valid_patterns = build_valid_pattern_set(memory, concept_keys, concept_offsets, concept_dims, exclude_keys)
-    # pattern -> nhan da so cua rule tuong ung (de tra cuu nhan sau khi repair)
     pattern_to_label = {}
     for r in range(memory.num_rules):
         d = memory.decode_rule(r, concept_keys, concept_offsets, concept_dims)
         pat = tuple(k for k in keys if d["slots"][k]["value"] == "present")
         pattern_to_label[pat] = d["label"]
 
-    n = 0
-    n_zero_flip = 0
-    n_repaired = 0  # can flip nhung thanh cong trong ngan sach
-    n_failed = 0    # vuot ngan sach, khong tim duoc
-    total_flips_when_needed = 0
-    n_y_correct_current_match = 0
-    n_y_correct_repair = 0
-    # Hamming va accuracy CHI tinh tren cac ca repair THANH CONG (0-flip hoac
-    # repaired-trong-budget) -- ca that bai bi loai khoi so sanh nay vi
-    # repaired_pattern luc do la 1 diem KHONG hop le sau khi bi ep lat du
-    # max_flips lan, so no voi match hien tai (luon hop le) la khong cong
-    # bang (se thoi phong Hamming/sai lech cua repair 1 cach gia tao).
-    n_success = 0
-    hamming_current_match_success = 0
-    hamming_repair_success = 0
-    n_y_correct_current_match_success = 0
-    n_y_correct_repair_success = 0
+    counts = _new_counts()
+    accumulate_loader(counts, test_loader, system1, memory, head, centroids, valid_patterns,
+                       pattern_to_label, concept_keys, concept_offsets, concept_dims,
+                       exclude_keys, keys, max_flips, device)
+    return finalize(name, counts, max_flips, len(valid_patterns))
 
-    for images, labels in test_loader:
-        images = images.to(device)
-        out = system1(images)
-        cv = soft_concept_vector(out)
-        y = labels["label"].to(device)
-        rule_ids, _ = memory.match(cv)
-        s2_pred_current = head(centroids[rule_ids]).argmax(dim=-1)
 
-        for i in range(cv.shape[0]):
-            n += 1
-            s1_pattern = decode_pattern_from_vec(cv[i], concept_keys, concept_offsets,
-                                                  concept_dims, exclude_keys)
-            repaired_pattern, n_flips, success = greedy_repair(
-                cv[i], valid_patterns, keys, concept_offsets, concept_dims, max_flips)
+@torch.no_grad()
+def evaluate_crlmatched(max_flips, batch_size, num_workers, device):
+    from src.scripts.fitzpatrick.train_icrl import load_system1, make_loaders, build_full_concept_layout
+    from src.utils.fitzpatrick_concepts import S1_LABEL_CONCEPT_KEY
 
-            if n_flips == 0:
-                n_zero_flip += 1
-            elif success:
-                n_repaired += 1
-                total_flips_when_needed += n_flips
-            else:
-                n_failed += 1
+    cv_root = Path("outputs/crlmatched_cv_gated_confmin03")
+    system1_root = Path("outputs/crlmatched_cv_gated")
+    data_root = Path("data/fitzpatrick17k_crl_matched_cv_official")
+    exclude_keys = {S1_LABEL_CONCEPT_KEY}
 
-            matched_rule_decoded = memory.decode_rule(rule_ids[i].item(), concept_keys,
-                                                        concept_offsets, concept_dims)
-            matched_rule_pattern = tuple(k for k in keys
-                                          if matched_rule_decoded["slots"][k]["value"] == "present")
-            current_correct = int(s2_pred_current[i].item()) == int(y[i].item())
-            if current_correct:
-                n_y_correct_current_match += 1
+    counts = _new_counts()
+    total_valid_patterns = 0
+    for k in range(5):
+        fold_dir = cv_root / f"fold_{k}"
+        system1, image_size = load_system1(system1_root / f"fold_{k}" / "system1" / "best_model.pt", device)
+        _, val_loader, test_loader = make_loaders(data_root / f"fold_{k}", DEFAULT_IMG_DIR, image_size,
+                                                    batch_size, num_workers)
+        concept_names = test_loader.dataset.concept_names
+        concept_keys, concept_offsets, concept_dims, _ = build_full_concept_layout(
+            concept_names, ["label_0", "label_1"])
+        keys = [kk for kk in concept_keys if kk not in exclude_keys]
 
-            if repaired_pattern in pattern_to_label:
-                repair_label = pattern_to_label[repaired_pattern]
-            else:
-                repair_label = int(s2_pred_current[i].item())  # fallback: giu cach match hien tai
-            repair_correct = repair_label == int(y[i].item())
-            if repair_correct:
-                n_y_correct_repair += 1
+        memory = ICRLRuleMemory.load(fold_dir / "icrl" / "icrl_rule_memory.pt", device=str(device))
+        head = nn.Linear(memory.concept_dim, 2).to(device)
+        head.load_state_dict(torch.load(fold_dir / "icrl" / "prediction_head.pt",
+                                         map_location=device, weights_only=False))
+        head.eval()
+        centroids = memory.get_centroids().to(device)
 
-            if n_flips == 0 or success:
-                n_success += 1
-                hamming_current_match_success += len(set(s1_pattern) ^ set(matched_rule_pattern))
-                hamming_repair_success += len(set(s1_pattern) ^ set(repaired_pattern))
-                n_y_correct_current_match_success += int(current_correct)
-                n_y_correct_repair_success += int(repair_correct)
+        valid_patterns = build_valid_pattern_set(memory, concept_keys, concept_offsets, concept_dims, exclude_keys)
+        total_valid_patterns += len(valid_patterns)
+        pattern_to_label = {}
+        for r in range(memory.num_rules):
+            d = memory.decode_rule(r, concept_keys, concept_offsets, concept_dims)
+            pat = tuple(kk for kk in keys if d["slots"][kk]["value"] == "present")
+            pattern_to_label[pat] = d["label"]
 
-    result = {
-        "n": n,
-        "max_flips": max_flips,
-        "num_valid_patterns": len(valid_patterns),
-        "pct_zero_flip_already_valid": n_zero_flip / n,
-        "pct_repaired_within_budget": n_repaired / n,
-        "pct_failed_exceed_budget": n_failed / n,
-        "avg_flips_when_repair_needed": total_flips_when_needed / max(1, n_repaired),
-        "s2_acc_current_match": n_y_correct_current_match / n,
-        "s2_acc_after_repair": n_y_correct_repair / n,
-        # So sanh CONG BANG, chi tren n_success ca repair thanh cong that su:
-        "n_success": n_success,
-        "avg_hamming_current_match_to_s1_success_only": hamming_current_match_success / max(1, n_success),
-        "avg_hamming_repair_to_s1_success_only": hamming_repair_success / max(1, n_success),
-        "s2_acc_current_match_success_only": n_y_correct_current_match_success / max(1, n_success),
-        "s2_acc_repair_success_only": n_y_correct_repair_success / max(1, n_success),
-    }
-    print(f"[{name}] n={n}  0-flip(Satisfactory)={result['pct_zero_flip_already_valid']*100:.1f}%  "
-          f"repaired={result['pct_repaired_within_budget']*100:.1f}%  "
-          f"failed={result['pct_failed_exceed_budget']*100:.1f}%  "
-          f"avg_flips={result['avg_flips_when_repair_needed']:.2f}")
-    print(f"  [toan bo n={n}] S2 acc: match_hien_tai={result['s2_acc_current_match']*100:.2f}%  "
-          f"sau_repair={result['s2_acc_after_repair']*100:.2f}%")
-    print(f"  [chi n_success={n_success}, cong bang] Hamming: match_hien_tai="
-          f"{result['avg_hamming_current_match_to_s1_success_only']:.3f}  "
-          f"repair={result['avg_hamming_repair_to_s1_success_only']:.3f}  |  "
-          f"S2 acc: match_hien_tai={result['s2_acc_current_match_success_only']*100:.2f}%  "
-          f"repair={result['s2_acc_repair_success_only']*100:.2f}%")
-    return result
+        before_n = counts["n"]
+        accumulate_loader(counts, test_loader, system1, memory, head, centroids, valid_patterns,
+                           pattern_to_label, concept_keys, concept_offsets, concept_dims,
+                           exclude_keys, keys, max_flips, device)
+        print(f"  [crlmatched fold_{k}] n={counts['n'] - before_n}  valid_patterns={len(valid_patterns)}")
+
+    return finalize("crlmatched", counts, max_flips, total_valid_patterns)
 
 
 def main():
@@ -224,6 +274,7 @@ def main():
               else torch.device("cpu")) if args.device == "auto" else torch.device(args.device)
 
     results = {}
+    results["crlmatched"] = evaluate_crlmatched(args.max_flips, args.batch_size, args.num_workers, device)
     results["pad_ufes20"] = evaluate_scope(
         "pad_ufes20", "pad_ufes20",
         "data/PAD-UFES-20_prepared", "data/PAD-UFES-20/images",
