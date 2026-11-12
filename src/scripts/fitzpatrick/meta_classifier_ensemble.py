@@ -134,7 +134,76 @@ def run_fold_data(k, cv_root, system1_root, data_root, img_dir, label_names,
         "X_val": X_val, "dis_val": dis_val, "label_val": label_val,
         "X_test": X_test, "dis_test": dis_test, "label_test": label_test,
         "y_test": y_test.numpy(), "pred1_test": pred1_test.numpy(), "pred2_test": pred2_test.numpy(),
+        "p1_test": p1_test, "p2_test": p2_test,
+        "p1_val": p1_val, "p2_val": p2_val, "y_val": y_val.numpy(),
     }
+
+
+def fit_pool_calibration(clf, scaler, X_dis, p1_dis, p2_dis, y_dis,
+                          a_grid=(0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0),
+                          b_grid=(-4.0, -3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0, 4.0)):
+    """Khong tai dung proba da hieu chinh cho NGUONG phan loai lam thang
+    TRONG SO pha tron -- thay vao do, dich qua logit (z = decision_function,
+    DUNG, chua qua sigmoid) va hoc rieng (a, b) sao cho
+    w2(x) = sigmoid(a*z(x) + b) TOI DA HOA chinh accuracy cua phep POOLING
+    (khong phai accuracy phan loai "S2 dung hay sai"), do bang grid-search
+    tren CHINH tap val dung de fit clf (khong leak tap test cua fold giu
+    lai)."""
+    z = clf.decision_function(scaler.transform(X_dis))
+    z = torch.tensor(z, dtype=torch.float32)
+    log_p1, log_p2 = p1_dis.clamp(min=1e-8).log(), p2_dis.clamp(min=1e-8).log()
+    y_dis_t = torch.tensor(y_dis, dtype=torch.long)
+    best_a, best_b, best_acc = 1.0, 0.0, -1.0
+    for a in a_grid:
+        for b in b_grid:
+            w2 = torch.sigmoid(a * z + b).unsqueeze(-1)
+            w1 = 1.0 - w2
+            pred = (w1 * log_p1 + w2 * log_p2).argmax(dim=-1)
+            acc = float((pred == y_dis_t).float().mean())
+            if acc > best_acc:
+                best_acc, best_a, best_b = acc, a, b
+    return best_a, best_b, best_acc
+
+
+def continuous_pool_pred_calibrated(clf, scaler, a, b, d):
+    """Nhu continuous_pool_pred(), nhung w2(x) = sigmoid(a*decision_function(x)+b)
+    thay vi predict_proba(x)[:,1] truc tiep -- (a, b) hoc rieng cho muc tieu
+    pooling qua fit_pool_calibration()."""
+    dis_test = d["dis_test"]
+    pred_final = d["pred1_test"].copy()
+    if dis_test.sum() == 0:
+        return pred_final
+    z = clf.decision_function(scaler.transform(d["X_test"][dis_test]))
+    z = torch.tensor(z, dtype=torch.float32)
+    w2 = torch.sigmoid(a * z + b).unsqueeze(-1)
+    w1 = 1.0 - w2
+    p1_dis = d["p1_test"][torch.from_numpy(dis_test)]
+    p2_dis = d["p2_test"][torch.from_numpy(dis_test)]
+    log_p = w1 * p1_dis.clamp(min=1e-8).log() + w2 * p2_dis.clamp(min=1e-8).log()
+    pred_dis = log_p.argmax(dim=-1).numpy()
+    pred_final[dis_test] = pred_dis
+    return pred_final
+
+
+def continuous_pool_pred(clf, scaler, d):
+    """Khung B cua notes/s1s2_formalization.md: thay vi chon cung S1/S2 tren
+    tap bat dong, dung predict_proba(X)[:,1] lam trong so w2(x) LIEN TUC
+    trong log-opinion pool (softmax(w1*logP1 + w2*logP2)), chi ap dung tren
+    tap bat dong (ngoai tap nay feature suy bien ve 0, model chi duoc train
+    tren tap bat dong). Mau dong y giu nguyen pred1 (= pred2)."""
+    dis_test = d["dis_test"]
+    pred_final = d["pred1_test"].copy()
+    if dis_test.sum() == 0:
+        return pred_final
+    proba = clf.predict_proba(scaler.transform(d["X_test"][dis_test]))[:, 1]
+    w2 = torch.tensor(proba, dtype=torch.float32).unsqueeze(-1)
+    w1 = 1.0 - w2
+    p1_dis = d["p1_test"][torch.from_numpy(dis_test)]
+    p2_dis = d["p2_test"][torch.from_numpy(dis_test)]
+    log_p = w1 * p1_dis.clamp(min=1e-8).log() + w2 * p2_dis.clamp(min=1e-8).log()
+    pred_dis = log_p.argmax(dim=-1).numpy()
+    pred_final[dis_test] = pred_dis
+    return pred_final
 
 
 def main():
@@ -151,6 +220,9 @@ def main():
 
     all_coefs = []
     accs, f1s = [], []
+    accs_cont, f1s_cont = [], []
+    accs_calib = []
+    coverages, accs_explained, accs_unexplained = [], [], []
     total_s2_fix, total_s1_wrong_s2_right = 0, 0
     total_s1_fix, total_s2_wrong_s1_right = 0, 0
 
@@ -167,6 +239,18 @@ def main():
         clf = LogisticRegression(max_iter=1000, class_weight="balanced").fit(
             scaler.transform(X_train), y_train)
         all_coefs.append(clf.coef_[0])
+
+        # Hieu chinh (a, b) RIENG cho muc tieu pooling (khong tai dung nguong
+        # phan loai best_t ben duoi) -- gop p1/p2/y that cua CHINH cac mau
+        # bat dong trong 4 fold dung de train clf, toi da hoa accuracy pooling.
+        p1_train_dis = torch.cat([fold_data[j]["p1_val"][torch.from_numpy(fold_data[j]["dis_val"])]
+                                   for j in range(args.num_folds) if j != k], dim=0)
+        p2_train_dis = torch.cat([fold_data[j]["p2_val"][torch.from_numpy(fold_data[j]["dis_val"])]
+                                   for j in range(args.num_folds) if j != k], dim=0)
+        y_train_dis = np.concatenate([fold_data[j]["y_val"][fold_data[j]["dis_val"]]
+                                       for j in range(args.num_folds) if j != k], axis=0)
+        pool_a, pool_b, pool_cal_acc = fit_pool_calibration(
+            clf, scaler, X_train, p1_train_dis, p2_train_dis, y_train_dis)
 
         d = fold_data[k]
 
@@ -191,7 +275,21 @@ def main():
         idx_dis = np.where(dis_test)[0]
         pred_final[idx_dis[meta_pred_disagree == 1]] = d["pred2_test"][idx_dis[meta_pred_disagree == 1]]
 
+        # Idea v1 (notes/s1s2_formalization.md, "Ket luan cuoi"): anh nao
+        # duoc GIAI THICH boi 1 rule cu the? Dong y (S1=S2) -> luon giai
+        # thich duoc (rule cua S2 trung voi ket qua cuoi). Bat dong -> chi
+        # giai thich duoc neu classifier du tin S2 (meta_pred_disagree==1);
+        # neu khong, dung S1, KHONG gan rule nao (khong giai thich duoc).
+        explained_mask = np.ones(len(dis_test), dtype=bool)
+        explained_mask[idx_dis] = (meta_pred_disagree == 1)
+        coverage = float(explained_mask.mean())
+
         y_test, pred1_test, pred2_test = d["y_test"], d["pred1_test"], d["pred2_test"]
+        acc_explained = (float((pred_final[explained_mask] == y_test[explained_mask]).mean())
+                          if explained_mask.sum() > 0 else float("nan"))
+        acc_unexplained = (float((pred_final[~explained_mask] == y_test[~explained_mask]).mean())
+                            if (~explained_mask).sum() > 0 else float("nan"))
+
         acc = float((pred_final == y_test).mean())
         tp = int(((pred_final == 1) & (y_test == 1)).sum()); fp = int(((pred_final == 1) & (y_test == 0)).sum())
         fn = int(((pred_final == 0) & (y_test == 1)).sum())
@@ -210,15 +308,57 @@ def main():
         accs.append(acc); f1s.append(f1)
         total_s2_fix += bidir["s2_fixes_s1_count"]; total_s1_wrong_s2_right += bidir["s1_wrong_s2_right_count"]
         total_s1_fix += bidir["s1_fixes_s2_count"]; total_s2_wrong_s1_right += bidir["s2_wrong_s1_right_count"]
+        coverages.append(coverage)
+        if not np.isnan(acc_explained):
+            accs_explained.append(acc_explained)
+        if not np.isnan(acc_unexplained):
+            accs_unexplained.append(acc_unexplained)
+        print(f"  [v1] fold_{k}: coverage={coverage*100:.1f}%  acc_explained={acc_explained*100:.2f}%  "
+              f"acc_unexplained={acc_unexplained*100:.2f}%")
+
+        # Khung B (notes/s1s2_formalization.md): pooling LIEN TUC thay vi chon
+        # cung, dung CUNG classifier (khong fit lai) de tach rieng dong gop cua
+        # "hoc trong so" khoi "chon cung nhi phan".
+        pred_final_cont = continuous_pool_pred(clf, scaler, d)
+        acc_cont = float((pred_final_cont == y_test).mean())
+        tp = int(((pred_final_cont == 1) & (y_test == 1)).sum()); fp = int(((pred_final_cont == 1) & (y_test == 0)).sum())
+        fn = int(((pred_final_cont == 0) & (y_test == 1)).sum())
+        prec = tp / (tp + fp) if (tp + fp) else 0.0
+        rec = tp / (tp + fn) if (tp + fn) else 0.0
+        f1_pos_c = 2 * prec * rec / (prec + rec) if (prec + rec) else 0.0
+        tp0 = int(((pred_final_cont == 0) & (y_test == 0)).sum()); fp0 = int(((pred_final_cont == 0) & (y_test == 1)).sum())
+        fn0 = int(((pred_final_cont == 1) & (y_test == 0)).sum())
+        prec0 = tp0 / (tp0 + fp0) if (tp0 + fp0) else 0.0
+        rec0 = tp0 / (tp0 + fn0) if (tp0 + fn0) else 0.0
+        f1_neg_c = 2 * prec0 * rec0 / (prec0 + rec0) if (prec0 + rec0) else 0.0
+        f1_cont = (f1_pos_c + f1_neg_c) / 2
+        accs_cont.append(acc_cont); f1s_cont.append(f1_cont)
+
+        # Pooling LIEN TUC voi (a, b) hieu chinh rieng cho pooling.
+        pred_final_calib = continuous_pool_pred_calibrated(clf, scaler, pool_a, pool_b, d)
+        acc_calib = float((pred_final_calib == y_test).mean())
+        accs_calib.append(acc_calib)
+
         print(f"fold_{k}: acc={acc:.4f}  f1={f1:.4f}  thresh={best_t:.2f} (val_acc={best_val_acc:.4f})  "
+              f"acc_continuous={acc_cont:.4f}  acc_pool_calib={acc_calib:.4f} (a={pool_a:.2f},b={pool_b:.2f},train_acc={pool_cal_acc:.4f})  "
               f"s2_fixes_s1={bidir['s2_fixes_s1_count']}/{bidir['s1_wrong_s2_right_count']}  "
               f"s1_fixes_s2={bidir['s1_fixes_s2_count']}/{bidir['s2_wrong_s1_right_count']}  "
               f"(train n={len(y_train)}, test disagree n={int(dis_test.sum())})")
 
-    print(f"\n[SUMMARY] meta_classifier: acc={np.mean(accs)*100:.2f}+-{np.std(accs, ddof=1)*100:.2f}%  "
+    print(f"\n[SUMMARY] meta_classifier (chon cung): acc={np.mean(accs)*100:.2f}+-{np.std(accs, ddof=1)*100:.2f}%  "
           f"f1={np.mean(f1s)*100:.2f}+-{np.std(f1s, ddof=1)*100:.2f}%  "
           f"S2->S1 fix={total_s2_fix}/{total_s1_wrong_s2_right}  "
           f"S1->S2 fix={total_s1_fix}/{total_s2_wrong_s1_right}")
+    print(f"[SUMMARY] meta_classifier (pooling lien tuc, proba truc tiep): "
+          f"acc={np.mean(accs_cont)*100:.2f}+-{np.std(accs_cont, ddof=1)*100:.2f}%  "
+          f"f1={np.mean(f1s_cont)*100:.2f}+-{np.std(f1s_cont, ddof=1)*100:.2f}%")
+    print(f"[SUMMARY] meta_classifier (pooling lien tuc, (a,b) hieu chinh rieng): "
+          f"acc={np.mean(accs_calib)*100:.2f}+-{np.std(accs_calib, ddof=1)*100:.2f}%")
+    print(f"[SUMMARY] Idea v1 (1 rule hoac None): coverage={np.mean(coverages)*100:.1f}+-"
+          f"{np.std(coverages, ddof=1)*100:.1f}%  "
+          f"acc_explained={np.mean(accs_explained)*100:.2f}%  "
+          f"acc_unexplained={np.mean(accs_unexplained)*100:.2f}%  "
+          f"(so sanh acc chon-cung toan bo={np.mean(accs)*100:.2f}%)")
 
     coefs = np.array(all_coefs)  # [5, 6]
     print(f"\n[FEATURE IMPORTANCE] he so logistic regression (da standardize), "
