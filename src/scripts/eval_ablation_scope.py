@@ -98,12 +98,19 @@ def main():
               else torch.device("cpu")) if args.device == "auto" else torch.device(args.device)
     cfg = SCOPE_CONFIGS[args.scope]
     module = cfg["module"]
-    label_names = cfg["icrl_args"]["label_names"].split(",")
+    if cfg["icrl_args"]["label_names"] is None:
+        from src.utils.cub_concepts import load_schema
+        label_names = load_schema(args.data_dir)["label_names"]
+    else:
+        label_names = cfg["icrl_args"]["label_names"].split(",")
     num_classes = len(label_names)
 
     if module == "fitzpatrick":
         from src.scripts.fitzpatrick.train_icrl import load_system1, make_loaders, build_full_concept_layout
         from src.utils.fitzpatrick_concepts import S1_LABEL_CONCEPT_KEY
+    elif module == "cub":
+        from src.scripts.cub.train_icrl import load_system1, make_loaders, build_full_concept_layout
+        from src.utils.cub_concepts import S1_LABEL_CONCEPT_KEY
     else:
         from src.scripts.pad_ufes20.train_icrl import load_system1, make_loaders, build_full_concept_layout
         from src.utils.pad_ufes20_concepts import S1_LABEL_CONCEPT_KEY

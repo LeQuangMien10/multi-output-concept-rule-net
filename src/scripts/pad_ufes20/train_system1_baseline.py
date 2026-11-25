@@ -317,7 +317,7 @@ def main():
     with open(output_dir / "metrics.json", "w", encoding="utf-8") as f:
         json.dump(results, f, indent=2)
 
-    print("\n[DONE] PAD-UFES-20 System1 results:")
+    print(f"\n[DONE] System1 results ({data_dir}):")
     print(f"  best_val_{args.monitor} = {best_val_metric:.4f}")
     print(f"  test_concept_macro_f1  = {test_metrics['concept_macro_f1']:.4f}")
     print(f"  test_concept_mean_acc  = {test_metrics['concept_mean_acc']:.4f}")

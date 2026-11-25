@@ -114,6 +114,30 @@ SCOPE_CONFIGS = {
             "label_names": "ACK,BCC,MEL,NEV,SCC,SEK",
         },
     },
+    # CUB-200-2011 (2026-11-25): bộ dữ liệu cho hướng explainability, xem
+    # notes/dataset_survey_cbm_benchmarks.md. Cả data_dir lẫn img_dir nằm dưới
+    # /kaggle/working vì notebook tự tải CUB từ data.caltech.edu rồi chạy
+    # src.scripts.cub.prepare_dataset ngay trong session (xem
+    # notes/kaggle_cub_runbook.md). Hyperparameter S1 là cấu hình khởi
+    # đầu, chưa tune: head lr 1e-3 (cao hơn Fitzpatrick 1e-4) vì 200 lớp
+    # fine-grained cần backbone thích nghi nhanh hơn, cosine 40 epoch.
+    # label_names = None: train_icrl của CUB tự đọc 200 tên loài từ meta.json.
+    "cub": {
+        "module": "cub",
+        "data_dir": "/kaggle/working/CUB_prepared",
+        "img_dir": "/kaggle/working/CUB/CUB_200_2011/images",
+        "s1_args": {
+            "backbone": "resnet50", "image_size": 224, "epochs": 40,
+            "batch_size": 32, "lr": 0.001, "backbone_lr_scale": 0.1,
+            "grad_clip_norm": 1.0, "weight_decay": 0.0001, "lr_schedule": "cosine",
+            "num_concepts": 112, "num_labels": 200,
+        },
+        "icrl_args": {
+            "theta": "auto", "n_min_sweep": "2,3,5,8,12", "conf_min": 0.5,
+            "head_epochs": 20, "head_lr": 0.001, "head_steps_per_epoch": 250,
+            "label_names": None,
+        },
+    },
 }
 
 
@@ -193,10 +217,12 @@ def main():
          "--system1_ckpt", str(s1_dir / "best_model.pt"),
          "--output_dir", str(icrl_dir),
          "--theta", icrl["theta"], "--n_min_sweep", icrl["n_min_sweep"],
-         "--conf_min", str(icrl["conf_min"]), "--label_names", icrl["label_names"],
+         "--conf_min", str(icrl["conf_min"]),
          "--head_epochs", str(icrl["head_epochs"]), "--head_lr", str(icrl["head_lr"]),
          "--head_steps_per_epoch", str(icrl["head_steps_per_epoch"]),
          "--seed", str(args.seed)]
+    if icrl["label_names"] is not None:
+        icrl_cmd += ["--label_names", icrl["label_names"]]
     if args.exclude_label_slot:
         icrl_cmd.append("--exclude_label_slot")
     run(icrl_cmd)
