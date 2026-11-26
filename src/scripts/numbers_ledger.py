@@ -46,6 +46,15 @@ CRL_PUBLISHED = {
     "DCR": [91.03, 0.80, 49.40, 1.00, 75.05, 2.12, 74.97, 2.12],
     "CRL": [92.80, 0.47, 52.39, 0.28, 75.95, 3.09, 75.90, 3.08],
 }
+# Koh et al. 2020 (CBM), arXiv 2007.04612v3, Table 1 (task error) va Table 2 (concept error) tren CUB,
+# trung binh ± 2SD qua seed; doi chieu ngay 2026-11-27. Doi sang accuracy = 1 - error (%).
+KOH_CUB = {  # model: (task_error, 2sd, concept_error, 2sd) ; None = khong bao cao
+    "Independent CBM": (0.240, 0.012, 0.034, 0.002),
+    "Sequential CBM": (0.243, 0.006, 0.034, 0.002),
+    "Joint CBM": (0.199, 0.006, 0.031, 0.000),
+    "Standard": (0.175, 0.008, None, None),
+    "Multitask": (0.162, 0.002, None, None),
+}
 METRIC_KEYS = ["concept_acc", "concept_acc_std", "concept_f1", "concept_f1_std",
                "diag_acc", "diag_acc_std", "diag_f1", "diag_f1_std"]
 
@@ -90,6 +99,26 @@ def crlmatched_table():
     return rows
 
 
+def s1_concept_acc_cub():
+    """Concept accuracy cua S1 tren test CUB (nguong 0.5), tren 112 concept theo loai."""
+    import csv
+    b = torch.load(CACHES["cub_class"], weights_only=False)
+    rows = list(csv.DictReader(open("data/CUB_prepared/test.csv", encoding="utf-8")))
+    gt = torch.tensor([[int(ch) for ch in r["concepts"]] for r in rows])
+    pred = (torch.sigmoid(b["test"]["concepts"]) >= 0.5).long()
+    return round(100 * float((pred == gt).float().mean()), 2)
+
+
+def cub_table():
+    rows = {}
+    for m, (te, tsd, ce, csd) in KOH_CUB.items():
+        rows[m] = dict(task_acc=round(100 * (1 - te), 1), task_2sd=round(100 * tsd, 1),
+                       concept_acc=None if ce is None else round(100 * (1 - ce), 1),
+                       concept_2sd=None if csd is None else round(100 * csd, 1),
+                       source="Koh et al. 2020, Tables 1-2 (published, 1 - error)")
+    return rows
+
+
 def main():
     ev = json.load(open(LATEST / "eval_results.json"))
     boot = json.load(open(LATEST / "bootstrap.json"))["results"]
@@ -111,10 +140,11 @@ def main():
                                              "top1_share", "cases_pct")} for v, m in d.items()}
                   for ds, d in abl.items()},
         complementarity=comp, crlmatched_baselines=crlmatched_table(),
+        cub_baselines=cub_table(), cub_s1_concept_acc=s1_concept_acc_cub(),
         decisions={"fitzpatrick_3class": "both full-data and concept-only in the main results; "
                                          "balanced accuracy not required in the paper (kept here for reference)",
                    "cub": "class-level concepts as in Koh et al. 2020; instance-level variant dropped"},
-        pending={"cub_baselines": "published CUB numbers (e.g. Koh et al. CBM) not yet sourced and verified"},
+        pending={},
     )
     with open(OUT_JSON, "w") as f:
         json.dump(ledger, f, indent=2)
@@ -153,6 +183,14 @@ def write_md(L):
         lines.append(f"| {m} | {r['concept_acc']:.2f} ± {r['concept_acc_std']:.2f} | {r['concept_f1']:.2f} ± "
                      f"{r['concept_f1_std']:.2f} | {r['diag_acc']:.2f} ± {r['diag_acc_std']:.2f} | "
                      f"{r['diag_f1']:.2f} ± {r['diag_f1_std']:.2f} | {r['source']} |")
+    lines += ["", "## Bảng CUB với baseline (Koh et al. 2020)", "",
+              "| Method | Task acc (± 2SD) | Concept acc (± 2SD) | Nguồn |", "|---|---|---|---|"]
+    for m, r in L["cub_baselines"].items():
+        ca = "—" if r["concept_acc"] is None else f"{r['concept_acc']:.1f} ± {r['concept_2sd']:.1f}"
+        lines.append(f"| {m} | {r['task_acc']:.1f} ± {r['task_2sd']:.1f} | {ca} | {r['source']} |")
+    cub = L["main"]["cub_class"]
+    lines.append(f"| ICRL S1 / ensemble (ours) | {cub['s1']:.2f} / {cub['ens']:.2f} | {L['cub_s1_concept_acc']:.2f} (S1) | "
+                 "outputs/icrl_latest, 1 seed |")
     lines += ["", "## Ablation trọng số rule (cùng artifact, g(x) học lại)", "",
               "| Dataset | Biến thể | S2 | Bal. S2 | Ensemble | len_w | Rule ngắn | effN | (d) không rule |",
               "|---|---|---|---|---|---|---|---|---|"]
@@ -168,7 +206,7 @@ def write_md(L):
                      f"{c['dis_s2_right']:.1f} / {c['dis_both_wrong']:.1f} | {c['ens_keeps_s1_only']:.1f}% | "
                      f"{c['ens_recovers_s2_only']:.1f}% |")
     lines += ["", "## Quyết định", ""] + [f"- {k}: {v}" for k, v in L["decisions"].items()]
-    lines += ["", "## Chưa chốt", ""] + [f"- {k}: {v}" for k, v in L["pending"].items()] + [""]
+    lines += ["", "## Chưa chốt", ""] + ([f"- {k}: {v}" for k, v in L["pending"].items()] or ["- (không còn)"]) + [""]
     OUT_MD.write_text("\n".join(lines), encoding="utf-8")
 
 
