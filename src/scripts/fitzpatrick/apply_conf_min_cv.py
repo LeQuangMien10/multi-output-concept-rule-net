@@ -34,7 +34,7 @@ import torch.nn as nn
 
 from src.scripts.fitzpatrick.train_icrl import (
     load_system1, make_loaders, record_rule_accuracy, evaluate,
-    build_full_concept_layout, export_rules,
+    build_full_concept_layout, export_rules, collect_concept_vectors,
 )
 from src.models.icrl_rule_memory import ICRLRuleMemory
 from src.utils.fitzpatrick_concepts import S1_LABEL_CONCEPT_KEY
@@ -98,6 +98,16 @@ def main():
         )
         print(f"fold_{k}: n_min={rec_n_min} conf_min={args.conf_min} -> {memory.num_rules} rules "
               f"(circular removed={dedupe_stats['removed_circular']})")
+
+        # Ban ICRL moi nhat: bo rule rong, luu do phu c_r tren val (giong train_icrl).
+        dedupe_stats["removed_empty"] = memory.remove_empty_rules(
+            full_concept_keys, full_concept_offsets, full_concept_dims,
+            exclude_keys={S1_LABEL_CONCEPT_KEY}, verbose=True,
+        )
+        if memory.num_rules > 0:
+            val_cv = collect_concept_vectors(system1, val_loader, device)
+            memory.fit_coverage(val_cv, full_concept_keys, full_concept_offsets, full_concept_dims,
+                                exclude_keys={S1_LABEL_CONCEPT_KEY})
 
         torch.save(head.state_dict(), out_icrl_dir / "prediction_head.pt")
         memory.save(out_icrl_dir / "icrl_rule_memory.pt")

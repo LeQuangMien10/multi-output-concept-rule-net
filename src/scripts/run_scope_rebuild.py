@@ -77,7 +77,7 @@ SCOPE_CONFIGS = {
             "num_concepts": 35, "num_labels": 3,
         },
         "icrl_args": {
-            "theta": "auto", "n_min_sweep": "5,10,25,50,75,100", "conf_min": 0.5,
+            "theta": "auto", "n_min_sweep": "5,10,25,50,75,100", "conf_min": 0.0,
             "head_epochs": 20, "head_lr": 0.001, "head_steps_per_epoch": 250,
             "label_names": "benign,malignant,non-neoplastic",
         },
@@ -93,7 +93,7 @@ SCOPE_CONFIGS = {
             "num_concepts": 35, "num_labels": 3,
         },
         "icrl_args": {
-            "theta": "auto", "n_min_sweep": "5,10,15,30,50", "conf_min": 0.5,
+            "theta": "auto", "n_min_sweep": "5,10,15,30,50", "conf_min": 0.0,
             "head_epochs": 20, "head_lr": 0.001, "head_steps_per_epoch": 250,
             "label_names": "benign,malignant,non-neoplastic",
         },
@@ -109,7 +109,7 @@ SCOPE_CONFIGS = {
             "num_concepts": 6, "num_labels": 6,
         },
         "icrl_args": {
-            "theta": "auto", "n_min_sweep": "5,10,15,20,30", "conf_min": 0.5,
+            "theta": "auto", "n_min_sweep": "5,10,15,20,30", "conf_min": 0.0,
             "head_epochs": 20, "head_lr": 0.001, "head_steps_per_epoch": 250,
             "label_names": "ACK,BCC,MEL,NEV,SCC,SEK",
         },
@@ -133,7 +133,7 @@ SCOPE_CONFIGS = {
             "num_concepts": 112, "num_labels": 200,
         },
         "icrl_args": {
-            "theta": "auto", "n_min_sweep": "2,3,5,8,12", "conf_min": 0.5,
+            "theta": "auto", "n_min_sweep": "2,3,5,8,12", "conf_min": 0.0,
             "head_epochs": 20, "head_lr": 0.001, "head_steps_per_epoch": 250,
             "label_names": None,
         },

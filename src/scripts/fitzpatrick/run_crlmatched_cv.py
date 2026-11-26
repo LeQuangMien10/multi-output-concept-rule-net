@@ -66,7 +66,7 @@ def parse_args():
     p.add_argument("--theta", type=str, default="auto")
     p.add_argument("--n_min", type=int, default=15)
     p.add_argument("--n_min_sweep", type=str, default="5,10,15,20,30")
-    p.add_argument("--conf_min", type=float, default=0.5)
+    p.add_argument("--conf_min", type=float, default=0.0)
     p.add_argument("--label_names", type=str, default="benign,malignant")
     p.add_argument("--head_epochs", type=int, default=20)
     p.add_argument("--head_lr", type=float, default=0.001)

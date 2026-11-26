@@ -93,6 +93,9 @@ class ICRLRuleMemory:
         self._n:          list[int]          = []   # count
         self._correct:    list[int]          = []   # correct predictions count
         self._total_pred: list[int]          = []   # total predictions count
+        # Do phu c_r cua tung rule tren val (fit_coverage), dung cho bang chung
+        # chuan hoa fire/c_r cua ban ICRL moi nhat. None = chua uoc luong.
+        self._coverage:   Optional[list[float]] = None
 
     # ── Properties ──────────────────────────────────────────
 
@@ -359,6 +362,7 @@ class ICRLRuleMemory:
         self._mu, self._m2 = new_mu, new_m2
         self._labels, self._n = new_labels, new_n
         self._correct, self._total_pred = new_correct, new_total_pred
+        self._coverage = None   # tap rule doi -> c_r cu khong con hop le
 
         stats = {
             "removed_circular": n_circular_removed,
@@ -422,6 +426,7 @@ class ICRLRuleMemory:
         self._labels[survivor].extend(self._labels[victim])
         self._correct[survivor]    += self._correct[victim]
         self._total_pred[survivor] += self._total_pred[victim]
+        self._coverage = None   # centroid survivor doi -> c_r cu khong con hop le
 
     def _compact(self, surviving_indices: list[int]) -> None:
         """Keep only surviving rules."""
@@ -431,6 +436,80 @@ class ICRLRuleMemory:
         self._n           = [self._n[i]           for i in surviving_indices]
         self._correct     = [self._correct[i]     for i in surviving_indices]
         self._total_pred  = [self._total_pred[i]  for i in surviving_indices]
+        if self._coverage is not None:
+            self._coverage = [self._coverage[i] for i in surviving_indices]
+
+    # ── Ban ICRL moi nhat: bo rule rong + do phu c_r ────────
+
+    def present_mask(
+        self,
+        concept_keys:    list[str],
+        concept_offsets: dict[str, int],
+        concept_dims:    dict[str, int],
+        exclude_keys:    Optional[set[str]] = None,
+        threshold:       float = 0.5,
+    ) -> torch.Tensor:
+        """Mask [R, K] cac concept dieu kien (present) cua tung rule, K = so
+        concept key khong nam trong exclude_keys. Cung quy tac voi
+        predict_weighted_activation() va dedupe_by_decoded_pattern()."""
+        exclude_keys = exclude_keys or set()
+        keys_used = [k for k in concept_keys if k not in exclude_keys]
+        mask = torch.zeros(self.num_rules, len(keys_used))
+        for r in range(self.num_rules):
+            for j, key in enumerate(keys_used):
+                s = concept_offsets[key]
+                if self._mu[r][s:s + concept_dims[key]].max().item() >= threshold:
+                    mask[r, j] = 1.0
+        return mask
+
+    def remove_empty_rules(
+        self,
+        concept_keys:    list[str],
+        concept_offsets: dict[str, int],
+        concept_dims:    dict[str, int],
+        exclude_keys:    Optional[set[str]] = None,
+        threshold:       float = 0.5,
+        verbose:         bool = True,
+    ) -> int:
+        """Loai cac rule khong co concept dieu kien nao. Rule rong fire = 1 tren
+        moi anh nen khong mang bang chung nao ve anh dang xet. Tra ve so rule
+        da loai."""
+        if self.is_empty:
+            return 0
+        mask = self.present_mask(concept_keys, concept_offsets, concept_dims, exclude_keys, threshold)
+        surviving = [r for r in range(self.num_rules) if mask[r].sum() > 0]
+        n_removed = self.num_rules - len(surviving)
+        if n_removed:
+            self._compact(surviving)
+        if verbose:
+            print(f"  [EmptyRules] removed={n_removed}  final={self.num_rules}")
+        return n_removed
+
+    @torch.no_grad()
+    def fit_coverage(
+        self,
+        val_concept_vecs: torch.Tensor,
+        concept_keys:     list[str],
+        concept_offsets:  dict[str, int],
+        concept_dims:     dict[str, int],
+        exclude_keys:     Optional[set[str]] = None,
+        threshold:        float = 0.5,
+    ) -> list[float]:
+        """Uoc luong do phu c_r = (sum_{x in val} fire(r,x) + 1) / (N_val + 1)
+        voi fire la soft-AND khong gate, roi luu vao memory (save/load giu lai)."""
+        num_classes = max(1, max((l for l in self.get_labels()), default=0) + 1)
+        fs = self.predict_weighted_activation(
+            val_concept_vecs.to(self.device), concept_keys, concept_offsets, concept_dims,
+            num_classes=num_classes, exclude_keys=exclude_keys, threshold=threshold,
+            hard_gate=False)["firing_strength"]
+        cov = (fs.sum(dim=0) + 1.0) / (fs.shape[0] + 1.0)
+        self._coverage = [float(c) for c in cov.cpu()]
+        return self._coverage
+
+    def get_coverage(self) -> torch.Tensor:
+        if self._coverage is None or len(self._coverage) != self.num_rules:
+            raise RuntimeError("Coverage c_r chua duoc uoc luong cho tap rule hien tai; goi fit_coverage().")
+        return torch.tensor(self._coverage, dtype=torch.float32, device=self.device)
 
     # ── Similarity ──────────────────────────────────────────
 
@@ -565,6 +644,10 @@ class ICRLRuleMemory:
 
         Returns dict: pred [B], used_fallback [B] bool, n_fired [B] so rule
         co firing_strength > 0.01 (chi de chan doan/debug).
+
+        Luu y: mac dinh hard_gate=True va trong so fire*conf la ban CU, giu lai de
+        tai tao so lieu lich su. Ban ICRL moi nhat (khong gate, fire/c_r*conf, khong
+        rule rong) nam o src/models/icrl_inference.py.
         """
         gate_threshold = threshold if gate_threshold is None else gate_threshold
         exclude_keys = exclude_keys or set()
@@ -699,6 +782,7 @@ class ICRLRuleMemory:
             "n":           self._n,
             "correct":     self._correct,
             "total_pred":  self._total_pred,
+            "coverage":    self._coverage,
         }
         torch.save(state, path)
 
@@ -720,6 +804,7 @@ class ICRLRuleMemory:
         mem._n           = state["n"]
         mem._correct     = state["correct"]
         mem._total_pred  = state["total_pred"]
+        mem._coverage    = state.get("coverage", None)
         return mem
 
     def __repr__(self) -> str:

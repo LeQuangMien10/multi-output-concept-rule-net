@@ -57,6 +57,7 @@ from tqdm import tqdm
 from src.datasets.fitzpatrick.fitzpatrick_dataset import FitzpatrickDataset, build_transforms
 from src.models.fitzpatrick.system1 import FitzpatrickSystem1, soft_concept_vector, hard_concept_vector
 from src.models.icrl_rule_memory import ICRLRuleMemory
+from src.models.icrl_inference import s2_balanced_accuracy
 from src.scripts.fitzpatrick.train_icrl_gt_ablation import measure_theta
 from src.utils.seed import set_seed
 from src.utils.fitzpatrick_concepts import (
@@ -115,7 +116,7 @@ def parse_args():
                          "+ 1 de xuat tu dong (uu tien so rule khong-circular cao nhat trong so cac "
                          "gia tri co val_accuracy trong pham vi 2 diem %% cua gia tri tot nhat) duoc "
                          "copy len output_dir/ (top-level) de tuong thich nguoc voi cac script khac.")
-    p.add_argument("--conf_min", type=float, default=0.5,
+    p.add_argument("--conf_min", type=float, default=0.0,
                     help="Tang tu 0.1 -> 0.5 sau khi accuracy tro nen y nghia (xem update_accuracy "
                          "fix): 0.1 qua de, khong loc duoc rule gan-ngau-nhien (vd accuracy 30-50%%, "
                          "confidence ~0.28-0.47). 0.5 loai rule co accuracy <~0.6-0.7 tuy coherence.")
@@ -458,6 +459,7 @@ def _collapsed_result(memory, output_dir, full_concept_keys, full_concept_offset
     result = {
         "n_min": memory.n_min,
         "val_accuracy": 0.0,
+        "val_s2_balanced_accuracy": 0.0,
         "test_accuracy": 0.0,
         "num_rules": 0,
         "num_effective_rules": rule_summary["num_effective_rules"],
@@ -511,6 +513,26 @@ def run_stage3_onward(memory, system1, val_loader, test_loader, label_names,
     )
     print(f"  After dedupe: {memory.num_rules} rules")
 
+    # Ban ICRL moi nhat: memory chi giu rule co it nhat mot concept dieu kien,
+    # va luu do phu c_r tren val cho bang chung chuan hoa fire/c_r.
+    dedupe_stats["removed_empty"] = memory.remove_empty_rules(
+        full_concept_keys, full_concept_offsets, full_concept_dims,
+        exclude_keys={S1_LABEL_CONCEPT_KEY}, verbose=True,
+    )
+    if memory.num_rules > 0:
+        with torch.no_grad():
+            val_cv = collect_concept_vectors(system1, val_loader, device, args.use_hard_cv, None)
+        memory.fit_coverage(val_cv, full_concept_keys, full_concept_offsets, full_concept_dims,
+                            exclude_keys={S1_LABEL_CONCEPT_KEY})
+    val_s2_bal = 0.0
+    if memory.num_rules > 0:
+        val_y = torch.cat([labels["label"] for _, labels in val_loader])
+        val_s2_bal = s2_balanced_accuracy(
+            memory, head, val_cv, val_y,
+            (full_concept_keys, full_concept_offsets, full_concept_dims, {S1_LABEL_CONCEPT_KEY}),
+            len(label_names))
+        print(f"  val S2 balanced accuracy (rule vote) = {val_s2_bal:.4f}")
+
     memory_path = output_dir / "icrl_rule_memory.pt"
     memory.save(memory_path)
 
@@ -532,6 +554,7 @@ def run_stage3_onward(memory, system1, val_loader, test_loader, label_names,
     result = {
         "n_min": memory.n_min,
         "val_accuracy": val_metrics["accuracy"],
+        "val_s2_balanced_accuracy": val_s2_bal,
         "test_accuracy": test_metrics["accuracy"],
         "num_rules": memory.num_rules,
         "num_effective_rules": rule_summary["num_effective_rules"],
@@ -676,23 +699,20 @@ def main():
         print(f"{r['n_min']:>6} {r['num_rules']:>6} {r['num_effective_rules']:>10} "
               f"{r['circular_rate']*100:>9.1f}% {r['val_accuracy']:>8.4f} {r['test_accuracy']:>9.4f}")
 
-    # Recommend: highest num_effective_rules among candidates whose val_accuracy
-    # is within 2 points of the best val_accuracy in the sweep.
-    best_val = max(r["val_accuracy"] for r in sweep_results)
-    in_range = [r for r in sweep_results if r["val_accuracy"] >= best_val - 0.02]
-    recommended = max(in_range, key=lambda r: r["num_effective_rules"])
+    # Quy tac chon cua ban ICRL moi nhat (2026-11-26): balanced accuracy cua phieu
+    # vote S2 tren val cao nhat, hoa thi it rule hon (src/scripts/select_theta_nmin.py
+    # dung cung quy tac cho ca cap (theta, n_min)).
+    recommended = max(sweep_results, key=lambda r: (round(r["val_s2_balanced_accuracy"], 9), -r["num_rules"]))
     print(f"\n[RECOMMENDED] n_min={recommended['n_min']} "
-          f"(val_accuracy={recommended['val_accuracy']:.4f}, within 2pp of best {best_val:.4f}; "
-          f"{recommended['num_effective_rules']} effective rules, "
-          f"circular_rate={recommended['circular_rate']:.2%})")
+          f"(val S2 balanced accuracy={recommended['val_s2_balanced_accuracy']:.4f}, "
+          f"{recommended['num_rules']} rules)")
 
     with open(output_dir / "n_min_sweep_summary.json", "w", encoding="utf-8") as f:
         json.dump({
             "sweep_values": sweep_values,
             "results": sweep_results,
             "recommended_n_min": recommended["n_min"],
-            "recommendation_rule": "max num_effective_rules among candidates with "
-                                    "val_accuracy >= best_val_accuracy - 0.02",
+            "recommendation_rule": "max val S2 balanced accuracy (rule vote), ties -> fewer rules",
         }, f, indent=2)
 
     # Copy the recommended candidate's outputs up to output_dir/ (top-level)
